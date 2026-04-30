@@ -1,4 +1,4 @@
-<!-- agent-updated: 2026-04-30T03:45:00Z -->
+<!-- agent-updated: 2026-04-30T04:05:00Z -->
 
 # taskq-rs Implementation Tasks
 
@@ -297,3 +297,5 @@ These are tracked here because they're external to taskq-rs but block specific t
 - [x] **Phase 2** — `taskq-storage` trait pair (native `async fn in trait` via `impl Future + Send` desugar); `taskq-storage-conformance` harness with 14 `#[ignore]`'d tests across 6 modules. Added `mark_worker_dead` (surfaced an under-specification in design.md §6.6 → §8.1, since folded back in `5fc45e0`). (`d8ddf87`, 2026-04-30)
 - [x] **Design clarifications** — `mark_worker_dead` added explicitly to `StorageTx` in §8.1; `RegisterWorkerResponse` contract documented in §6.3 (`lease_duration_ms`, `eps_ms`, `error_classes`, `worker_id`). (`5fc45e0`, 2026-04-30)
 - [x] **Doc freshness sweep** — `<!-- agent-updated: ... -->` line added to all 17 markdown docs per `.claude/rules/shared/api/docsguide.md`. (`63b5fd4`, 2026-04-30)
+- [x] **Phase 3** — `taskq-storage-postgres` Postgres backend: `tokio-postgres` + `deadpool-postgres`, SERIALIZABLE state-transition txns, READ COMMITTED carve-out for heartbeats on a separate connection, `idempotency_keys` range-partitioned by `expires_at` (daily) with `taskq_create_idempotency_partitions_through()` SQL function pre-creating ~96 days of runway, BRIN index on `worker_heartbeats(last_heartbeat_at)`, dedicated LISTEN connection demuxed via mpsc to per-namespace subscribers, AFTER INSERT/UPDATE-status-PENDING trigger calling `pg_notify`, in-memory per-replica token-bucket rate limiter, smoke tests against `docker.yuacx.com:5432`. (`01fe7f7`, 2026-04-30)
+- [x] **Phase 4** — `taskq-storage-sqlite` SQLite backend (embedded/dev only per design.md §8.3): rusqlite (bundled) with `Arc<Mutex<Connection>>` single-writer model, WAL journal mode + busy_timeout=5000, `BEGIN IMMEDIATE` for trivially-serializable transactions, B-tree (not BRIN) on `last_heartbeat_at`, `tokio::time::interval(500ms)` polling for `subscribe_pending`, smoke tests against in-memory SQLite. Rate-quota and waiter-cap methods return safe no-op values per the agent's read of §1.1. (`8511d55`, 2026-04-30)
