@@ -1,0 +1,357 @@
+// taskq.v1 wire schema. Append-only; never reorder; never change types. See design.md S12.2.
+//
+// Operator-facing service. Backs SetNamespaceQuota, GetNamespaceQuota,
+// SetNamespaceConfig, EnableNamespace, DisableNamespace, PurgeTasks,
+// ReplayDeadLetters, GetStats, ListWorkers. design.md S3.2, S6.7, S9, S11.
+
+include "common.fbs";
+
+namespace taskq.v1;
+
+// ---------------------------------------------------------------------------
+// Strategy and namespace configuration
+// ---------------------------------------------------------------------------
+
+/// Built-in admitter strategies shipped in v1 (design.md S7.1). Stateful strategies
+/// are deferred to v2; new variants append at the end and the CP refuses to serve
+/// namespaces whose configured admitter is not present in the running binary
+/// (design.md S7, S12.4).
+enum AdmitterKind : ubyte {
+    UNSPECIFIED = 0,
+    ALWAYS = 1,
+    MAX_PENDING = 2,
+    CO_DEL = 3,
+}
+
+/// Built-in dispatcher strategies shipped in v1 (design.md S7.2).
+enum DispatcherKind : ubyte {
+    UNSPECIFIED = 0,
+    PRIORITY_FIFO = 1,
+    AGE_PROMOTED = 2,
+    RANDOM_NAMESPACE = 3,
+}
+
+/// Log-level override for namespace-scoped logging (design.md S4.namespace_quota).
+enum LogLevel : ubyte {
+    UNSPECIFIED = 0,
+    TRACE = 1,
+    DEBUG = 2,
+    INFO = 3,
+    WARN = 4,
+    ERROR = 5,
+}
+
+/// Strategy parameter blob. Strategies validate this server-side; nonsensical
+/// values are rejected at SetNamespaceQuota time per S9.1. Carried as opaque JSON
+/// because each strategy has its own parameter shape.
+table StrategyParams {
+    json: string;
+}
+
+/// Full namespace quota record. Fields not set on the wire inherit from the
+/// `system_default` namespace per S9.1. Validation rejects nonsensical writes
+/// (registry caps, ttl ceiling, eps invariant, strategy parameter bounds) -- the CP
+/// must not silently accept-and-clamp.
+///
+/// Numeric fields use uint64 for capacity counts and uint32 for cardinality / time
+/// windows where 4G / 4 billion seconds (~136 years) is sufficient headroom. All
+/// "_seconds" fields are seconds because the design doc speaks in seconds; the wire
+/// matches the doc to remove translation layers.
+table NamespaceQuota {
+    namespace: string;
+
+    admitter_kind: AdmitterKind;
+    admitter_params: StrategyParams;
+    dispatcher_kind: DispatcherKind;
+    dispatcher_params: StrategyParams;
+
+    /// Capacity quotas (read transactionally inline; not eventually consistent).
+    /// design.md S9.1.
+    max_pending: uint64;
+    max_inflight: uint64;
+    max_workers: uint32;
+    max_waiters_per_replica: uint32;
+
+    /// Rate quotas (eventually consistent within cache TTL). design.md S1.1, S9.1.
+    max_submit_rpm: RateLimit;
+    max_dispatch_rpm: RateLimit;
+    max_replay_per_second: uint32;
+
+    /// Per-task ceilings.
+    max_retries_ceiling: uint32;
+    max_idempotency_ttl_seconds: uint64;     // hard cap 90 days; design.md S8.3, S9.1
+    max_payload_bytes: uint32;
+    max_details_bytes: uint32;
+    min_heartbeat_interval_seconds: uint32;
+
+    /// Lease / heartbeat. lazy_extension_threshold_seconds (eps) MUST be
+    /// >= 2 * min_heartbeat_interval_seconds; SetNamespaceQuota validates this
+    /// before persisting. design.md S6.3, S9.1.
+    lease_duration_seconds: uint32;
+    lazy_extension_threshold_seconds: uint32;
+
+    /// Cardinality budget (enforced at SetNamespaceConfig). design.md S11.3.
+    max_error_classes: uint32;
+    max_task_types: uint32;
+
+    /// Observability. design.md S4 namespace_quota, S11.4.
+    trace_sampling_ratio: float32;
+    log_level_override: LogLevel;
+    audit_log_retention_days: uint32;
+    metrics_export_enabled: bool;
+
+    /// True when a namespace exists but is currently administratively disabled
+    /// (design.md S6.7). Set by EnableNamespace / DisableNamespace.
+    enabled: bool;
+}
+
+// ---------------------------------------------------------------------------
+// SetNamespaceQuota / GetNamespaceQuota
+// ---------------------------------------------------------------------------
+
+table SetNamespaceQuotaRequest {
+    client_version: SemVer;
+    traceparent: [ubyte];
+    tracestate: [ubyte];
+
+    quota: NamespaceQuota;
+    /// Free-form description threaded through the audit_log entry (design.md S11.4).
+    audit_note: string;
+}
+
+table SetNamespaceQuotaResponse {
+    quota: NamespaceQuota;
+    server_version: SemVer;
+    error: Rejection;
+}
+
+table GetNamespaceQuotaRequest {
+    client_version: SemVer;
+    traceparent: [ubyte];
+    tracestate: [ubyte];
+
+    namespace: string;
+}
+
+table GetNamespaceQuotaResponse {
+    quota: NamespaceQuota;
+    server_version: SemVer;
+    error: Rejection;
+}
+
+// ---------------------------------------------------------------------------
+// SetNamespaceConfig
+// ---------------------------------------------------------------------------
+
+/// design.md S6.7 / S9.4. Updates strategy choice, error_class registry additions,
+/// and task_type registry additions. Cardinality writes that would exceed
+/// max_error_classes / max_task_types are rejected (S11.3).
+table SetNamespaceConfigRequest {
+    client_version: SemVer;
+    traceparent: [ubyte];
+    tracestate: [ubyte];
+
+    namespace: string;
+
+    admitter_kind: AdmitterKind;
+    admitter_params: StrategyParams;
+    dispatcher_kind: DispatcherKind;
+    dispatcher_params: StrategyParams;
+
+    /// Append-only registry additions. Existing classes/types are not removed by
+    /// this call; mark deprecated by passing `deprecate_error_classes` (S9.4).
+    add_error_classes: [string];
+    deprecate_error_classes: [string];
+    add_task_types: [string];
+
+    audit_note: string;
+}
+
+table SetNamespaceConfigResponse {
+    server_version: SemVer;
+    error: Rejection;
+}
+
+// ---------------------------------------------------------------------------
+// Enable / Disable namespace
+// ---------------------------------------------------------------------------
+
+table EnableNamespaceRequest {
+    client_version: SemVer;
+    traceparent: [ubyte];
+    tracestate: [ubyte];
+    namespace: string;
+    audit_note: string;
+}
+
+table EnableNamespaceResponse {
+    server_version: SemVer;
+    error: Rejection;
+}
+
+table DisableNamespaceRequest {
+    client_version: SemVer;
+    traceparent: [ubyte];
+    tracestate: [ubyte];
+    namespace: string;
+    /// Surfaced to callers via `Rejection.hint` when SubmitTask hits NAMESPACE_DISABLED
+    /// (design.md S10.2).
+    reason: string;
+    audit_note: string;
+}
+
+table DisableNamespaceResponse {
+    server_version: SemVer;
+    error: Rejection;
+}
+
+// ---------------------------------------------------------------------------
+// PurgeTasks
+// ---------------------------------------------------------------------------
+
+/// design.md S6.7. Cancels-then-deletes tasks matching the filter. Rate-limited
+/// at the admin RPC; default 100/sec (configurable per namespace).
+table PurgeTasksRequest {
+    client_version: SemVer;
+    traceparent: [ubyte];
+    tracestate: [ubyte];
+
+    namespace: string;
+    /// CEL-subset filter expression evaluated server-side, e.g.
+    ///   `task_type = "scrape.browser" AND submitted_at < timestamp("2026-04-01T00:00:00Z")`.
+    /// Empty matches all tasks in the namespace; CP requires confirm_namespace == namespace
+    /// to actually purge-all to prevent accidents.
+    filter: string;
+    confirm_namespace: string;
+
+    /// Soft cap; CP processes at most this many tasks per call to keep audit-log
+    /// transactions bounded. Callers loop until purged_count < max_tasks.
+    max_tasks: uint32;
+    audit_note: string;
+}
+
+table PurgeTasksResponse {
+    purged_count: uint32;
+    /// True when the filter matched more rows than `max_tasks`; caller should re-issue.
+    has_more: bool;
+    server_version: SemVer;
+    error: Rejection;
+}
+
+// ---------------------------------------------------------------------------
+// ReplayDeadLetters
+// ---------------------------------------------------------------------------
+
+/// design.md S6.7. Resets matching terminal-failure tasks to PENDING and resets
+/// attempt_number; preserves original_failure_count. Rejected per-task if the
+/// idempotency_key has been reclaimed by another submission.
+table ReplayDeadLettersRequest {
+    client_version: SemVer;
+    traceparent: [ubyte];
+    tracestate: [ubyte];
+
+    namespace: string;
+    filter: string;
+    confirm_namespace: string;
+    max_tasks: uint32;
+    audit_note: string;
+}
+
+table ReplayedTask {
+    task_id: string;
+    /// Per-task error when an individual replay was rejected (e.g. dedup key
+    /// reclaimed); `task_id` is still populated so the operator can correlate.
+    error: Rejection;
+}
+
+table ReplayDeadLettersResponse {
+    replayed: [ReplayedTask];
+    /// Tasks the filter matched but that were skipped (e.g. dedup conflict).
+    skipped_count: uint32;
+    has_more: bool;
+    server_version: SemVer;
+    error: Rejection;
+}
+
+// ---------------------------------------------------------------------------
+// GetStats
+// ---------------------------------------------------------------------------
+
+/// Snapshot of in-process counters for the queried namespace, surfaced to operators
+/// for quick triage without scraping Prometheus. design.md S11.3.
+table GetStatsRequest {
+    client_version: SemVer;
+    traceparent: [ubyte];
+    tracestate: [ubyte];
+    namespace: string;
+}
+
+table NamespaceStats {
+    namespace: string;
+    pending_count: uint64;
+    inflight_count: uint64;
+    waiting_retry_count: uint64;
+    workers_registered: uint32;
+    waiters_active: uint32;
+    quota_usage_ratio: float32;
+    /// p50/p99 dispatch latency in milliseconds, sampled from the local replica's
+    /// histogram. Operators wanting cluster-wide aggregates should query Prometheus.
+    dispatch_latency_p50_ms: float32;
+    dispatch_latency_p99_ms: float32;
+}
+
+table GetStatsResponse {
+    stats: NamespaceStats;
+    server_version: SemVer;
+    error: Rejection;
+}
+
+// ---------------------------------------------------------------------------
+// ListWorkers
+// ---------------------------------------------------------------------------
+
+table ListWorkersRequest {
+    client_version: SemVer;
+    traceparent: [ubyte];
+    tracestate: [ubyte];
+
+    namespace: string;
+    /// Pagination per AIP-158. Empty means start from the beginning.
+    page_size: uint32;
+    page_token: string;
+}
+
+table WorkerInfo {
+    worker_id: string;
+    namespace: string;
+    task_types: [string];
+    declared_concurrency: uint32;
+    inflight_count: uint32;
+    last_heartbeat_at: Timestamp;
+    declared_dead_at: Timestamp;
+    labels: [Label];
+}
+
+table ListWorkersResponse {
+    workers: [WorkerInfo];
+    next_page_token: string;
+    server_version: SemVer;
+    error: Rejection;
+}
+
+// ---------------------------------------------------------------------------
+// Service definition
+// ---------------------------------------------------------------------------
+
+/// Operator-facing service. design.md S3.2.
+rpc_service TaskAdmin {
+    SetNamespaceQuota(SetNamespaceQuotaRequest): SetNamespaceQuotaResponse;
+    GetNamespaceQuota(GetNamespaceQuotaRequest): GetNamespaceQuotaResponse;
+    SetNamespaceConfig(SetNamespaceConfigRequest): SetNamespaceConfigResponse;
+    EnableNamespace(EnableNamespaceRequest): EnableNamespaceResponse;
+    DisableNamespace(DisableNamespaceRequest): DisableNamespaceResponse;
+    PurgeTasks(PurgeTasksRequest): PurgeTasksResponse;
+    ReplayDeadLetters(ReplayDeadLettersRequest): ReplayDeadLettersResponse;
+    GetStats(GetStatsRequest): GetStatsResponse;
+    ListWorkers(ListWorkersRequest): ListWorkersResponse;
+}

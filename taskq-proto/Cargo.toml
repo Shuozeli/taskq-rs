@@ -8,3 +8,13 @@ description = "FlatBuffers-generated wire bindings and helpers for the taskq-rs 
 publish = false
 
 [dependencies]
+# Runtime crate that the generated readers/builders depend on. Pinned to the same
+# major shipped by flatbuffers-rs codegen so wire-format constants line up.
+flatbuffers = "25"
+
+[build-dependencies]
+# Pure-Rust FlatBuffers compiler + Rust codegen. Pulled directly (not via
+# pure-grpc-rs::grpc-build) so we control include paths, codegen options, and
+# rerun-if-changed signaling without dragging in protobuf-rs as a transitive build dep.
+flatc-rs-compiler = { git = "https://github.com/Shuozeli/flatbuffers-rs.git", branch = "main" }
+flatc-rs-codegen = { git = "https://github.com/Shuozeli/flatbuffers-rs.git", branch = "main" }

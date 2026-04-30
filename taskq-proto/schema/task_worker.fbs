@@ -1,0 +1,228 @@
+// taskq.v1 wire schema. Append-only; never reorder; never change types. See design.md S12.2.
+//
+// Worker-facing service. Backs Register, AcquireTask (long-poll), Heartbeat,
+// CompleteTask, ReportFailure, Deregister. design.md S3.2, S6.2-6.6.
+
+include "common.fbs";
+
+namespace taskq.v1;
+
+// ---------------------------------------------------------------------------
+// Register / Deregister
+// ---------------------------------------------------------------------------
+
+/// design.md S6.2 Worker validation, S6.3 SDK heartbeat-cadence guidance, S9.4
+/// (typed error_class enum at SDK init).
+table RegisterWorkerRequest {
+    client_version: SemVer;
+    traceparent: [ubyte];
+    tracestate: [ubyte];
+
+    /// Server-assigned UUID; absent on first call, present on re-Register after
+    /// WORKER_DEREGISTERED so the SDK can keep the same identity across sessions.
+    worker_id: string;
+    namespace: string;
+
+    /// Task-types this worker is willing to acquire. Filtered against
+    /// namespace.task_type registry; unknown types are ignored (logged), known types
+    /// the worker did not register get filtered at AcquireTask time.
+    task_types: [string];
+
+    /// Worker-declared maximum concurrent in-flight tasks. CP uses this to size
+    /// long-poll fairness; it does not enforce concurrency on the worker.
+    declared_concurrency: uint32;
+
+    /// Free-form labels (e.g. region, build sha) for ListWorkers introspection.
+    labels: [Label];
+}
+
+/// Generic key-value pair used by RegisterWorkerRequest.labels and admin RPCs.
+table Label {
+    key: string;
+    value: string;
+}
+
+/// Returns the namespace's effective lease + lazy-extension threshold so the SDK
+/// can clamp heartbeat cadence to <= eps / 3 (design.md S6.3 guidance). The full
+/// error_class registry is returned so the SDK can build a typed enum at init.
+table RegisterWorkerResponse {
+    worker_id: string;
+    server_version: SemVer;
+
+    lease_duration_ms: uint64;
+    /// Symmetric threshold: lazy_extension_threshold_seconds. design.md S4, S6.3.
+    eps_ms: uint64;
+    min_heartbeat_interval_ms: uint64;
+
+    /// Namespace's currently-registered error_class set (S9.4). Append-only.
+    error_classes: [string];
+
+    error: Rejection;
+}
+
+table DeregisterWorkerRequest {
+    client_version: SemVer;
+    traceparent: [ubyte];
+    tracestate: [ubyte];
+
+    worker_id: string;
+    namespace: string;
+    /// If true, drop any in-flight leases so the next reaper pass can reclaim them
+    /// quickly. If false, in-flight tasks run to completion before deregistration
+    /// finalizes.
+    abandon_inflight: bool;
+}
+
+table DeregisterWorkerResponse {
+    server_version: SemVer;
+    error: Rejection;
+}
+
+// ---------------------------------------------------------------------------
+// AcquireTask (long-poll)
+// ---------------------------------------------------------------------------
+
+/// design.md S6.2.
+table AcquireTaskRequest {
+    client_version: SemVer;
+    traceparent: [ubyte];
+    tracestate: [ubyte];
+
+    worker_id: string;
+    namespace: string;
+    task_types: [string];
+
+    /// 0 means "use server default (30s)". Hard-capped at 60s server-side.
+    long_poll_timeout_ms: uint64;
+}
+
+/// Returns at most one task. `no_task = true` means the long-poll deadline elapsed
+/// without a match; the worker should immediately reconnect (S7 worker SDK).
+/// On success, `traceparent` / `tracestate` carry the task's persisted W3C context
+/// so the worker can continue the trace per S11.2.
+table AcquireTaskResponse {
+    task: Task;
+    attempt_number: uint32;
+    lease: Lease;
+
+    no_task: bool;
+
+    /// Persisted task trace context, returned per S11.2 so the worker continues the
+    /// caller's trace rather than starting a new one.
+    traceparent: [ubyte];
+    tracestate: [ubyte];
+
+    server_version: SemVer;
+    error: Rejection;
+}
+
+// ---------------------------------------------------------------------------
+// Heartbeat
+// ---------------------------------------------------------------------------
+
+/// READ COMMITTED carve-out per design.md S1.1 / S6.3. The CP UPSERTs into
+/// worker_heartbeats and lazily extends owned leases when (now - last_extended_at)
+/// >= (lease_duration - eps).
+table HeartbeatRequest {
+    client_version: SemVer;
+    traceparent: [ubyte];
+    tracestate: [ubyte];
+
+    worker_id: string;
+    namespace: string;
+
+    /// Identifies the leases the worker still owns; the CP refuses to extend any
+    /// (task_id, attempt_number) not in this list (and the worker MUST stop work
+    /// on excluded ones). Empty means "no in-flight tasks" -- still useful as a
+    /// liveness signal so Reaper B does not declare us dead.
+    held_leases: [LeaseRef];
+}
+
+/// Compact reference passed in HeartbeatRequest.
+table LeaseRef {
+    task_id: string;
+    attempt_number: uint32;
+}
+
+/// Optional control signals from the CP, used by S5.8 graceful shutdown / drain.
+/// `worker_deregistered` is set when worker_heartbeats.declared_dead_at != NULL
+/// (S6.6 -- forces re-Register). `extended_leases` lists which leases were actually
+/// extended this heartbeat (others were no-ops because the eps threshold had not
+/// elapsed -- design.md S6.3 lazy semantics).
+table HeartbeatResponse {
+    worker_deregistered: bool;
+    drain: bool;
+    terminate: bool;
+    extended_leases: [LeaseRef];
+    server_version: SemVer;
+    error: Rejection;
+}
+
+// ---------------------------------------------------------------------------
+// CompleteTask / ReportFailure
+// ---------------------------------------------------------------------------
+
+/// design.md S6.4. Idempotent on (task_id, attempt_number); a second call observes
+/// the existing terminal row and returns success.
+table CompleteTaskRequest {
+    client_version: SemVer;
+    traceparent: [ubyte];
+    tracestate: [ubyte];
+
+    worker_id: string;
+    namespace: string;
+    task_id: string;
+    attempt_number: uint32;
+
+    /// Opaque application-defined success bytes (<= namespace.max_payload_bytes).
+    result_payload: [ubyte];
+}
+
+table CompleteTaskResponse {
+    task_id: string;
+    final_status: TerminalState;
+    server_version: SemVer;
+    /// `error.reason = LEASE_EXPIRED` when the reaper reclaimed the lease before this
+    /// call landed (S6.4). The worker SDK logs and drops the result.
+    error: Rejection;
+}
+
+/// design.md S6.4-6.5. `error_class` MUST be in the namespace's registered set
+/// (UNKNOWN_ERROR_CLASS otherwise). The CP computes `retry_after` server-side using
+/// the task's resolved retry config + full jitter (S6.5).
+table ReportFailureRequest {
+    client_version: SemVer;
+    traceparent: [ubyte];
+    tracestate: [ubyte];
+
+    worker_id: string;
+    namespace: string;
+    task_id: string;
+    attempt_number: uint32;
+
+    failure: Failure;
+}
+
+table ReportFailureResponse {
+    task_id: string;
+    /// One of WAITING_RETRY, FAILED_NONRETRYABLE, FAILED_EXHAUSTED, EXPIRED per S6.5.
+    final_status: TerminalState;
+    /// Set when final_status == WAITING_RETRY.
+    retry_after: Timestamp;
+    server_version: SemVer;
+    error: Rejection;
+}
+
+// ---------------------------------------------------------------------------
+// Service definition
+// ---------------------------------------------------------------------------
+
+/// Worker-facing service. design.md S3.2.
+rpc_service TaskWorker {
+    Register(RegisterWorkerRequest): RegisterWorkerResponse;
+    AcquireTask(AcquireTaskRequest): AcquireTaskResponse;
+    Heartbeat(HeartbeatRequest): HeartbeatResponse;
+    CompleteTask(CompleteTaskRequest): CompleteTaskResponse;
+    ReportFailure(ReportFailureRequest): ReportFailureResponse;
+    Deregister(DeregisterWorkerRequest): DeregisterWorkerResponse;
+}

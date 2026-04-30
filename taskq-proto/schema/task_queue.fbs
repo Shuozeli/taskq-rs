@@ -1,0 +1,172 @@
+// taskq.v1 wire schema. Append-only; never reorder; never change types. See design.md S12.2.
+//
+// Caller-facing service. Backs SubmitTask, GetTaskResult, BatchGetTaskResults,
+// CancelTask, SubmitAndWait. design.md S3.2, S6.1, S6.4, S6.7.
+
+include "common.fbs";
+
+namespace taskq.v1;
+
+// ---------------------------------------------------------------------------
+// SubmitTask
+// ---------------------------------------------------------------------------
+
+/// design.md S6.1. `client_version`, `traceparent`, `tracestate` are required on the
+/// first RPC; servers within a compatible major ignore them on subsequent requests.
+/// Optional fields that are absent inherit per-task-type then per-namespace defaults.
+table SubmitTaskRequest {
+    client_version: SemVer;
+    traceparent: [ubyte];
+    tracestate: [ubyte];
+
+    namespace: string;
+    task_type: string;
+    payload: [ubyte];
+
+    idempotency_key: string;
+
+    /// Optional per-task overrides. Absent fields take registry defaults.
+    priority: int32;
+    max_retries: uint32;
+    expires_at: Timestamp;
+    retry_config: RetryConfig;
+}
+
+/// On accept, returns the created (or idempotency-hit existing) task. On reject,
+/// returns a structured `error`. Exactly one of {task, error} should be populated;
+/// callers MUST treat a Rejection with `retryable=false` as final.
+table SubmitTaskResponse {
+    /// Filled on success.
+    task_id: string;
+    status: TerminalState;
+    /// True when the dedup row matched and we returned the prior task. design.md S6.1.
+    existing_task: bool;
+
+    /// Server's view of its own version, returned on every response so the SDK can
+    /// detect rolling-upgrade skew without a separate handshake RPC.
+    server_version: SemVer;
+
+    /// Filled on reject. When present, `task_id` is empty.
+    error: Rejection;
+}
+
+// ---------------------------------------------------------------------------
+// GetTaskResult
+// ---------------------------------------------------------------------------
+
+table GetTaskResultRequest {
+    client_version: SemVer;
+    traceparent: [ubyte];
+    tracestate: [ubyte];
+
+    namespace: string;
+    task_id: string;
+}
+
+table GetTaskResultResponse {
+    task: Task;
+    outcome: TaskOutcome;
+    result_payload: [ubyte];
+    failure: Failure;
+    server_version: SemVer;
+    error: Rejection;
+}
+
+// ---------------------------------------------------------------------------
+// BatchGetTaskResults
+// ---------------------------------------------------------------------------
+
+table BatchGetTaskResultsRequest {
+    client_version: SemVer;
+    traceparent: [ubyte];
+    tracestate: [ubyte];
+
+    namespace: string;
+    task_ids: [string];
+}
+
+/// Per-id result. `error` is populated for ids that could not be resolved (NOT_FOUND
+/// or per-id quota); the remaining fields are populated on hit.
+table BatchTaskResult {
+    task_id: string;
+    task: Task;
+    outcome: TaskOutcome;
+    result_payload: [ubyte];
+    failure: Failure;
+    error: Rejection;
+}
+
+table BatchGetTaskResultsResponse {
+    results: [BatchTaskResult];
+    server_version: SemVer;
+    error: Rejection;
+}
+
+// ---------------------------------------------------------------------------
+// CancelTask
+// ---------------------------------------------------------------------------
+
+table CancelTaskRequest {
+    client_version: SemVer;
+    traceparent: [ubyte];
+    tracestate: [ubyte];
+
+    namespace: string;
+    task_id: string;
+    reason: string;
+}
+
+/// Idempotent: returns the post-cancel task state (which may be a prior terminal
+/// state if the task already settled before cancel arrived). design.md S6.7.
+table CancelTaskResponse {
+    task_id: string;
+    final_status: TerminalState;
+    server_version: SemVer;
+    error: Rejection;
+}
+
+// ---------------------------------------------------------------------------
+// SubmitAndWait
+// ---------------------------------------------------------------------------
+
+/// Submit a task and block until it reaches a terminal state or the deadline expires.
+/// Wraps SubmitTask + GetTaskResult with a server-side wait. The CP enforces the same
+/// per-namespace waiter cap as AcquireTask (REPLICA_WAITER_LIMIT_EXCEEDED).
+table SubmitAndWaitRequest {
+    client_version: SemVer;
+    traceparent: [ubyte];
+    tracestate: [ubyte];
+
+    submit: SubmitTaskRequest;
+    /// Deadline relative to server clock; default 30s, max 60s, mirroring AcquireTask.
+    wait_timeout_ms: uint64;
+}
+
+table SubmitAndWaitResponse {
+    task: Task;
+    outcome: TaskOutcome;
+    result_payload: [ubyte];
+    failure: Failure;
+    /// True if the wait timed out before the task settled. The task itself is still
+    /// in the queue; the caller can poll GetTaskResult to retrieve a later outcome.
+    timed_out: bool;
+    server_version: SemVer;
+    error: Rejection;
+}
+
+// ---------------------------------------------------------------------------
+// Service definition
+// ---------------------------------------------------------------------------
+
+/// Caller-facing service. design.md S3.2.
+///
+/// FlatBuffers `rpc_service` blocks declare the gRPC contract on the wire; the
+/// generated Rust bindings produced by `flatc-rs-codegen` carry the service IR
+/// through to `pure-grpc-rs` for server/client trait generation in later phases.
+rpc_service TaskQueue {
+    SubmitTask(SubmitTaskRequest): SubmitTaskResponse;
+    GetTaskResult(GetTaskResultRequest): GetTaskResultResponse;
+    BatchGetTaskResults(BatchGetTaskResultsRequest): BatchGetTaskResultsResponse;
+    CancelTask(CancelTaskRequest): CancelTaskResponse;
+    SubmitAndWait(SubmitAndWaitRequest): SubmitAndWaitResponse;
+}

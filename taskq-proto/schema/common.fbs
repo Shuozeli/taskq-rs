@@ -1,0 +1,231 @@
+// taskq.v1 wire schema. Append-only; never reorder; never change types. See design.md S12.2.
+//
+// This file defines the shared types referenced by every taskq-rs RPC service:
+// task_queue.fbs, task_worker.fbs, task_admin.fbs.
+//
+// Rules for evolving this schema (problems/09-versioning.md):
+//   1. New fields go at the end of a table only -- never reorder.
+//   2. Field types never change. To replace, add a new field; mark the old (deprecated).
+//   3. New enum variants append at the end. The numeric tag for an existing variant is
+//      permanent. Mark obsolete variants with documentation; do not remove.
+//   4. Removing a field is forbidden in a stable major. Mark (deprecated) and leave the
+//      slot occupied so older readers continue to parse.
+
+namespace taskq.v1;
+
+// ---------------------------------------------------------------------------
+// Versioning and trace context
+// ---------------------------------------------------------------------------
+
+/// SemVer for the wire-version handshake on every first RPC.
+/// design.md S3.3, S12.1.
+table SemVer {
+    major: uint32;
+    minor: uint32;
+    patch: uint32;
+}
+
+/// Range of client SemVers a server accepts. Returned with INCOMPATIBLE_VERSION.
+table SemVerRange {
+    min: SemVer;
+    max: SemVer;
+}
+
+/// W3C Trace Context propagated on every RPC that crosses a tracing boundary.
+/// `traceparent` is the 55-byte W3C header bytes. `tracestate` is opaque (<= 256 bytes).
+/// design.md S3.4, S11.2.
+table TraceContext {
+    traceparent: [ubyte];
+    tracestate: [ubyte];
+}
+
+// ---------------------------------------------------------------------------
+// Time
+// ---------------------------------------------------------------------------
+
+/// Unix epoch milliseconds in UTC. Wire timestamps use a uniform int64 representation
+/// so callers, workers, and operators all interpret the same wall clock.
+/// `unix_millis` is signed to allow pre-1970 inputs to round-trip without surprise,
+/// though tasks always carry positive values in practice.
+table Timestamp {
+    unix_millis: int64;
+}
+
+// ---------------------------------------------------------------------------
+// Identity & idempotency
+// ---------------------------------------------------------------------------
+
+/// Idempotency key used to bound duplicate-suppression at submit time.
+/// Scoped (namespace, key); `payload_hash` is blake3 of the submit payload, used to
+/// reject IDEMPOTENCY_KEY_REUSE_WITH_DIFFERENT_PAYLOAD on collision.
+/// design.md S4 (idempotency_keys), S6.1.
+table IdempotencyKey {
+    namespace: string;
+    key: string;
+    payload_hash: [ubyte];
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle
+// ---------------------------------------------------------------------------
+
+/// Full lifecycle states a task can occupy. Terminal states are documented in
+/// design.md S5: COMPLETED, CANCELLED, FAILED_NONRETRYABLE, FAILED_EXHAUSTED, EXPIRED.
+/// PENDING / DISPATCHED / WAITING_RETRY are non-terminal but are wire-visible because
+/// GetTaskResult / SubmitTaskResponse can return any of them.
+///
+/// New variants append at the end. Numeric values are stable forever.
+enum TerminalState : ubyte {
+    PENDING = 0,
+    DISPATCHED = 1,
+    WAITING_RETRY = 2,
+    COMPLETED = 3,
+    CANCELLED = 4,
+    FAILED_NONRETRYABLE = 5,
+    FAILED_EXHAUSTED = 6,
+    EXPIRED = 7,
+}
+
+/// Outcome reported by a worker on CompleteTask / ReportFailure.
+/// design.md S4 (task_results.outcome).
+enum TaskOutcome : ubyte {
+    SUCCESS = 0,
+    RETRYABLE_FAIL = 1,
+    NONRETRYABLE_FAIL = 2,
+    CANCELLED = 3,
+    EXPIRED = 4,
+}
+
+/// Why a request was rejected by the control plane. Carried in error responses
+/// alongside `retry_after` and `retryable`.
+/// design.md S10.1 (rejection structure) plus the additional codes folded in from
+/// S6.2 (REPLICA_WAITER_LIMIT_EXCEEDED), S6.3 / S6.6 (WORKER_DEREGISTERED), S6.4
+/// (LEASE_EXPIRED), S6.5 / S9.4 (UNKNOWN_ERROR_CLASS), and S3.3 (INCOMPATIBLE_VERSION).
+enum RejectReason : ubyte {
+    UNSPECIFIED = 0,
+    NAMESPACE_QUOTA_EXCEEDED = 1,
+    MAX_PENDING_EXCEEDED = 2,
+    LATENCY_TARGET_EXCEEDED = 3,
+    SYSTEM_OVERLOAD = 4,
+    NAMESPACE_DISABLED = 5,
+    UNKNOWN_TASK_TYPE = 6,
+    IDEMPOTENCY_KEY_REUSE_WITH_DIFFERENT_PAYLOAD = 7,
+    INVALID_PAYLOAD = 8,
+    REPLICA_WAITER_LIMIT_EXCEEDED = 9,
+    WORKER_DEREGISTERED = 10,
+    INCOMPATIBLE_VERSION = 11,
+    LEASE_EXPIRED = 12,
+    UNKNOWN_ERROR_CLASS = 13,
+}
+
+/// Structured rejection. Returned with gRPC RESOURCE_EXHAUSTED / FAILED_PRECONDITION
+/// and friends so the SDK can decide whether to retry without parsing a string.
+/// `retry_after` is a Timestamp (Unix millis), not a delay -- robust to network latency.
+/// `retryable` is derived server-side from `reason`; SDK MUST honor `false`.
+/// design.md S10.1, S10.4.
+table Rejection {
+    reason: RejectReason;
+    retry_after: Timestamp;
+    retryable: bool;
+    pending_count: uint64;
+    pending_limit: uint64;
+    hint: string;
+
+    /// Filled when `reason = IDEMPOTENCY_KEY_REUSE_WITH_DIFFERENT_PAYLOAD` per S10.2.
+    existing_task_id: string;
+    existing_payload_hash: [ubyte];
+
+    /// Filled when `reason = INCOMPATIBLE_VERSION` per S3.3 / S12.3 so the client can
+    /// surface a precise error message without round-tripping the server.
+    server_version: SemVer;
+    supported_range: SemVerRange;
+}
+
+// ---------------------------------------------------------------------------
+// Retry / failure
+// ---------------------------------------------------------------------------
+
+/// Retry policy resolved per-task -> per-task-type -> per-namespace at submit.
+/// All four fields are required on the wire (defaults are applied server-side).
+/// design.md S9.2.
+table RetryConfig {
+    initial_ms: uint64;
+    max_ms: uint64;
+    coefficient: float32;
+    max_retries: uint32;
+}
+
+/// Worker-reported failure detail. `error_class` MUST be present in the namespace's
+/// registered set; ReportFailure rejects unknowns with UNKNOWN_ERROR_CLASS.
+/// `details` is opaque application-defined bytes (<= namespace.max_details_bytes).
+/// `retryable` distinguishes WAITING_RETRY from FAILED_NONRETRYABLE per S6.5.
+/// design.md S4 (task_results), S6.5, S9.4.
+table Failure {
+    error_class: string;
+    message: string;
+    details: [ubyte];
+    retryable: bool;
+}
+
+// ---------------------------------------------------------------------------
+// Rates
+// ---------------------------------------------------------------------------
+
+/// Token bucket rate limit. Used inside NamespaceQuota for the cached, eventually
+/// consistent rate quotas (max_submit_rpm, max_dispatch_rpm).
+/// design.md S1.1 (rate quota carve-out), S4 (namespace_quota), S9.1.
+table RateLimit {
+    rate_per_minute: uint64;
+    burst: uint64;
+}
+
+// ---------------------------------------------------------------------------
+// Task and Lease
+// ---------------------------------------------------------------------------
+
+/// The full Task entity as seen on the wire. Mirrors the `tasks` row from design.md S4
+/// minus storage-only columns. Returned by GetTaskResult, AcquireTaskResponse,
+/// ListWorkers (truncated), and PurgeTasks audit summaries.
+table Task {
+    task_id: string;
+    namespace: string;
+    task_type: string;
+    status: TerminalState;
+    priority: int32;
+
+    payload: [ubyte];
+    /// blake3 of `payload`; server fills this in on submit so callers can compare
+    /// against an idempotency-key-reuse rejection without re-hashing.
+    payload_hash: [ubyte];
+
+    submitted_at: Timestamp;
+    expires_at: Timestamp;
+
+    attempt_number: uint32;
+    max_retries: uint32;
+    retry_config: RetryConfig;
+    /// Set when status == WAITING_RETRY. Computed server-side using full jitter; see S6.5.
+    retry_after: Timestamp;
+
+    /// Persisted W3C trace context bytes from submit (S11.2).
+    traceparent: [ubyte];
+    tracestate: [ubyte];
+
+    /// Task-row format version for stored-data evolution (S12.6).
+    format_version: uint32;
+    /// Preserved across DLQ replay (S6.7).
+    original_failure_count: uint32;
+
+    idempotency_key: string;
+}
+
+/// Runtime lease. One row per (task_id, attempt_number) when a worker holds it.
+/// design.md S4 (task_runtime), S6.2-6.4.
+table Lease {
+    task_id: string;
+    attempt_number: uint32;
+    worker_id: string;
+    acquired_at: Timestamp;
+    timeout_at: Timestamp;
+    last_extended_at: Timestamp;
+}
