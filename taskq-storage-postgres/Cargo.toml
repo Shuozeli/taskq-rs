@@ -8,3 +8,32 @@ description = "Postgres backend implementation of the taskq-rs Storage trait"
 publish = false
 
 [dependencies]
+# Trait surface this crate implements (workspace-internal path).
+taskq-storage = { path = "../taskq-storage" }
+
+# Postgres driver and pooling per design.md §8 Open Q5.
+tokio-postgres = { version = "0.7", features = ["with-uuid-1", "with-chrono-0_4"] }
+deadpool-postgres = "0.14"
+
+# Async runtime; only the trait/spawn pieces, no #[tokio::main]-time deps.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+
+# Stream types for `subscribe_pending`.
+futures-core = "0.3"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+
+# Shared types crossing the trait boundary use these.
+bytes = "1"
+uuid = { version = "1", features = ["v7"] }
+
+# Time conversions on Postgres rows. `chrono` because tokio-postgres exposes
+# `timestamptz` as `chrono::DateTime<Utc>` via the `with-chrono-0_4` feature
+# enabled above.
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+
+# Local error wrapping so backend-specific errors map cleanly to StorageError.
+thiserror = "1"
+
+[dev-dependencies]
+# Smoke tests use `tokio::test`.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

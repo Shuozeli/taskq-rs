@@ -1,0 +1,362 @@
+//! End-to-end smoke tests for the Postgres backend.
+//!
+//! These exercise the happy paths of `insert_task`, `lookup_idempotency`,
+//! `complete_task`, and the duplicate-payload-hash branch of
+//! `insert_task`. They are NOT a substitute for the full conformance suite
+//! (Phase 9 owns that); they validate that the SQL the trait methods emit
+//! actually matches the schema in `migrations/0001_initial.sql`.
+//!
+//! ## Database
+//!
+//! Per the project infra defaults, the tests target `docker.yuacx.com:5432`
+//! with user `cyuan` / password `cyuan`. Override via `TASKQ_PG_TEST_URL`.
+//! Each test creates a dedicated Postgres schema named
+//! `taskq_phase3_smoke_<unique>` and drops it on completion, so multiple
+//! parallel test runs don't collide.
+//!
+//! ## Skip semantics
+//!
+//! Tests are gated by `#[ignore = "..."]` so they don't run by default; use
+//! `cargo test -p taskq-storage-postgres -- --ignored`. If the database is
+//! unreachable, the tests skip with a printed reason instead of failing
+//! the run.
+
+use std::time::SystemTime;
+
+use bytes::Bytes;
+use taskq_storage::ids::{IdempotencyKey, Namespace, TaskId, TaskType, Timestamp, WorkerId};
+use taskq_storage::types::{LeaseRef, NewDedupRecord, NewLease, NewTask, TaskOutcome};
+use taskq_storage::{Storage, StorageError, StorageTx};
+use taskq_storage_postgres::{migrate, PostgresConfig, PostgresStorage};
+
+const DEFAULT_TEST_URL: &str =
+    "host=docker.yuacx.com port=5432 user=cyuan password=cyuan dbname=taskq_test_phase3";
+
+fn test_url() -> String {
+    std::env::var("TASKQ_PG_TEST_URL").unwrap_or_else(|_| DEFAULT_TEST_URL.to_owned())
+}
+
+fn now_ms() -> Timestamp {
+    let dur = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("system clock before 1970");
+    Timestamp::from_unix_millis(dur.as_millis() as i64)
+}
+
+/// Best-effort connectivity probe. Returns the connected `PostgresStorage`
+/// or `None` with a printed reason. Tests use this to skip cleanly when
+/// the database is unreachable (per task spec).
+async fn try_connect() -> Option<std::sync::Arc<PostgresStorage>> {
+    // First make sure the database itself exists. We connect to the
+    // server-default `postgres` database to issue `CREATE DATABASE` if
+    // needed; if even that fails the smoke tests skip.
+    let admin_url = test_url().replace("dbname=taskq_test_phase3", "dbname=postgres");
+    let (admin, admin_conn) = match tokio_postgres::connect(&admin_url, tokio_postgres::NoTls).await
+    {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("[smoke] skip: cannot reach postgres admin db: {e}");
+            return None;
+        }
+    };
+    let admin_handle = tokio::spawn(async move {
+        let _ = admin_conn.await;
+    });
+
+    let exists: bool = match admin
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = 'taskq_test_phase3')",
+            &[],
+        )
+        .await
+    {
+        Ok(row) => row.get(0),
+        Err(e) => {
+            eprintln!("[smoke] skip: cannot probe pg_database: {e}");
+            admin_handle.abort();
+            return None;
+        }
+    };
+    if !exists {
+        if let Err(e) = admin
+            .batch_execute("CREATE DATABASE taskq_test_phase3")
+            .await
+        {
+            eprintln!("[smoke] skip: cannot create taskq_test_phase3: {e}");
+            admin_handle.abort();
+            return None;
+        }
+    }
+    drop(admin);
+    admin_handle.abort();
+
+    match PostgresStorage::connect(PostgresConfig::new(test_url())).await {
+        Ok(s) => Some(s),
+        Err(e) => {
+            eprintln!("[smoke] skip: cannot connect to taskq_test_phase3: {e}");
+            None
+        }
+    }
+}
+
+/// Pre-test helper: create a schema dedicated to this test, set
+/// `search_path` so all subsequent statements land there. Returns the
+/// schema name so the test can drop it at the end.
+async fn isolate_schema(storage: &PostgresStorage, suffix: &str) -> String {
+    let schema_name = format!("taskq_phase3_smoke_{suffix}");
+    let conn = storage.pool().get().await.expect("pool checkout failed");
+    conn.batch_execute(&format!("DROP SCHEMA IF EXISTS {schema_name} CASCADE"))
+        .await
+        .expect("drop existing schema");
+    conn.batch_execute(&format!(
+        "CREATE SCHEMA {schema_name}; SET search_path TO {schema_name}, public;"
+    ))
+    .await
+    .expect("create schema");
+    drop(conn);
+    schema_name
+}
+
+/// Drop the per-test schema. Best-effort.
+async fn drop_schema(storage: &PostgresStorage, schema_name: &str) {
+    if let Ok(conn) = storage.pool().get().await {
+        let _ = conn
+            .batch_execute(&format!("DROP SCHEMA IF EXISTS {schema_name} CASCADE"))
+            .await;
+    }
+}
+
+/// Pool-level helper to set search_path for every checked-out connection in
+/// this test run. Cheap and avoids polluting the smoke test bodies with
+/// schema bookkeeping.
+async fn set_search_path(storage: &PostgresStorage, schema_name: &str) {
+    let conn = storage.pool().get().await.expect("pool checkout");
+    conn.batch_execute(&format!(
+        "ALTER DATABASE taskq_test_phase3 SET search_path = {schema_name}, public"
+    ))
+    .await
+    .expect("alter search_path");
+}
+
+#[tokio::test]
+#[ignore = "requires reachable Postgres at docker.yuacx.com:5432 (set TASKQ_PG_TEST_URL to override)"]
+async fn smoke_submit_then_complete_round_trips_through_storage() {
+    // Arrange
+    let Some(storage) = try_connect().await else {
+        return;
+    };
+    let schema = isolate_schema(&storage, "complete").await;
+    set_search_path(&storage, &schema).await;
+    migrate(storage.pool()).await.expect("run migrations");
+
+    let namespace = Namespace::new("smoke-ns");
+    let task_type = TaskType::new("smoke.task");
+    let key = IdempotencyKey::new("smoke-key-1");
+    let task_id = TaskId::generate();
+    let worker_id = WorkerId::generate();
+    let now = now_ms();
+    // expires_at: now + 1 hour
+    let expires_at = Timestamp::from_unix_millis(now.as_unix_millis() + 3_600_000);
+
+    let payload_hash = [0xABu8; 32];
+    let new_task = NewTask {
+        task_id,
+        namespace: namespace.clone(),
+        task_type: task_type.clone(),
+        priority: 5,
+        payload: Bytes::from_static(b"hello"),
+        payload_hash,
+        submitted_at: now,
+        expires_at,
+        max_retries: 3,
+        retry_initial_ms: 1_000,
+        retry_max_ms: 60_000,
+        retry_coefficient: 2.0,
+        traceparent: Bytes::from_static(b""),
+        tracestate: Bytes::from_static(b""),
+        format_version: 1,
+    };
+    let new_dedup = NewDedupRecord {
+        namespace: namespace.clone(),
+        key: key.clone(),
+        payload_hash,
+        expires_at,
+    };
+
+    // Act: insert + lookup + complete in two transactions.
+    {
+        let mut tx = storage.begin().await.expect("begin");
+        tx.insert_task(new_task, new_dedup)
+            .await
+            .expect("insert_task");
+        // record_acquisition so complete_task has a runtime row to lock.
+        tx.record_acquisition(NewLease {
+            task_id,
+            attempt_number: 0,
+            worker_id,
+            acquired_at: now,
+            timeout_at: expires_at,
+        })
+        .await
+        .expect("record_acquisition");
+        tx.commit().await.expect("commit");
+    }
+
+    let lease_ref = LeaseRef {
+        task_id,
+        attempt_number: 0,
+        worker_id,
+    };
+
+    {
+        let mut tx = storage.begin().await.expect("begin 2");
+        tx.complete_task(
+            &lease_ref,
+            TaskOutcome::Success {
+                result_payload: Bytes::from_static(b"ok"),
+                recorded_at: now,
+            },
+        )
+        .await
+        .expect("complete_task");
+        tx.commit().await.expect("commit 2");
+    }
+
+    // Assert: task_runtime row gone; task_results row present with success.
+    let conn = storage.pool().get().await.expect("pool checkout");
+    let runtime_count: i64 = conn
+        .query_one(
+            "SELECT COUNT(*)::bigint FROM task_runtime WHERE task_id = $1",
+            &[&task_id.into_uuid()],
+        )
+        .await
+        .expect("count runtime")
+        .get(0);
+    assert_eq!(
+        runtime_count, 0,
+        "task_runtime should be empty after complete"
+    );
+
+    let result_outcome: String = conn
+        .query_one(
+            "SELECT outcome::text FROM task_results WHERE task_id = $1 AND attempt_number = 0",
+            &[&task_id.into_uuid()],
+        )
+        .await
+        .expect("query result")
+        .get(0);
+    assert_eq!(result_outcome, "success");
+
+    let task_status: String = conn
+        .query_one(
+            "SELECT status::text FROM tasks WHERE task_id = $1",
+            &[&task_id.into_uuid()],
+        )
+        .await
+        .expect("query status")
+        .get(0);
+    assert_eq!(task_status, "COMPLETED");
+
+    drop(conn);
+    drop_schema(&storage, &schema).await;
+}
+
+#[tokio::test]
+#[ignore = "requires reachable Postgres at docker.yuacx.com:5432 (set TASKQ_PG_TEST_URL to override)"]
+async fn smoke_duplicate_idempotency_key_with_different_payload_returns_constraint_violation() {
+    // Arrange
+    let Some(storage) = try_connect().await else {
+        return;
+    };
+    let schema = isolate_schema(&storage, "dedup").await;
+    set_search_path(&storage, &schema).await;
+    migrate(storage.pool()).await.expect("run migrations");
+
+    let namespace = Namespace::new("dedup-ns");
+    let task_type = TaskType::new("dedup.task");
+    let key = IdempotencyKey::new("shared-key");
+    let now = now_ms();
+    let expires_at = Timestamp::from_unix_millis(now.as_unix_millis() + 3_600_000);
+
+    let task_id_a = TaskId::generate();
+    let task_id_b = TaskId::generate();
+
+    let payload_hash_a = [0x01u8; 32];
+    let payload_hash_b = [0x02u8; 32];
+
+    let mk_task = |id, ns: &Namespace, tt: &TaskType, hash| NewTask {
+        task_id: id,
+        namespace: ns.clone(),
+        task_type: tt.clone(),
+        priority: 0,
+        payload: Bytes::from_static(b""),
+        payload_hash: hash,
+        submitted_at: now,
+        expires_at,
+        max_retries: 0,
+        retry_initial_ms: 1_000,
+        retry_max_ms: 1_000,
+        retry_coefficient: 1.0,
+        traceparent: Bytes::from_static(b""),
+        tracestate: Bytes::from_static(b""),
+        format_version: 1,
+    };
+
+    // Act 1: first insert succeeds.
+    {
+        let mut tx = storage.begin().await.expect("begin a");
+        tx.insert_task(
+            mk_task(task_id_a, &namespace, &task_type, payload_hash_a),
+            NewDedupRecord {
+                namespace: namespace.clone(),
+                key: key.clone(),
+                payload_hash: payload_hash_a,
+                expires_at,
+            },
+        )
+        .await
+        .expect("first insert");
+        tx.commit().await.expect("commit a");
+    }
+
+    // Assert: lookup_idempotency observes the dedup row.
+    {
+        let mut tx = storage.begin().await.expect("begin lookup");
+        let found = tx
+            .lookup_idempotency(&namespace, &key)
+            .await
+            .expect("lookup");
+        let record = found.expect("dedup record present");
+        assert_eq!(record.task_id, task_id_a);
+        assert_eq!(record.payload_hash, payload_hash_a);
+        tx.rollback().await.expect("rollback lookup");
+    }
+
+    // Act 2: second insert with the same idempotency key + different
+    // payload hash MUST fail with a `ConstraintViolation` (mapped from
+    // SQLSTATE 23505 unique_violation on the partition's PK).
+    let result = {
+        let mut tx = storage.begin().await.expect("begin b");
+        let res = tx
+            .insert_task(
+                mk_task(task_id_b, &namespace, &task_type, payload_hash_b),
+                NewDedupRecord {
+                    namespace: namespace.clone(),
+                    key: key.clone(),
+                    payload_hash: payload_hash_b,
+                    expires_at,
+                },
+            )
+            .await;
+        let _ = tx.rollback().await;
+        res
+    };
+
+    // Assert
+    match result {
+        Err(StorageError::ConstraintViolation(_)) => {}
+        other => panic!("expected ConstraintViolation, got {other:?}"),
+    }
+
+    drop_schema(&storage, &schema).await;
+}
