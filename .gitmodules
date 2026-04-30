@@ -1,0 +1,3 @@
+[submodule ".claude/rules/shared"]
+	path = .claude/rules/shared
+	url = git@github.com:Shuozeli/claude-rules.git
