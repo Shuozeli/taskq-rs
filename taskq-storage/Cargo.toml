@@ -8,3 +8,11 @@ description = "Storage and StorageTx traits plus shared types for taskq-rs backe
 publish = false
 
 [dependencies]
+# Error model: thiserror gives us a tidy `StorageError` enum.
+thiserror = "1"
+# Stream trait for `subscribe_pending`. Pull only the trait crate, no executor.
+futures-core = "0.3"
+# Opaque payload bytes. Cheaply cloneable, share-friendly.
+bytes = "1"
+# Domain newtypes (TaskId, WorkerId) use UUID v7 (time-ordered) per design.md §4.
+uuid = { version = "1", features = ["v7"] }

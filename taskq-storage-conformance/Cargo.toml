@@ -8,3 +8,8 @@ description = "Shared conformance test suite that every taskq-rs storage backend
 publish = false
 
 [dependencies]
+# The trait surface under test.
+taskq-storage = { path = "../taskq-storage" }
+# Async test runtime. `rt` + `macros` for `#[tokio::test]`; `test-util` lets
+# tests pause/advance time without sleeping when the suite needs it.
+tokio = { version = "1", features = ["rt", "macros", "test-util"] }
