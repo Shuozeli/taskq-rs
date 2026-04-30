@@ -1,3 +1,5 @@
+<!-- agent-updated: 2026-04-30T03:30:00Z -->
+
 # taskq-rs Design
 
 This document consolidates the design decisions made across `problems/01` through `problems/12`. It captures *what we built and why* in a reader-oriented narrative; the problem docs retain the full discussion (failure modes, prior-art comparisons, alternatives considered) and are cross-referenced throughout.
@@ -366,7 +368,14 @@ Heartbeats are best-effort liveness signals, not state transitions. They run at 
 
 **ε ≥ 2 × min_heartbeat_interval invariant.** `SetNamespaceQuota` rejects configs where `lazy_extension_threshold_seconds < 2 × min_heartbeat_interval_seconds`. This guarantees that at least two heartbeats per ε-window have a chance to fire extension — covers a single dropped heartbeat without losing the lease.
 
-**SDK heartbeat-cadence guidance.** The Rust worker SDK clamps its default heartbeat cadence to `≤ ε / 3` (read from `Register` response which now returns the namespace's effective lease + ε); operators overriding the cadence to a value > ε / 3 receive a startup warning. This is SDK convention, not protocol.
+**SDK heartbeat-cadence guidance.** The Rust worker SDK clamps its default heartbeat cadence to `≤ ε / 3` (read from `Register` response — see below); operators overriding the cadence to a value > ε / 3 receive a startup warning. This is SDK convention, not protocol.
+
+**`RegisterWorkerResponse` contract.** When a worker calls `Register`, the CP returns:
+- `lease_duration_ms` and `eps_ms` — so the SDK can compute the correct heartbeat cadence (§6.3 invariants are namespace-resolved) and clamp accordingly
+- `error_classes: [string]` — the namespace's currently-registered `error_class` set, so the worker SDK can build a typed enum at init time and reject `ReportFailure` calls with unknown classes at compile time (§9.4)
+- `worker_id` (UUID assigned by the CP) — used in subsequent `AcquireTask` / `Heartbeat` / `CompleteTask` / `ReportFailure` calls
+
+If the namespace's error-class registry changes after `Register` (operator runs `SetNamespaceConfig`), the next `ReportFailure` carrying an unknown class returns `UNKNOWN_ERROR_CLASS`; the SDK MAY refresh by re-`Register`ing.
 
 Reaper B (§6.6) reads `worker_heartbeats.last_heartbeat_at` to identify dead workers and stamps `declared_dead_at` on any worker whose tasks it reclaims. Reaper A continues to read `task_runtime.timeout_at` directly. Lazy extension keeps the SERIALIZABLE write rate down to actual lease extensions, not every keepalive ping.
 
@@ -547,6 +556,10 @@ trait StorageTx: Send {
     // Reaper
     async fn list_expired_runtimes(&mut self, before: Timestamp, n: usize) -> Result<Vec<ExpiredRuntime>>;
     async fn reclaim_runtime(&mut self, runtime: &RuntimeRef) -> Result<()>;
+    // mark_worker_dead: Reaper B stamps declared_dead_at on workers it reclaims (§6.6),
+    //                   so the heartbeat path's WHERE declared_dead_at IS NULL filter (§6.3)
+    //                   surfaces WORKER_DEREGISTERED to the worker SDK on the next ping.
+    async fn mark_worker_dead(&mut self, worker_id: &WorkerId, at: Timestamp) -> Result<()>;
 
     // Quota enforcement
     //   capacity quotas: read transactionally; CapacityKind covers MaxPending, MaxInflight,
