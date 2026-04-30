@@ -1,4 +1,4 @@
-<!-- agent-updated: 2026-04-30T03:35:00Z -->
+<!-- agent-updated: 2026-04-30T03:45:00Z -->
 
 # taskq-rs Implementation Tasks
 
@@ -292,3 +292,8 @@ These are tracked here because they're external to taskq-rs but block specific t
 - [x] `tasks.md` — this file (2026-04-30)
 - [x] Two rounds of adversarial design debate; verdicts applied to design.md (2026-04-29 / -04-30)
 - [x] 12 problem docs covering Architecture, Correctness, Operability written, with Round-1 and Round-2 refinement sections (2026-04-26 → -04-30)
+- [x] **Phase 0** — Cargo workspace, 9 crate skeletons, LICENSE (MIT), CHANGELOG, CONTRIBUTING, CI workflow (4 jobs), pre-commit, rust-toolchain.toml. CI green on `faf0d0d`. (2026-04-30)
+- [x] **Phase 1** — `taskq-proto` wire schema: 4 `.fbs` files (common, task_queue, task_worker, task_admin) under `taskq.v1`; codegen via `flatc-rs-compiler`+`flatc-rs-codegen` from `Shuozeli/flatbuffers-rs`; smoke tests pin enum tag values. Service-trait stub generation deferred to Phase 5. (`c53ba09`, 2026-04-30)
+- [x] **Phase 2** — `taskq-storage` trait pair (native `async fn in trait` via `impl Future + Send` desugar); `taskq-storage-conformance` harness with 14 `#[ignore]`'d tests across 6 modules. Added `mark_worker_dead` (surfaced an under-specification in design.md §6.6 → §8.1, since folded back in `5fc45e0`). (`d8ddf87`, 2026-04-30)
+- [x] **Design clarifications** — `mark_worker_dead` added explicitly to `StorageTx` in §8.1; `RegisterWorkerResponse` contract documented in §6.3 (`lease_duration_ms`, `eps_ms`, `error_classes`, `worker_id`). (`5fc45e0`, 2026-04-30)
+- [x] **Doc freshness sweep** — `<!-- agent-updated: ... -->` line added to all 17 markdown docs per `.claude/rules/shared/api/docsguide.md`. (`63b5fd4`, 2026-04-30)
