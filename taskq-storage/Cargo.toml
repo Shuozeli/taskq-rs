@@ -1,0 +1,10 @@
+[package]
+name = "taskq-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Storage and StorageTx traits plus shared types for taskq-rs backends"
+publish = false
+
+[dependencies]

@@ -1,0 +1,10 @@
+[package]
+name = "taskq-storage-sqlite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SQLite backend implementation of the taskq-rs Storage trait (embedded/dev only)"
+publish = false
+
+[dependencies]

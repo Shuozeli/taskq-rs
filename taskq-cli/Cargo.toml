@@ -1,0 +1,10 @@
+[package]
+name = "taskq-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "taskq-rs operator CLI (migrate, namespace admin, quota, purge, replay)"
+publish = false
+
+[dependencies]

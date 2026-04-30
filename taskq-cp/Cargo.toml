@@ -1,0 +1,10 @@
+[package]
+name = "taskq-cp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "taskq-rs control-plane gRPC server binary"
+publish = false
+
+[dependencies]

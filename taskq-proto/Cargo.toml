@@ -1,0 +1,10 @@
+[package]
+name = "taskq-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "FlatBuffers-generated wire bindings and helpers for the taskq-rs gRPC contract"
+publish = false
+
+[dependencies]

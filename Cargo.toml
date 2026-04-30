@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = [
+    "taskq-proto",
+    "taskq-storage",
+    "taskq-storage-conformance",
+    "taskq-storage-postgres",
+    "taskq-storage-sqlite",
+    "taskq-cp",
+    "taskq-caller-sdk",
+    "taskq-worker-sdk",
+    "taskq-cli",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Shuozeli/taskq-rs"

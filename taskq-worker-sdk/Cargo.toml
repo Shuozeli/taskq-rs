@@ -1,0 +1,10 @@
+[package]
+name = "taskq-worker-sdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Worker-side Rust SDK for the taskq-rs gRPC contract"
+publish = false
+
+[dependencies]

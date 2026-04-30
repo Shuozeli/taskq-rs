@@ -1,0 +1,10 @@
+[package]
+name = "taskq-storage-conformance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared conformance test suite that every taskq-rs storage backend must pass"
+publish = false
+
+[dependencies]

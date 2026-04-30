@@ -1,0 +1,10 @@
+[package]
+name = "taskq-caller-sdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Caller-side Rust SDK for the taskq-rs gRPC contract"
+publish = false
+
+[dependencies]
