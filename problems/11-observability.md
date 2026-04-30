@@ -1,3 +1,5 @@
+<!-- agent-updated: 2026-04-30T03:35:00Z -->
+
 # Problem: Observability & trace propagation
 
 ## The problem

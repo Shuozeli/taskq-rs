@@ -1,3 +1,5 @@
+<!-- agent-updated: 2026-04-30T03:35:00Z -->
+
 # taskq-rs Implementation Tasks
 
 A living roadmap for the v1 implementation. Translated from [`design.md`](design.md) §13 (v1 scope) into discrete work items with phase ordering. Each task references the design section it implements; the implementer should read that section, not re-derive.

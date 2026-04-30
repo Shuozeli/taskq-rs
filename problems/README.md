@@ -1,3 +1,5 @@
+<!-- agent-updated: 2026-04-30T03:35:00Z -->
+
 # Problems
 
 Problems we expect to face designing taskq-rs. One file per problem, written as we discuss.

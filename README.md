@@ -1,3 +1,5 @@
+<!-- agent-updated: 2026-04-30T03:35:00Z -->
+
 # taskq-rs
 
 A pure-Rust distributed task queue with a standard gRPC contract. Schema is FlatBuffers (compiled with [`flatbuffers-rs`](https://github.com/Shuozeli/flatbuffers-rs)); transport is gRPC over [`pure-grpc-rs`](https://github.com/Shuozeli/pure-grpc-rs); idempotency keys are required and the contract is at-least-once with externally-consistent state transitions.

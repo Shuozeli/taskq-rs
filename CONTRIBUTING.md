@@ -1,3 +1,5 @@
+<!-- agent-updated: 2026-04-30T03:35:00Z -->
+
 # Contributing to taskq-rs
 
 Thanks for your interest in contributing. taskq-rs is a pure-Rust distributed

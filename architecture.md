@@ -1,3 +1,5 @@
+<!-- agent-updated: 2026-04-30T03:35:00Z -->
+
 # taskq-rs Architecture
 
 A 10-minute on-ramp. For the full design see [`design.md`](design.md); for the discussion behind each decision see [`problems/`](problems/).

@@ -1,3 +1,5 @@
+<!-- agent-updated: 2026-04-30T03:35:00Z -->
+
 # Problem: Crash consistency
 
 (Subsumes the original problem #04, "Result delivery": under our chosen direction, result delivery is just another serializable transition with no special crash semantics.)

@@ -1,3 +1,5 @@
+<!-- agent-updated: 2026-04-30T03:35:00Z -->
+
 # Problem: Retry storms & poison pills
 
 (Closes the forward reference from problem #03 about the retryable-vs-nonretryable taxonomy.)
