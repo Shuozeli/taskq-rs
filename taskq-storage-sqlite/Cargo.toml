@@ -8,3 +8,27 @@ description = "SQLite backend implementation of the taskq-rs Storage trait (embe
 publish = false
 
 [dependencies]
+# The trait surface this crate implements.
+taskq-storage = { path = "../taskq-storage" }
+
+# rusqlite is the de-facto Rust SQLite driver. Sync API, wrapped in
+# tokio::task::spawn_blocking to satisfy the async StorageTx contract.
+# `bundled` compiles libsqlite3 in-tree so the build does not depend on a
+# system SQLite version (per design.md §8.3 — embedded/dev scope).
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Async runtime: spawn_blocking lifts rusqlite calls into the tokio runtime.
+# Minimal feature set; consumers pick their own runtime configuration.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+
+# Stream trait for `subscribe_pending`. Pull only the trait crate, no executor.
+futures-core = "0.3"
+
+# Opaque payload bytes carried across the trait boundary.
+bytes = "1"
+
+# UUID v7 for TaskId / WorkerId; used when (de)serializing UUIDs to TEXT.
+uuid = { version = "1", features = ["v7"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "test-util"] }
