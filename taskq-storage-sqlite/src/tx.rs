@@ -578,6 +578,37 @@ impl StorageTx for SqliteTx {
         }
     }
 
+    async fn oldest_pending_age_ms(&mut self, namespace: &Namespace) -> StorageResult<Option<u64>> {
+        // §7.1 CoDel: head-of-line age of PENDING tasks. SQLite stores
+        // submitted_at as Unix-epoch milliseconds (see migrations/0001), so
+        // the age = (now_ms - MIN(submitted_at)) where now_ms is sourced
+        // from the same canonical clock the CP layer uses. We compute now in
+        // Rust to avoid SQLite's `strftime('%s', 'now')`, which is
+        // second-resolution.
+        let now_ms = current_millis();
+        let row: Option<Option<i64>> = self
+            .conn()
+            .query_row(
+                "SELECT MIN(submitted_at) FROM tasks WHERE namespace = ?1 AND status = 'PENDING'",
+                params![namespace.as_str()],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()
+            .map_err(map_sql_error)?;
+        // SQLite returns one row from MIN(...) even when no rows match; the
+        // column is NULL in that case. `Option<Option<i64>>` therefore folds
+        // to `None` for "namespace has no pending tasks".
+        let oldest = row.flatten();
+        Ok(oldest.and_then(|min| {
+            let age = now_ms.saturating_sub(min);
+            if age < 0 {
+                None
+            } else {
+                Some(age as u64)
+            }
+        }))
+    }
+
     async fn try_consume_rate_quota(
         &mut self,
         _namespace: &Namespace,

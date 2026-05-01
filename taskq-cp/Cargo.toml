@@ -30,6 +30,13 @@ grpc-core = { git = "https://github.com/Shuozeli/pure-grpc-rs.git", rev = "12004
 # Async runtime. `signal` for SIGTERM/SIGINT in shutdown.rs.
 tokio = { version = "1", features = ["full"] }
 
+# rusqlite is needed only by `read_schema_version` for the SQLite branch of
+# the schema-version compatibility check. We open a transient connection
+# directly (rather than going through `SqliteStorage::open*` which would
+# re-run migrations) so the gate is read-only. `bundled` matches the
+# storage crate's flag so cargo unifies on one libsqlite3 build.
+rusqlite = { version = "0.32", features = ["bundled"] }
+
 # CLI parsing per Phase 5a deliverable list.
 clap = { version = "4", features = ["derive", "env"] }
 

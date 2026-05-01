@@ -237,6 +237,23 @@ pub trait StorageTx: Send {
         kind: CapacityKind,
     ) -> impl std::future::Future<Output = Result<CapacityDecision>> + Send;
 
+    /// Used by the `CoDel` admitter (`design.md` §7.1): return the age in
+    /// milliseconds of the oldest PENDING task in `namespace`, or `None` when
+    /// the namespace has no PENDING tasks.
+    ///
+    /// "Age" is `(now − submitted_at)`, computed by the backend so a single
+    /// SQL round trip can answer the question without the CP layer having to
+    /// page over rows. Returns the age of the *oldest* pending task because
+    /// CoDel rejects when the head-of-line latency has already blown past the
+    /// configured target.
+    ///
+    /// SERIALIZABLE: yes (rides the same admit transaction as
+    /// `check_capacity_quota`).
+    fn oldest_pending_age_ms(
+        &mut self,
+        namespace: &Namespace,
+    ) -> impl std::future::Future<Output = Result<Option<u64>>> + Send;
+
     /// Used by §6.1 SubmitTask + §6.2 AcquireTask: try to consume `n` rate
     /// tokens for the given dimension.
     ///

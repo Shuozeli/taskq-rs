@@ -1,26 +1,45 @@
 //! Build script for `taskq-proto`.
 //!
-//! Compiles every `.fbs` file under `schema/` with the pure-Rust `flatc-rs`
-//! pipeline:
-//!   1. `flatc_rs_compiler::compile` parses, resolves includes, and runs the
-//!      8-step semantic analyzer (yields a `ResolvedSchema`).
-//!   2. `flatc_rs_codegen::generate_rust` emits Rust readers / builders into
-//!      a single combined source file under `OUT_DIR`.
+//! Drives FlatBuffers + Rust codegen through `grpc_build::compile_fbs`. The
+//! pipeline parses every `.fbs` file under `schema/`, runs the
+//! `flatbuffers-rs` semantic analyzer, and emits Rust readers / builders /
+//! Object API types into a single output file under `OUT_DIR`.
 //!
-//! All four schemas share `namespace taskq.v1;`, so the generated code emits
-//! one `pub mod taskq { pub mod v1 { ... } }` tree containing every type.
-//! `src/lib.rs` includes that file once and re-exports the inner module under
-//! per-file aliases (`common`, `task_queue`, etc.) for ergonomic call sites.
+//! ## Output filename
 //!
-//! gRPC service stubs are intentionally NOT generated here. The `.fbs` files
-//! contain `rpc_service` blocks that are parsed and carried in the resolved
-//! schema; concrete server/client trait wiring happens in `taskq-cp` (Phase 5)
-//! using `pure-grpc-rs` codegen on top of these bindings.
+//! Per `compile_fbs`'s contract the output filename is derived from the FIRST
+//! input file's stem. We pass `common.fbs` first so the file lands as
+//! `common_generated.rs`. All four schemas share `namespace taskq.v1;`, so
+//! every generated type ends up in one combined `pub mod taskq { pub mod v1 {
+//! ... } }` tree -- the per-file split lives at the schema source layer
+//! (where it bounds reviewer blast radius), not the Rust module tree.
+//!
+//! ## gRPC service stubs (deferred to Phase 5b)
+//!
+//! `compile_fbs` itself does NOT emit gRPC service stubs at the pinned
+//! `pure-grpc-rs` revision (`120046b9...`). The path that would do so --
+//! activating `flatc-rs-codegen/grpc` -- fails to compile against this pin
+//! because of the upstream `2db926d` "use codegen-infra for schema
+//! representation" refactor that moved `service_from_fbs` out of
+//! `grpc-codegen::flatbuffers`. See the Phase 5b-pre report for the full
+//! analysis.
+//!
+//! Driving service codegen directly via
+//! `grpc_codegen::flatbuffers::generate_service_tokens` *does* work and emits
+//! syntactically-correct trait stubs, but the emitted code references the
+//! zero-copy `SubmitTaskRequest<'a>` types as if they were owned, and the
+//! generated `tower::Service` adapter requires a `FlatBuffersCodec`
+//! parameterised on owned types that impl `FlatBufferGrpcMessage`. Owned
+//! wrappers + their codec impls are a Phase 5b deliverable (mirroring the
+//! `pure-grpc-rs/examples/greeter-fbs` pattern), so emitting the stubs here
+//! would only produce a non-compiling output. We hold off until Phase 5b
+//! lands the owned-wrapper layer alongside the service-trait `impl` blocks.
 
 use std::path::PathBuf;
 
 const SCHEMA_FILES: &[&str] = &[
-    // common.fbs FIRST so its types are visible to the includers below.
+    // common.fbs FIRST so its types are visible to the includers below AND so
+    // the generated output filename is `common_generated.rs`.
     "schema/common.fbs",
     "schema/task_queue.fbs",
     "schema/task_worker.fbs",
@@ -28,38 +47,18 @@ const SCHEMA_FILES: &[&str] = &[
 ];
 
 fn main() {
-    // Re-run only when a `.fbs` file under schema/ changes.
     println!("cargo:rerun-if-changed=schema");
     for f in SCHEMA_FILES {
         println!("cargo:rerun-if-changed={f}");
     }
 
-    let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR not set by Cargo");
     let manifest_dir =
         PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"));
     let schema_dir = manifest_dir.join("schema");
 
     let inputs: Vec<PathBuf> = SCHEMA_FILES.iter().map(|f| manifest_dir.join(f)).collect();
+    let includes: Vec<PathBuf> = vec![schema_dir];
 
-    let options = flatc_rs_compiler::CompilerOptions {
-        include_paths: vec![schema_dir],
-    };
-
-    let result = flatc_rs_compiler::compile(&inputs, &options)
-        .unwrap_or_else(|e| panic!("flatbuffers compilation failed: {e}"));
-
-    let codegen_opts = flatc_rs_codegen::CodeGenOptions {
-        // Emit owned `*T` Object API types alongside the zero-copy readers so
-        // higher layers can move messages across .await boundaries without
-        // wrestling with FlatBuffer lifetimes.
-        gen_object_api: true,
-        ..Default::default()
-    };
-
-    let code = flatc_rs_codegen::generate_rust(&result.schema, &codegen_opts)
-        .unwrap_or_else(|e| panic!("flatbuffers codegen failed: {e}"));
-
-    let out_file = PathBuf::from(&out_dir).join("taskq_v1_generated.rs");
-    std::fs::write(&out_file, code)
-        .unwrap_or_else(|e| panic!("failed to write {}: {e}", out_file.display()));
+    grpc_build::compile_fbs(&inputs, &includes)
+        .unwrap_or_else(|e| panic!("FlatBuffers + Rust codegen failed: {e}"));
 }

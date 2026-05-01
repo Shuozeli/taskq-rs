@@ -1,4 +1,4 @@
-//! `taskq-cp` — taskq-rs control-plane gRPC server binary.
+//! `taskq-cp` -- taskq-rs control-plane gRPC server binary.
 //!
 //! Phase 5a startup sequence (`tasks.md` §5.x):
 //!
@@ -25,7 +25,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
 use taskq_cp::config::{CpConfig, StorageBackendConfig};
 use taskq_cp::error::CpError;
@@ -34,7 +34,19 @@ use taskq_cp::state::{CpState, DynStorage};
 use taskq_cp::strategy::StrategyRegistry;
 use taskq_cp::{health, observability, server, shutdown};
 
+/// Schema version this binary expects to find in `taskq_meta.schema_version`.
+///
+/// Bumped any time a migration is added under `taskq-storage-{postgres,sqlite}/migrations/`
+/// and corresponds to the highest migration the bundled binary knows how to
+/// apply. `design.md` §12.5: production CPs run `taskq-cp migrate` deliberately;
+/// `serve` refuses to start when the storage backend's recorded version does
+/// not match this constant unless `--auto-migrate` is passed.
+const SCHEMA_VERSION: u32 = 1;
+
 /// Command-line interface for `taskq-cp`.
+///
+/// Default behaviour (no subcommand): `serve`. The `migrate` subcommand
+/// applies migrations against the configured backend and exits.
 #[derive(Debug, Parser)]
 #[command(
     name = "taskq-cp",
@@ -42,17 +54,38 @@ use taskq_cp::{health, observability, server, shutdown};
     about = "taskq-rs control-plane gRPC server"
 )]
 struct Cli {
-    /// Path to the TOML config file. Required.
-    #[arg(long, value_name = "PATH")]
-    config: PathBuf,
+    /// Path to the TOML config file. Required for both `serve` and
+    /// `migrate` so the binary always knows which backend to talk to.
+    #[arg(long, value_name = "PATH", global = true)]
+    config: Option<PathBuf>,
 
-    /// If set, run migrations against the configured storage backend before
-    /// serving traffic. Otherwise the binary refuses to start when
-    /// `taskq_meta.schema_version` does not match the binary's expected
-    /// version (`design.md` §12.5: production CPs must run `taskq-cp
-    /// migrate` explicitly; `--auto-migrate` is a development convenience).
+    /// Optional subcommand. Default behaviour (no subcommand) is `serve`,
+    /// matching the previous Phase 5a CLI shape.
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    /// `serve`-only: if set, run migrations against the configured storage
+    /// backend before serving traffic. Otherwise the binary refuses to
+    /// start when `taskq_meta.schema_version` does not match this binary's
+    /// expected version (`design.md` §12.5: production CPs must run
+    /// `taskq-cp migrate` explicitly; `--auto-migrate` is a development
+    /// convenience).
+    ///
+    /// Top-level (rather than nested under `serve`) so `taskq-cp
+    /// --auto-migrate --config <path>` keeps working without callers having
+    /// to type `serve` explicitly.
     #[arg(long, default_value_t = false)]
     auto_migrate: bool,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Run the gRPC server. Default if no subcommand is provided.
+    Serve,
+    /// Apply schema migrations against the configured storage backend and
+    /// exit. Operators run this deliberately during deploys (`design.md`
+    /// §12.5); the `--auto-migrate` flag on `serve` is the dev shortcut.
+    Migrate,
 }
 
 #[tokio::main]
@@ -61,35 +94,62 @@ async fn main() -> anyhow::Result<()> {
     install_tracing();
 
     let cli = Cli::parse();
-    let config = CpConfig::load_from_file(&cli.config)
-        .with_context(|| format!("loading config from {}", cli.config.display()))?;
-    tracing::info!(?cli.config, "configuration loaded");
+    let config_path = cli
+        .config
+        .clone()
+        .context("--config <PATH> is required (set the path to the TOML config)")?;
+    let config = CpConfig::load_from_file(&config_path)
+        .with_context(|| format!("loading config from {}", config_path.display()))?;
+    tracing::info!(?config_path, "configuration loaded");
 
+    match cli.command.unwrap_or(Command::Serve) {
+        Command::Migrate => run_migrate(&config).await,
+        Command::Serve => run_serve(config, cli.auto_migrate).await,
+    }
+}
+
+/// `migrate` subcommand: apply migrations and exit. Does not start the OTel
+/// pipeline or the gRPC server -- this is the operator's deliberate
+/// schema-evolution action.
+async fn run_migrate(config: &CpConfig) -> anyhow::Result<()> {
+    apply_migrations(&config.storage_backend)
+        .await
+        .context("running migrations")?;
+    tracing::info!("migrations applied; exiting");
+    Ok(())
+}
+
+/// `serve` subcommand: full startup. Runs migrations first iff
+/// `--auto-migrate` was passed, then performs the schema-version compatibility
+/// check, then proceeds with the rest of Phase 5a's startup sequence.
+async fn run_serve(config: CpConfig, auto_migrate: bool) -> anyhow::Result<()> {
     // OTel pipeline before storage init so storage operations can record
     // their first metrics if Phase 5d wires them.
     let observability_state = observability::init(&config.otel_exporter)
         .map_err(anyhow::Error::from)
         .context("initializing observability pipeline")?;
 
+    if auto_migrate {
+        tracing::warn!(
+            "--auto-migrate is set; running migrations against the configured backend (dev path)"
+        );
+        apply_migrations(&config.storage_backend)
+            .await
+            .context("running --auto-migrate migrations")?;
+    }
+
+    // Schema-version compatibility gate (`design.md` §12.5). Done after
+    // any --auto-migrate so the post-migration version is what gets
+    // checked. Fails fast before serving traffic on drift.
+    check_schema_version(&config.storage_backend)
+        .await
+        .context("schema-version compatibility check")?;
+
     let storage = build_storage(&config.storage_backend)
         .await
         .context("building storage handle")?;
 
-    if cli.auto_migrate {
-        // TODO(phase-5b): run migrations for the configured backend.
-        // For Postgres: taskq_storage_postgres::migrate(...).
-        // For SQLite: SqliteStorage::open already runs migrations.
-        // Phase 5b will route through the right helper based on the
-        // backend variant.
-        tracing::warn!("--auto-migrate passed; Phase 5b implements the migration runner");
-    } else {
-        // TODO(phase-5b): read taskq_meta.schema_version and compare to
-        //                 the binary's expected schema_version; fail with
-        //                 CpError::SchemaVersionMismatch on drift.
-        tracing::debug!("schema-version check is implemented in Phase 5b");
-    }
-
-    // Strategy registry — Phase 5b populates this from the namespace_quota
+    // Strategy registry -- Phase 5b populates this from the namespace_quota
     // table. Phase 5a starts empty so the rest of the pipeline can wire up.
     let strategy_registry = Arc::new(StrategyRegistry::empty());
 
@@ -142,6 +202,119 @@ async fn main() -> anyhow::Result<()> {
     serve_result.map_err(anyhow::Error::from)
 }
 
+/// Run the bundled migrations for the configured backend. Each backend
+/// owns its own migration runner; this just dispatches.
+async fn apply_migrations(backend: &StorageBackendConfig) -> Result<(), CpError> {
+    match backend {
+        StorageBackendConfig::Postgres { url, pool_size } => {
+            // The Postgres migration runner takes a `deadpool_postgres::Pool`.
+            // We connect a transient `PostgresStorage` to acquire the pool;
+            // it is dropped at the end of the migration.
+            let pg_config = taskq_storage_postgres::PostgresConfig {
+                conn_str: url.clone(),
+                pool_size: *pool_size,
+            };
+            let storage = taskq_storage_postgres::PostgresStorage::connect(pg_config)
+                .await
+                .map_err(CpError::Storage)?;
+            taskq_storage_postgres::migrate(storage.pool())
+                .await
+                .map_err(CpError::Storage)?;
+            tracing::info!(backend = "postgres", "migrations applied");
+            Ok(())
+        }
+        StorageBackendConfig::Sqlite { path } => {
+            // The SQLite migration runner takes a `&mut rusqlite::Connection`.
+            // `SqliteStorage::open*` already runs migrations on construction,
+            // so we just open / drop a transient handle. This keeps the
+            // entry point uniform across backends without exposing
+            // rusqlite's internal `Connection` from the storage crate.
+            if path == ":memory:" {
+                taskq_storage_sqlite::SqliteStorage::open_in_memory()
+                    .await
+                    .map_err(CpError::Storage)?;
+            } else {
+                taskq_storage_sqlite::SqliteStorage::open(path)
+                    .await
+                    .map_err(CpError::Storage)?;
+            }
+            tracing::info!(backend = "sqlite", "migrations applied");
+            Ok(())
+        }
+    }
+}
+
+/// Read `taskq_meta.schema_version` and compare to the binary's
+/// [`SCHEMA_VERSION`]. Refuse to start on drift with a message pointing at
+/// `taskq-cp migrate` (`design.md` §12.5).
+async fn check_schema_version(backend: &StorageBackendConfig) -> Result<(), CpError> {
+    let found = read_schema_version(backend).await?;
+    if found != SCHEMA_VERSION {
+        return Err(CpError::SchemaVersionMismatch {
+            expected: SCHEMA_VERSION,
+            found,
+        });
+    }
+    Ok(())
+}
+
+/// Backend-specific `taskq_meta.schema_version` read. Returns the value as
+/// `u32` so the comparison against [`SCHEMA_VERSION`] is type-aligned.
+async fn read_schema_version(backend: &StorageBackendConfig) -> Result<u32, CpError> {
+    match backend {
+        StorageBackendConfig::Postgres { url, pool_size } => {
+            let pg_config = taskq_storage_postgres::PostgresConfig {
+                conn_str: url.clone(),
+                pool_size: *pool_size,
+            };
+            let storage = taskq_storage_postgres::PostgresStorage::connect(pg_config)
+                .await
+                .map_err(CpError::Storage)?;
+            let conn = storage
+                .pool()
+                .get()
+                .await
+                .map_err(|e| CpError::Storage(taskq_storage::StorageError::backend(e)))?;
+            let row = conn
+                .query_one(
+                    "SELECT schema_version FROM taskq_meta WHERE only_row = TRUE",
+                    &[],
+                )
+                .await
+                .map_err(|e| CpError::Storage(taskq_storage::StorageError::backend(e)))?;
+            let version: i32 = row.get(0);
+            // schema_version is non-negative by construction; cast checked.
+            u32::try_from(version).map_err(|_| {
+                CpError::Internal(format!(
+                    "taskq_meta.schema_version is negative: {version} (corrupt schema?)"
+                ))
+            })
+        }
+        StorageBackendConfig::Sqlite { path } => {
+            // SqliteStorage::open* runs migrations on connect, so we go
+            // through the lower-level `migrate::current_schema_version`
+            // helper instead -- it reads the row without performing
+            // additional migrations.
+            let connection = if path == ":memory:" {
+                rusqlite::Connection::open_in_memory()
+                    .map_err(|e| CpError::Storage(taskq_storage::StorageError::backend(e)))?
+            } else {
+                rusqlite::Connection::open(path)
+                    .map_err(|e| CpError::Storage(taskq_storage::StorageError::backend(e)))?
+            };
+            let version =
+                taskq_storage_sqlite::migrate::current_schema_version(&connection).await?;
+            // SQLite stores schema_version as i64; clamp to u32 for the
+            // comparison below.
+            u32::try_from(version).map_err(|_| {
+                CpError::Internal(format!(
+                    "taskq_meta.schema_version is out of u32 range: {version}"
+                ))
+            })
+        }
+    }
+}
+
 /// Build the configured `Storage` backend wrapped as `Arc<dyn DynStorage>`.
 async fn build_storage(backend: &StorageBackendConfig) -> Result<Arc<dyn DynStorage>, CpError> {
     match backend {
@@ -186,6 +359,6 @@ fn install_tracing() {
         .with_target(true)
         .finish();
     if tracing::subscriber::set_global_default(subscriber).is_err() {
-        // Already installed by a parent runtime — fine.
+        // Already installed by a parent runtime -- fine.
     }
 }

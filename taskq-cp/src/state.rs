@@ -13,14 +13,29 @@
 //!
 //! Phase 5a pins the shape; Phase 5b/c plug in the live behaviour for the
 //! placeholders.
+//!
+//! ## Object-safe storage seam
+//!
+//! [`StorageTxDyn`] is the dyn-dispatch shim around [`taskq_storage::StorageTx`].
+//! Strategies (`Admitter` / `Dispatcher`) hold an `Arc<dyn Admitter>` and need
+//! to call into a transaction; native `async fn in trait` (used by
+//! `StorageTx`) is not object-safe in `dyn` position because the returned
+//! `impl Future` types differ per backend. The shim erases those Futures
+//! behind `BoxFuture`, narrows the surface to the methods strategies actually
+//! call, and is implemented blanket-style for any concrete `StorageTx`.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::RwLock;
 
-use taskq_storage::{Namespace, NamespaceQuota, Storage};
+use taskq_storage::{
+    CapacityDecision, CapacityKind, LockedTask, Namespace, NamespaceQuota, NewLease, PickCriteria,
+    Storage, StorageError, StorageTx,
+};
 
 use crate::config::CpConfig;
 use crate::observability::MetricsHandle;
@@ -40,6 +55,120 @@ pub trait DynStorage: Send + Sync + 'static {}
 
 /// Blanket impl: any `Storage` impl participates as `DynStorage`.
 impl<S: Storage> DynStorage for S {}
+
+// ---------------------------------------------------------------------------
+// StorageTxDyn -- object-safe shim for `StorageTx`
+// ---------------------------------------------------------------------------
+
+/// Boxed future alias used by [`StorageTxDyn`]. `'a` is the borrow of the
+/// transaction the future captures; `T` is the method's return type.
+pub type StorageTxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Object-safe shim around [`taskq_storage::StorageTx`].
+///
+/// The native `StorageTx` trait uses `async fn in trait` (returns an
+/// associated `impl Future`), which makes it unusable behind `dyn`. The
+/// strategy framework needs `dyn` dispatch so per-namespace `Arc<dyn Admitter>`
+/// / `Arc<dyn Dispatcher>` can be picked at runtime
+/// (`design.md` §7, `problems/05`). This shim forwards a narrow set of
+/// `StorageTx` methods through `BoxFuture` so strategies can call into the
+/// transaction without taking on the underlying `StorageTx`'s associated-type
+/// machinery.
+///
+/// The blanket impl below covers every concrete `StorageTx` type, so the
+/// shim is automatic for both `taskq-storage-postgres::PostgresTx` and
+/// `taskq-storage-sqlite::SqliteTx`.
+///
+/// ## What's exposed
+///
+/// Only the methods the v1 strategies need:
+///
+/// - [`StorageTxDyn::check_capacity_quota`] -- `MaxPending` admitter.
+/// - [`StorageTxDyn::oldest_pending_age_ms`] -- `CoDel` admitter.
+/// - [`StorageTxDyn::pick_and_lock_pending`] -- every dispatcher.
+/// - [`StorageTxDyn::record_acquisition`] -- every dispatcher's lease step.
+///
+/// Other `StorageTx` methods (`insert_task`, `complete_task`, ...) are not
+/// behind dyn; the gRPC handlers (Phase 5b) drive them through the static
+/// `Storage::Tx<'_>` associated type directly.
+pub trait StorageTxDyn: Send {
+    /// `MaxPending` admit path: ask the backend whether `kind`'s configured
+    /// limit has been hit for `ns`. Returns the observed counts so the
+    /// handler can populate `pending_count` / `pending_limit` on
+    /// `RESOURCE_EXHAUSTED` rejections (`design.md` §10.1).
+    fn check_capacity_quota<'a>(
+        &'a mut self,
+        ns: &'a Namespace,
+        kind: CapacityKind,
+    ) -> StorageTxFuture<'a, Result<CapacityDecision, StorageError>>;
+
+    /// `CoDel` admit path: head-of-line latency of PENDING tasks in `ns` in
+    /// milliseconds. `None` when no PENDING tasks exist; in that case CoDel
+    /// always admits.
+    fn oldest_pending_age_ms<'a>(
+        &'a mut self,
+        ns: &'a Namespace,
+    ) -> StorageTxFuture<'a, Result<Option<u64>, StorageError>>;
+
+    /// Dispatch path: backend translates `criteria.ordering` to its native
+    /// idiom, locks one row, and returns it (or `None` when no candidate
+    /// matches the filters).
+    fn pick_and_lock_pending<'a>(
+        &'a mut self,
+        criteria: PickCriteria,
+    ) -> StorageTxFuture<'a, Result<Option<LockedTask>, StorageError>>;
+
+    /// Dispatch path: write the `task_runtime` row alongside the locked
+    /// task. Caller is the `AcquireTask` handler; the strategy itself does
+    /// not call this in v1 (the dispatcher returns the locked task and the
+    /// handler records the lease) but the shim exposes it so future
+    /// strategies (or test fakes) have access without needing static
+    /// dispatch.
+    fn record_acquisition<'a>(
+        &'a mut self,
+        lease: NewLease,
+    ) -> StorageTxFuture<'a, Result<(), StorageError>>;
+}
+
+/// Blanket impl: any concrete `StorageTx` participates as `StorageTxDyn`.
+///
+/// Each shim method calls the native `StorageTx` method and `Box::pin`s the
+/// returned `impl Future`. The trait bound `T: StorageTx + Send + ?Sized`
+/// allows borrowed-mut references (`&mut dyn StorageTx`) as well as owned
+/// values.
+impl<T> StorageTxDyn for T
+where
+    T: StorageTx + ?Sized,
+{
+    fn check_capacity_quota<'a>(
+        &'a mut self,
+        ns: &'a Namespace,
+        kind: CapacityKind,
+    ) -> StorageTxFuture<'a, Result<CapacityDecision, StorageError>> {
+        Box::pin(StorageTx::check_capacity_quota(self, ns, kind))
+    }
+
+    fn oldest_pending_age_ms<'a>(
+        &'a mut self,
+        ns: &'a Namespace,
+    ) -> StorageTxFuture<'a, Result<Option<u64>, StorageError>> {
+        Box::pin(StorageTx::oldest_pending_age_ms(self, ns))
+    }
+
+    fn pick_and_lock_pending<'a>(
+        &'a mut self,
+        criteria: PickCriteria,
+    ) -> StorageTxFuture<'a, Result<Option<LockedTask>, StorageError>> {
+        Box::pin(StorageTx::pick_and_lock_pending(self, criteria))
+    }
+
+    fn record_acquisition<'a>(
+        &'a mut self,
+        lease: NewLease,
+    ) -> StorageTxFuture<'a, Result<(), StorageError>> {
+        Box::pin(StorageTx::record_acquisition(self, lease))
+    }
+}
 
 /// Shared CP state. Cloned as `Arc<CpState>` everywhere.
 pub struct CpState {

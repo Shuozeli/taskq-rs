@@ -3,15 +3,16 @@
 //! `design.md` §7.1 / `problems/05-dispatch-fairness.md`. Strategies run
 //! inside the SubmitTask SERIALIZABLE transaction; they read whatever they
 //! need (pending count, oldest-pending age) via the `StorageTx` already
-//! borrowed by the handler.
+//! borrowed by the handler. The handler hands strategies a `&mut dyn
+//! StorageTxDyn` -- the object-safe shim defined in [`crate::state`].
 //!
-//! ## Phase 5a status
+//! ## Phase 5b-pre status
 //!
-//! - `Always`: real (one line) — accepts unconditionally.
-//! - `MaxPending`: stub (`todo!()`) — Phase 5b implements via
-//!   `check_capacity_quota(MaxPending)`.
-//! - `CoDel`: stub (`todo!()`) — Phase 5b implements via the oldest-pending
-//!   age read.
+//! - `Always`: real (one line) -- accepts unconditionally.
+//! - `MaxPending`: real -- calls `check_capacity_quota(MaxPending)` and
+//!   rejects on `OverLimit`.
+//! - `CoDel`: real -- calls `oldest_pending_age_ms` and rejects when the
+//!   head-of-line age exceeds the configured target latency.
 //!
 //! ## Why `async-trait`?
 //!
@@ -24,12 +25,13 @@
 
 use async_trait::async_trait;
 
-use taskq_storage::{Namespace, TaskType, Timestamp};
+use taskq_storage::{CapacityDecision, CapacityKind, Namespace, TaskType, Timestamp};
 
-/// Submit-time context handed to every `Admitter::admit` call. Phase 5b
-/// will fill in the call site (the `SubmitTask` handler in
-/// `handlers/task_queue.rs`); Phase 5a defines the shape so strategy
-/// authors can write against it.
+use crate::state::StorageTxDyn;
+
+/// Submit-time context handed to every `Admitter::admit` call. The
+/// `SubmitTask` handler builds this from the wire request before calling
+/// the registry-resolved admitter.
 #[derive(Debug, Clone)]
 pub struct SubmitCtx {
     pub namespace: Namespace,
@@ -48,7 +50,7 @@ pub enum Admit {
 }
 
 /// Reasons an admitter can reject. Mirror of the CP-internal projection
-/// of `taskq.v1.RejectReason` — Phase 5b will collapse this enum and the
+/// of `taskq.v1.RejectReason` -- Phase 5b will collapse this enum and the
 /// wire enum into one type once handler bodies land.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RejectReason {
@@ -76,17 +78,8 @@ pub trait Admitter: Send + Sync + 'static {
     fn name(&self) -> &'static str;
 }
 
-/// Object-safe shim around `StorageTx`. The storage trait uses native
-/// `async fn` returning `impl Future` which is not object-safe. Phase 5b
-/// will define this shim with the methods strategies actually need
-/// (`check_capacity_quota`, an "oldest pending" read for CoDel, etc.).
-///
-/// Phase 5a leaves it as a marker so `dyn Admitter` signatures compile.
-/// Implementors of `StorageTx` plug in via a blanket impl in Phase 5b.
-pub trait StorageTxDyn: Send {}
-
 // ---------------------------------------------------------------------------
-// `Always` — accept everything (default).
+// `Always` -- accept everything (default).
 // ---------------------------------------------------------------------------
 
 /// Default admitter: accepts unconditionally. `design.md` §7.1.
@@ -105,27 +98,49 @@ impl Admitter for AlwaysAdmitter {
 }
 
 // ---------------------------------------------------------------------------
-// `MaxPending` — reject if pending_count(namespace) > limit.
+// `MaxPending` -- reject if pending_count(namespace) >= limit.
 // ---------------------------------------------------------------------------
 
-/// `MaxPending` admitter. Reads `check_capacity_quota(MaxPending)`.
+/// `MaxPending` admitter. Reads `check_capacity_quota(MaxPending)` and
+/// rejects when the backend reports `OverLimit`. The strategy's own
+/// `limit` field is informational; the SOURCE OF TRUTH is the backend's
+/// transactional read against `namespace_quota.max_pending` (`design.md`
+/// §9.1: capacity reads are inline transactional, no cache fence).
 ///
-/// Phase 5b: implement the body using the storage trait. The struct is
-/// final-shaped so strategy registry code already knows how to instantiate
-/// it from `NamespaceQuota::admitter_params`.
+/// ## Why we don't compare `self.limit` directly
+///
+/// The strategy's `limit` is parsed from `dispatcher_params` at startup;
+/// the backend's read picks up edits via `SetNamespaceQuota` without
+/// requiring a CP restart. Re-reading transactionally per-admit costs one
+/// cheap PK lookup per submit (`design.md` §9.1) and avoids the staleness
+/// window that a cached value would introduce.
 #[derive(Debug, Clone, Copy)]
 pub struct MaxPendingAdmitter {
-    /// Pending-count ceiling. Read from `NamespaceQuota.max_pending`.
+    /// Pending-count ceiling. Read from `NamespaceQuota.max_pending`. Kept
+    /// for diagnostic logging and as a fallback when the backend's
+    /// `check_capacity_quota` returns `UnderLimit { limit: u64::MAX }`
+    /// (i.e. unconfigured) but the operator wired this strategy
+    /// explicitly.
     pub limit: u64,
 }
 
 #[async_trait]
 impl Admitter for MaxPendingAdmitter {
-    async fn admit(&self, _ctx: &SubmitCtx, _tx: &mut dyn StorageTxDyn) -> Admit {
-        // TODO(phase-5b): call check_capacity_quota(MaxPending) and compare
-        //                 to self.limit; emit Admit::Reject(MaxPendingExceeded)
-        //                 if over.
-        todo!("phase-5b: MaxPending admitter")
+    async fn admit(&self, ctx: &SubmitCtx, tx: &mut dyn StorageTxDyn) -> Admit {
+        match tx
+            .check_capacity_quota(&ctx.namespace, CapacityKind::MaxPending)
+            .await
+        {
+            Ok(CapacityDecision::OverLimit { .. }) => {
+                Admit::Reject(RejectReason::MaxPendingExceeded)
+            }
+            Ok(CapacityDecision::UnderLimit { .. }) => Admit::Accept,
+            // Transient backend failure: prefer fail-closed under contention
+            // since admit is the cheapest gate. The handler's outer
+            // transaction-retry loop will recover from `SerializationConflict`;
+            // other errors should not silently admit.
+            Err(_) => Admit::Reject(RejectReason::SystemOverload),
+        }
     }
 
     fn name(&self) -> &'static str {
@@ -134,26 +149,34 @@ impl Admitter for MaxPendingAdmitter {
 }
 
 // ---------------------------------------------------------------------------
-// `CoDel` — reject if oldest pending has aged past target latency.
+// `CoDel` -- reject if oldest pending has aged past target latency.
 // ---------------------------------------------------------------------------
 
 /// `CoDel` admitter. Reads the oldest PENDING task's age in the namespace
-/// and compares it to a target latency.
-///
-/// Phase 5b: implement the body. Storage trait may need a new method
-/// `oldest_pending_age(ns)`; that's a Phase 5b decision.
+/// and compares it to a target latency. `design.md` §7.1 / `problems/05`:
+/// CoDel rejects tasks whose latency budget is already blown so callers
+/// can shed load before the queue grows further.
 #[derive(Debug, Clone, Copy)]
 pub struct CoDelAdmitter {
     /// Target latency in milliseconds. Reject when oldest-pending exceeds.
+    /// Read from `NamespaceQuota.admitter_params` at startup.
     pub target_latency_ms: u64,
 }
 
 #[async_trait]
 impl Admitter for CoDelAdmitter {
-    async fn admit(&self, _ctx: &SubmitCtx, _tx: &mut dyn StorageTxDyn) -> Admit {
-        // TODO(phase-5b): read oldest-pending age, compare against
-        //                 self.target_latency_ms.
-        todo!("phase-5b: CoDel admitter")
+    async fn admit(&self, ctx: &SubmitCtx, tx: &mut dyn StorageTxDyn) -> Admit {
+        match tx.oldest_pending_age_ms(&ctx.namespace).await {
+            // No pending tasks -> nothing to be late on -> accept.
+            Ok(None) => Admit::Accept,
+            Ok(Some(age_ms)) if age_ms > self.target_latency_ms => {
+                Admit::Reject(RejectReason::LatencyTargetExceeded)
+            }
+            Ok(Some(_)) => Admit::Accept,
+            // See MaxPendingAdmitter::admit; fail-closed on transient
+            // backend errors.
+            Err(_) => Admit::Reject(RejectReason::SystemOverload),
+        }
     }
 
     fn name(&self) -> &'static str {
@@ -165,10 +188,56 @@ impl Admitter for CoDelAdmitter {
 mod tests {
     use super::*;
 
-    /// Concrete dummy impl so we can build a `&mut dyn StorageTxDyn` in tests
-    /// without spinning up a real backend.
-    struct DummyTx;
-    impl StorageTxDyn for DummyTx {}
+    use taskq_storage::{
+        CapacityDecision, CapacityKind, LockedTask, Namespace, NewLease, PickCriteria, StorageError,
+    };
+
+    use crate::state::{StorageTxDyn, StorageTxFuture};
+
+    /// Test fake that records the calls made and returns scripted decisions.
+    /// Keeping the fake concrete (rather than mocking) follows the
+    /// "real implementations / fakes over mocks" rule in
+    /// `.claude/rules/shared/common/code-standards.md`.
+    #[derive(Default)]
+    struct FakeTx {
+        capacity_response: Option<CapacityDecision>,
+        oldest_age_response: Option<Option<u64>>,
+    }
+
+    impl StorageTxDyn for FakeTx {
+        fn check_capacity_quota<'a>(
+            &'a mut self,
+            _ns: &'a Namespace,
+            _kind: CapacityKind,
+        ) -> StorageTxFuture<'a, Result<CapacityDecision, StorageError>> {
+            let response = self.capacity_response.expect("capacity_response not set");
+            Box::pin(async move { Ok(response) })
+        }
+
+        fn oldest_pending_age_ms<'a>(
+            &'a mut self,
+            _ns: &'a Namespace,
+        ) -> StorageTxFuture<'a, Result<Option<u64>, StorageError>> {
+            let response = self
+                .oldest_age_response
+                .expect("oldest_age_response not set");
+            Box::pin(async move { Ok(response) })
+        }
+
+        fn pick_and_lock_pending<'a>(
+            &'a mut self,
+            _criteria: PickCriteria,
+        ) -> StorageTxFuture<'a, Result<Option<LockedTask>, StorageError>> {
+            unreachable!("dispatcher methods not exercised in admitter tests")
+        }
+
+        fn record_acquisition<'a>(
+            &'a mut self,
+            _lease: NewLease,
+        ) -> StorageTxFuture<'a, Result<(), StorageError>> {
+            unreachable!("dispatcher methods not exercised in admitter tests")
+        }
+    }
 
     fn submit_ctx() -> SubmitCtx {
         SubmitCtx {
@@ -185,10 +254,107 @@ mod tests {
         // Arrange
         let admitter = AlwaysAdmitter;
         let ctx = submit_ctx();
-        let mut tx = DummyTx;
+        let mut tx = FakeTx::default();
 
         // Act
-        let decision = admitter.admit(&ctx, &mut tx).await;
+        let decision = admitter.admit(&ctx, &mut tx as &mut dyn StorageTxDyn).await;
+
+        // Assert
+        assert_eq!(decision, Admit::Accept);
+    }
+
+    #[tokio::test]
+    async fn max_pending_rejects_when_backend_reports_over_limit() {
+        // Arrange
+        let admitter = MaxPendingAdmitter { limit: 100 };
+        let ctx = submit_ctx();
+        let mut tx = FakeTx {
+            capacity_response: Some(CapacityDecision::OverLimit {
+                current: 100,
+                limit: 100,
+            }),
+            ..FakeTx::default()
+        };
+
+        // Act
+        let decision = admitter.admit(&ctx, &mut tx as &mut dyn StorageTxDyn).await;
+
+        // Assert
+        assert_eq!(decision, Admit::Reject(RejectReason::MaxPendingExceeded));
+    }
+
+    #[tokio::test]
+    async fn max_pending_admits_when_backend_reports_under_limit() {
+        // Arrange
+        let admitter = MaxPendingAdmitter { limit: 100 };
+        let ctx = submit_ctx();
+        let mut tx = FakeTx {
+            capacity_response: Some(CapacityDecision::UnderLimit {
+                current: 5,
+                limit: 100,
+            }),
+            ..FakeTx::default()
+        };
+
+        // Act
+        let decision = admitter.admit(&ctx, &mut tx as &mut dyn StorageTxDyn).await;
+
+        // Assert
+        assert_eq!(decision, Admit::Accept);
+    }
+
+    #[tokio::test]
+    async fn codel_admits_when_no_pending_tasks() {
+        // Arrange
+        let admitter = CoDelAdmitter {
+            target_latency_ms: 5_000,
+        };
+        let ctx = submit_ctx();
+        let mut tx = FakeTx {
+            oldest_age_response: Some(None),
+            ..FakeTx::default()
+        };
+
+        // Act
+        let decision = admitter.admit(&ctx, &mut tx as &mut dyn StorageTxDyn).await;
+
+        // Assert
+        assert_eq!(decision, Admit::Accept);
+    }
+
+    #[tokio::test]
+    async fn codel_rejects_when_oldest_pending_exceeds_target() {
+        // Arrange
+        let admitter = CoDelAdmitter {
+            target_latency_ms: 5_000,
+        };
+        let ctx = submit_ctx();
+        let mut tx = FakeTx {
+            oldest_age_response: Some(Some(10_000)),
+            ..FakeTx::default()
+        };
+
+        // Act
+        let decision = admitter.admit(&ctx, &mut tx as &mut dyn StorageTxDyn).await;
+
+        // Assert
+        assert_eq!(decision, Admit::Reject(RejectReason::LatencyTargetExceeded));
+    }
+
+    #[tokio::test]
+    async fn codel_admits_when_oldest_pending_within_target() {
+        // Arrange
+        let admitter = CoDelAdmitter {
+            target_latency_ms: 5_000,
+        };
+        let ctx = submit_ctx();
+        let mut tx = FakeTx {
+            oldest_age_response: Some(Some(1_000)),
+            ..FakeTx::default()
+        };
+
+        // Act
+        let decision = admitter.admit(&ctx, &mut tx as &mut dyn StorageTxDyn).await;
 
         // Assert
         assert_eq!(decision, Admit::Accept);

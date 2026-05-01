@@ -589,6 +589,29 @@ impl<'a> StorageTx for PostgresTx<'a> {
         }
     }
 
+    async fn oldest_pending_age_ms(&mut self, namespace: &Namespace) -> Result<Option<u64>> {
+        // §7.1 CoDel: head-of-line age of PENDING tasks in this namespace.
+        // Postgres computes the age in milliseconds server-side so the CP
+        // layer's clock skew never enters the picture.
+        let row = self
+            .conn
+            .query_opt(
+                "SELECT (EXTRACT(EPOCH FROM (NOW() - MIN(submitted_at))) * 1000)::bigint \
+                   FROM tasks \
+                  WHERE namespace = $1 AND status = 'PENDING'",
+                &[&namespace.as_str()],
+            )
+            .await
+            .map_err(map_db_error)?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        // The aggregate returns one row even when no tasks match; the column
+        // is NULL in that case. Treat NULL and "no rows" the same.
+        let age: Option<i64> = row.try_get::<_, Option<i64>>(0).map_err(map_db_error)?;
+        Ok(age.and_then(|v| if v < 0 { None } else { Some(v as u64) }))
+    }
+
     async fn try_consume_rate_quota(
         &mut self,
         namespace: &Namespace,

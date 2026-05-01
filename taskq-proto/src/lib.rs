@@ -1,17 +1,19 @@
 //! taskq-proto: generated FlatBuffers bindings and minor wire helpers for the
 //! taskq-rs gRPC contract.
 //!
-//! The wire schema lives in `schema/*.fbs`; `build.rs` compiles every file
-//! through the pure-Rust `flatc-rs` pipeline into a single Rust source file
-//! under `OUT_DIR`. The four FlatBuffers files share `namespace taskq.v1;` so
-//! every generated type lands in [`v1`].
+//! The wire schema lives in `schema/*.fbs`; `build.rs` drives
+//! `grpc_build::compile_fbs` to compile every file through the pure-Rust
+//! `flatc-rs` pipeline into a single Rust source file under `OUT_DIR`. The
+//! four FlatBuffers files share `namespace taskq.v1;` so every generated type
+//! lands in [`v1`].
 //!
 //! ## Layout
 //!
 //! - [`v1`] -- all generated readers, builders, and Object API types under the
 //!   `taskq.v1` namespace, plus root-type helpers (`root_as_*`).
-//! - [`common`] -- thin alias re-export of [`v1`] for code sites that conceptually
-//!   speak in terms of `common.fbs` (`Task`, `Lease`, `RetryConfig`, ...).
+//! - [`common`] -- thin alias re-export of [`v1`] for code sites that
+//!   conceptually speak in terms of `common.fbs` (`Task`, `Lease`,
+//!   `RetryConfig`, ...).
 //! - [`task_queue`] -- alias for code sites speaking the caller-facing service.
 //! - [`task_worker`] -- alias for the worker-facing service.
 //! - [`task_admin`] -- alias for the operator-facing service.
@@ -19,6 +21,32 @@
 //! All four aliases point at the same module because FlatBuffers namespaces
 //! are flat; the per-file split lives at the schema layer (where it bounds the
 //! reviewer's blast radius) rather than in the Rust module tree.
+//!
+//! ## gRPC service trait stubs
+//!
+//! `compile_fbs` emits gRPC service trait stubs only when its underlying
+//! `flatc-rs-codegen` dependency is built with the `grpc` feature. As of the
+//! pinned `pure-grpc-rs` revision (`120046b9...`), `grpc-build`'s
+//! `flatbuffers` feature does NOT activate `flatc-rs-codegen/grpc`, and
+//! activating it directly fails to compile against this revision (the `grpc`
+//! sub-feature on `flatc-rs-codegen` references a `service_from_fbs` symbol
+//! that the pinned `pure-grpc-rs` revision no longer exports -- the upstream
+//! `2db926d` "use codegen-infra for schema representation" refactor moved it).
+//! See the Phase 5b-pre report.
+//!
+//! Phase 5b takes one of three follow-up paths:
+//!   1. bump the workspace-wide `pure-grpc-rs` pin to a revision that re-aligns
+//!      with `flatc-rs-codegen/grpc`, then add `flatc-rs-codegen/grpc` here;
+//!   2. hand-write the `*_server` / `*_client` modules in this crate, mirroring
+//!      the `pure-grpc-rs/examples/greeter-fbs` pattern (owned message
+//!      wrappers + manual `FlatBufferGrpcMessage` impls + per-service
+//!      `tower::Service` adapters);
+//!   3. extend `grpc-build` upstream so its `flatbuffers` feature drives the
+//!      service codegen through `grpc_codegen::flatbuffers::generate_service_tokens`
+//!      directly (no `flatc-rs-codegen/grpc` dependency).
+//!
+//! Phase 5b-pre keeps the wiring minimal: `compile_fbs` is the seam, and
+//! Phase 5b plugs in the chosen follow-up.
 //!
 //! ## Schema discipline
 //!
@@ -43,7 +71,7 @@
     clippy::pedantic
 )]
 mod generated {
-    include!(concat!(env!("OUT_DIR"), "/taskq_v1_generated.rs"));
+    include!(concat!(env!("OUT_DIR"), "/common_generated.rs"));
 }
 
 /// Every generated type lives here under `taskq.v1`. Importing as

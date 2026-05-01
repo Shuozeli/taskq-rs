@@ -2,19 +2,25 @@
 //!
 //! `design.md` §7.2 / `problems/05`. Strategies translate an `AcquireTask`
 //! call into a `PickCriteria` and call `pick_and_lock_pending` on the
-//! `StorageTx`.
+//! storage transaction.
 //!
-//! ## Phase 5a status
+//! ## Phase 5b-pre status
 //!
 //! All three impls (`PriorityFifo`, `AgePromoted`, `RandomNamespace`) are
-//! `todo!()` stubs. Phase 5b plugs in the call to `pick_and_lock_pending`
-//! using the right `PickOrdering` variant.
+//! real: they build a `PickCriteria` keyed off the `PullCtx` and the
+//! strategy's stored params, then call into the storage shim. The
+//! `AcquireTask` handler (Phase 5b) is responsible for the surrounding
+//! transaction lifecycle and the long-poll loop; this trait only models
+//! the picking decision.
 
 use async_trait::async_trait;
 
-use taskq_storage::{Namespace, TaskId, TaskType, Timestamp};
+use taskq_storage::{
+    Namespace, NamespaceFilter, PickCriteria, PickOrdering, TaskId, TaskType, TaskTypeFilter,
+    Timestamp,
+};
 
-use crate::strategy::admitter::StorageTxDyn;
+use crate::state::StorageTxDyn;
 
 /// Acquire-time context handed to every `Dispatcher::pick_next` call.
 #[derive(Debug, Clone)]
@@ -22,7 +28,7 @@ pub struct PullCtx {
     /// Worker identity is opaque to the dispatcher; only the task-type filter
     /// matters for picking. The handler uses worker_id elsewhere (lease).
     pub task_types: Vec<TaskType>,
-    /// Namespace filter — typically a single namespace, but the
+    /// Namespace filter -- typically a single namespace, but the
     /// `RandomNamespace` dispatcher samples across multiple.
     pub namespace_filter: Vec<Namespace>,
     pub now: Timestamp,
@@ -44,8 +50,31 @@ pub trait Dispatcher: Send + Sync + 'static {
     fn name(&self) -> &'static str;
 }
 
+/// Translate `PullCtx.namespace_filter` into the storage trait's
+/// `NamespaceFilter` enum. The CP layer represents the filter as a flat
+/// `Vec<Namespace>`; storage prefers the discriminated form so backends can
+/// pick the right SQL shape.
+fn namespace_filter_for(ctx: &PullCtx) -> NamespaceFilter {
+    match ctx.namespace_filter.len() {
+        0 => NamespaceFilter::Any,
+        1 => NamespaceFilter::Single(ctx.namespace_filter[0].clone()),
+        _ => NamespaceFilter::AnyOf(ctx.namespace_filter.clone()),
+    }
+}
+
+/// Build the `PickCriteria` shared by every dispatcher. Each impl supplies
+/// only the `PickOrdering`; the rest of the criteria comes from `ctx`.
+fn build_criteria(ctx: &PullCtx, ordering: PickOrdering) -> PickCriteria {
+    PickCriteria {
+        namespace_filter: namespace_filter_for(ctx),
+        task_types_filter: TaskTypeFilter::AnyOf(ctx.task_types.clone()),
+        ordering,
+        now: ctx.now,
+    }
+}
+
 // ---------------------------------------------------------------------------
-// `PriorityFifo` — ORDER BY priority DESC, submitted_at ASC.
+// `PriorityFifo` -- ORDER BY priority DESC, submitted_at ASC.
 // ---------------------------------------------------------------------------
 
 /// Default dispatcher. Maps to `PickOrdering::PriorityFifo`.
@@ -54,11 +83,12 @@ pub struct PriorityFifoDispatcher;
 
 #[async_trait]
 impl Dispatcher for PriorityFifoDispatcher {
-    async fn pick_next(&self, _ctx: &PullCtx, _tx: &mut dyn StorageTxDyn) -> Option<TaskId> {
-        // TODO(phase-5b): build PickCriteria with PickOrdering::PriorityFifo,
-        //                 call tx.pick_and_lock_pending(criteria), return the
-        //                 task_id (or None).
-        todo!("phase-5b: PriorityFifo dispatcher")
+    async fn pick_next(&self, ctx: &PullCtx, tx: &mut dyn StorageTxDyn) -> Option<TaskId> {
+        let criteria = build_criteria(ctx, PickOrdering::PriorityFifo);
+        match tx.pick_and_lock_pending(criteria).await {
+            Ok(Some(locked)) => Some(locked.task_id),
+            Ok(None) | Err(_) => None,
+        }
     }
 
     fn name(&self) -> &'static str {
@@ -67,7 +97,7 @@ impl Dispatcher for PriorityFifoDispatcher {
 }
 
 // ---------------------------------------------------------------------------
-// `AgePromoted` — effective priority = base + f(age).
+// `AgePromoted` -- effective priority = base + f(age).
 // ---------------------------------------------------------------------------
 
 /// `AgePromoted` dispatcher. Maps to `PickOrdering::AgePromoted { age_weight }`.
@@ -80,11 +110,17 @@ pub struct AgePromotedDispatcher {
 
 #[async_trait]
 impl Dispatcher for AgePromotedDispatcher {
-    async fn pick_next(&self, _ctx: &PullCtx, _tx: &mut dyn StorageTxDyn) -> Option<TaskId> {
-        // TODO(phase-5b): build PickCriteria with PickOrdering::AgePromoted
-        //                 { age_weight: self.age_weight }, call
-        //                 tx.pick_and_lock_pending.
-        todo!("phase-5b: AgePromoted dispatcher")
+    async fn pick_next(&self, ctx: &PullCtx, tx: &mut dyn StorageTxDyn) -> Option<TaskId> {
+        let criteria = build_criteria(
+            ctx,
+            PickOrdering::AgePromoted {
+                age_weight: self.age_weight,
+            },
+        );
+        match tx.pick_and_lock_pending(criteria).await {
+            Ok(Some(locked)) => Some(locked.task_id),
+            Ok(None) | Err(_) => None,
+        }
     }
 
     fn name(&self) -> &'static str {
@@ -93,7 +129,7 @@ impl Dispatcher for AgePromotedDispatcher {
 }
 
 // ---------------------------------------------------------------------------
-// `RandomNamespace` — sample uniformly from active namespaces.
+// `RandomNamespace` -- sample uniformly from active namespaces.
 // ---------------------------------------------------------------------------
 
 /// `RandomNamespace` dispatcher. Maps to
@@ -107,11 +143,17 @@ pub struct RandomNamespaceDispatcher {
 
 #[async_trait]
 impl Dispatcher for RandomNamespaceDispatcher {
-    async fn pick_next(&self, _ctx: &PullCtx, _tx: &mut dyn StorageTxDyn) -> Option<TaskId> {
-        // TODO(phase-5b): build PickCriteria with PickOrdering::RandomNamespace
-        //                 { sample_attempts: self.sample_attempts }; call
-        //                 tx.pick_and_lock_pending.
-        todo!("phase-5b: RandomNamespace dispatcher")
+    async fn pick_next(&self, ctx: &PullCtx, tx: &mut dyn StorageTxDyn) -> Option<TaskId> {
+        let criteria = build_criteria(
+            ctx,
+            PickOrdering::RandomNamespace {
+                sample_attempts: self.sample_attempts,
+            },
+        );
+        match tx.pick_and_lock_pending(criteria).await {
+            Ok(Some(locked)) => Some(locked.task_id),
+            Ok(None) | Err(_) => None,
+        }
     }
 
     fn name(&self) -> &'static str {
@@ -122,6 +164,168 @@ impl Dispatcher for RandomNamespaceDispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use bytes::Bytes;
+    use taskq_storage::{
+        CapacityDecision, CapacityKind, LockedTask, NewLease, StorageError, TaskId,
+    };
+
+    use crate::state::{StorageTxDyn, StorageTxFuture};
+
+    /// Test fake recording the last `PickCriteria` it saw and returning a
+    /// scripted `LockedTask`. Mirrors the admitter-tests fake; the two
+    /// modules don't share since they exercise different shim methods.
+    #[derive(Default)]
+    struct FakeTx {
+        pick_response: Option<LockedTask>,
+        last_criteria: Option<PickCriteria>,
+    }
+
+    impl FakeTx {
+        fn with_pick(mut self, locked: LockedTask) -> Self {
+            self.pick_response = Some(locked);
+            self
+        }
+    }
+
+    impl StorageTxDyn for FakeTx {
+        fn check_capacity_quota<'a>(
+            &'a mut self,
+            _ns: &'a Namespace,
+            _kind: CapacityKind,
+        ) -> StorageTxFuture<'a, Result<CapacityDecision, StorageError>> {
+            unreachable!("admitter methods not exercised in dispatcher tests")
+        }
+
+        fn oldest_pending_age_ms<'a>(
+            &'a mut self,
+            _ns: &'a Namespace,
+        ) -> StorageTxFuture<'a, Result<Option<u64>, StorageError>> {
+            unreachable!("admitter methods not exercised in dispatcher tests")
+        }
+
+        fn pick_and_lock_pending<'a>(
+            &'a mut self,
+            criteria: PickCriteria,
+        ) -> StorageTxFuture<'a, Result<Option<LockedTask>, StorageError>> {
+            self.last_criteria = Some(criteria);
+            let response = self.pick_response.clone();
+            Box::pin(async move { Ok(response) })
+        }
+
+        fn record_acquisition<'a>(
+            &'a mut self,
+            _lease: NewLease,
+        ) -> StorageTxFuture<'a, Result<(), StorageError>> {
+            Box::pin(async move { Ok(()) })
+        }
+    }
+
+    fn pull_ctx_for(ns: &str, types: &[&str]) -> PullCtx {
+        PullCtx {
+            namespace_filter: vec![Namespace::new(ns)],
+            task_types: types.iter().map(|t| TaskType::new(*t)).collect(),
+            now: Timestamp::from_unix_millis(0),
+        }
+    }
+
+    fn make_locked_task(task_id: TaskId, ns: &str) -> LockedTask {
+        LockedTask {
+            task_id,
+            namespace: Namespace::new(ns),
+            task_type: TaskType::new("dummy"),
+            attempt_number: 0,
+            priority: 0,
+            payload: Bytes::new(),
+            submitted_at: Timestamp::from_unix_millis(0),
+            expires_at: Timestamp::from_unix_millis(1_000_000),
+            max_retries: 0,
+            retry_initial_ms: 0,
+            retry_max_ms: 0,
+            retry_coefficient: 1.0,
+            traceparent: Bytes::new(),
+            tracestate: Bytes::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn priority_fifo_returns_picked_task_id() {
+        // Arrange
+        let task_id = TaskId::generate();
+        let mut tx = FakeTx::default().with_pick(make_locked_task(task_id, "test"));
+        let ctx = pull_ctx_for("test", &["dummy"]);
+        let dispatcher = PriorityFifoDispatcher;
+
+        // Act
+        let picked = dispatcher
+            .pick_next(&ctx, &mut tx as &mut dyn StorageTxDyn)
+            .await;
+
+        // Assert
+        assert_eq!(picked, Some(task_id));
+        let criteria = tx.last_criteria.expect("criteria should be recorded");
+        assert!(matches!(criteria.ordering, PickOrdering::PriorityFifo));
+    }
+
+    #[tokio::test]
+    async fn age_promoted_passes_age_weight_to_storage() {
+        // Arrange
+        let mut tx = FakeTx::default();
+        let ctx = pull_ctx_for("test", &["dummy"]);
+        let dispatcher = AgePromotedDispatcher { age_weight: 2.5 };
+
+        // Act
+        let _ = dispatcher
+            .pick_next(&ctx, &mut tx as &mut dyn StorageTxDyn)
+            .await;
+
+        // Assert
+        let criteria = tx.last_criteria.expect("criteria should be recorded");
+        match criteria.ordering {
+            PickOrdering::AgePromoted { age_weight } => {
+                assert!((age_weight - 2.5).abs() < f64::EPSILON);
+            }
+            other => panic!("expected AgePromoted ordering, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn random_namespace_passes_sample_attempts_to_storage() {
+        // Arrange
+        let mut tx = FakeTx::default();
+        let ctx = pull_ctx_for("test", &["dummy"]);
+        let dispatcher = RandomNamespaceDispatcher { sample_attempts: 7 };
+
+        // Act
+        let _ = dispatcher
+            .pick_next(&ctx, &mut tx as &mut dyn StorageTxDyn)
+            .await;
+
+        // Assert
+        let criteria = tx.last_criteria.expect("criteria should be recorded");
+        match criteria.ordering {
+            PickOrdering::RandomNamespace { sample_attempts } => {
+                assert_eq!(sample_attempts, 7);
+            }
+            other => panic!("expected RandomNamespace ordering, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatcher_returns_none_when_no_candidates() {
+        // Arrange
+        let mut tx = FakeTx::default();
+        let ctx = pull_ctx_for("test", &["dummy"]);
+        let dispatcher = PriorityFifoDispatcher;
+
+        // Act
+        let picked = dispatcher
+            .pick_next(&ctx, &mut tx as &mut dyn StorageTxDyn)
+            .await;
+
+        // Assert
+        assert_eq!(picked, None);
+    }
 
     #[test]
     fn dispatcher_names_are_unique() {

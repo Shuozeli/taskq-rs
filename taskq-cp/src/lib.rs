@@ -42,7 +42,9 @@ pub use crate::server::serve;
 pub use crate::shutdown::{
     channel as shutdown_channel, wait_for_signal, ShutdownReceiver, ShutdownSender,
 };
-pub use crate::state::{CpState, DynStorage, NamespaceConfigCache, WaiterPool};
+pub use crate::state::{
+    CpState, DynStorage, NamespaceConfigCache, StorageTxDyn, StorageTxFuture, WaiterPool,
+};
 pub use crate::strategy::{
     admitter::{
         Admit, Admitter, AlwaysAdmitter, CoDelAdmitter, MaxPendingAdmitter, RejectReason, SubmitCtx,
