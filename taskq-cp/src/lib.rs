@@ -24,11 +24,20 @@
 
 #![forbid(unsafe_code)]
 
+/// Schema version this binary expects to find in `taskq_meta.schema_version`.
+///
+/// Mirrored from `main.rs::SCHEMA_VERSION`; declared here as well so the
+/// observability module can stamp `taskq_schema_version{component=taskq-cp}`
+/// at startup without depending on the binary entrypoint.
+pub const SCHEMA_VERSION: u32 = 2;
+
 pub mod audit;
+pub mod audit_pruner;
 pub mod config;
 pub mod error;
 pub mod handlers;
 pub mod health;
+pub mod metrics_refresher;
 pub mod observability;
 pub mod reapers;
 pub mod server;

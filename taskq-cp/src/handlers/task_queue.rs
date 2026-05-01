@@ -162,6 +162,20 @@ impl TaskQueue for TaskQueueHandler {
 ///    layer fuses steps 4 and 5 from the design doc into one call).
 /// 5. Commit.
 /// 6. Return `SubmitTaskResponse{ task_id, status: PENDING }`.
+///
+/// Phase 5d: a `tracing::Span` is opened with the namespace + task_type
+/// fields. The W3C `traceparent` from the request body is persisted on the
+/// task row so workers can continue the trace at acquire time
+/// (`design.md` §11.2).
+#[tracing::instrument(
+    name = "taskq.submit_task",
+    skip_all,
+    fields(
+        namespace = req.namespace.as_deref().unwrap_or(""),
+        task_type = req.task_type.as_deref().unwrap_or(""),
+        idempotency_key = req.idempotency_key.as_deref().unwrap_or(""),
+    ),
+)]
 async fn submit_task_impl(state: Arc<CpState>, req: SubmitTaskRequest) -> SubmitTaskResponse {
     // Validate required fields on the wire body. Missing required fields
     // are a permanent INVALID_PAYLOAD rejection per `design.md` §10.2.
@@ -325,9 +339,16 @@ async fn submit_task_impl(state: Arc<CpState>, req: SubmitTaskRequest) -> Submit
 
     match result {
         Ok(Ok(SubmitTaskHit::Created(task_id))) => {
-            metrics
-                .submit_total
-                .add(1, &[KeyValue::new("namespace", namespace_str.clone())]);
+            // §11.3 submit-side counters carry (namespace, task_type, outcome).
+            metrics.submit_total.add(
+                1,
+                &[
+                    KeyValue::new("namespace", namespace_str.clone()),
+                    KeyValue::new("task_type", task_type.as_str().to_owned()),
+                    KeyValue::new("outcome", "accepted"),
+                ],
+            );
+            // Histogram drops `task_type` per §11.3.
             metrics.submit_payload_bytes.record(
                 payload_bytes.len() as u64,
                 &[KeyValue::new("namespace", namespace_str)],
@@ -337,7 +358,18 @@ async fn submit_task_impl(state: Arc<CpState>, req: SubmitTaskRequest) -> Submit
         Ok(Ok(SubmitTaskHit::Existing(task_id))) => {
             metrics
                 .idempotency_hit_total
-                .add(1, &[KeyValue::new("namespace", namespace_str)]);
+                .add(1, &[KeyValue::new("namespace", namespace_str.clone())]);
+            // Idempotent hits also count as a (logical) submit acceptance for
+            // the rate metric, but with a distinct outcome so dashboards can
+            // segment them.
+            metrics.submit_total.add(
+                1,
+                &[
+                    KeyValue::new("namespace", namespace_str),
+                    KeyValue::new("task_type", task_type.as_str().to_owned()),
+                    KeyValue::new("outcome", "idempotent_hit"),
+                ],
+            );
             ok_submit_response(task_id, TerminalState::PENDING, true)
         }
         Ok(Ok(SubmitTaskHit::PayloadMismatch {
@@ -346,7 +378,22 @@ async fn submit_task_impl(state: Arc<CpState>, req: SubmitTaskRequest) -> Submit
         })) => {
             metrics
                 .idempotency_payload_mismatch_total
-                .add(1, &[KeyValue::new("namespace", namespace_str)]);
+                .add(1, &[KeyValue::new("namespace", namespace_str.clone())]);
+            metrics.rejection_total.add(
+                1,
+                &[
+                    KeyValue::new("namespace", namespace_str.clone()),
+                    KeyValue::new("reason", "IDEMPOTENCY_KEY_REUSE_WITH_DIFFERENT_PAYLOAD"),
+                ],
+            );
+            metrics.submit_total.add(
+                1,
+                &[
+                    KeyValue::new("namespace", namespace_str),
+                    KeyValue::new("task_type", task_type.as_str().to_owned()),
+                    KeyValue::new("outcome", "rejected_payload_mismatch"),
+                ],
+            );
             payload_mismatch_response(existing_task_id, existing_payload_hash.to_vec())
         }
         Ok(Err(reason)) => {
@@ -354,16 +401,66 @@ async fn submit_task_impl(state: Arc<CpState>, req: SubmitTaskRequest) -> Submit
             metrics.rejection_total.add(
                 1,
                 &[
-                    KeyValue::new("namespace", namespace_str),
+                    KeyValue::new("namespace", namespace_str.clone()),
                     KeyValue::new("reason", format!("{wire:?}")),
+                ],
+            );
+            // System-overload surfaced as a rate-limit hit lets capacity-
+            // planning dashboards distinguish "hit a quota" from "got
+            // rejected for invalid payload"; same emit point keeps the
+            // labels consistent.
+            if matches!(wire, WireRejectReason::SYSTEM_OVERLOAD) {
+                metrics.rate_limit_hit_total.add(
+                    1,
+                    &[
+                        KeyValue::new("namespace", namespace_str.clone()),
+                        KeyValue::new("kind", "submit_rpm"),
+                    ],
+                );
+            }
+            metrics.submit_total.add(
+                1,
+                &[
+                    KeyValue::new("namespace", namespace_str),
+                    KeyValue::new("task_type", task_type.as_str().to_owned()),
+                    KeyValue::new("outcome", reject_outcome_label(wire)),
                 ],
             );
             reject_response(wire, "admit-time rejection")
         }
         Err(err) => {
             tracing::error!(error = %err, "submit_task storage error");
+            metrics.rejection_total.add(
+                1,
+                &[
+                    KeyValue::new("namespace", namespace_str.clone()),
+                    KeyValue::new("reason", "STORAGE_ERROR"),
+                ],
+            );
+            metrics.submit_total.add(
+                1,
+                &[
+                    KeyValue::new("namespace", namespace_str),
+                    KeyValue::new("task_type", task_type.as_str().to_owned()),
+                    KeyValue::new("outcome", "rejected_storage_error"),
+                ],
+            );
             reject_response(WireRejectReason::SYSTEM_OVERLOAD, "storage error")
         }
+    }
+}
+
+/// Map the wire reject reason to the `outcome` label value used by
+/// `taskq_submit_total`. Keeps the label vocabulary stable across rejection
+/// reasons.
+fn reject_outcome_label(reason: WireRejectReason) -> &'static str {
+    match reason {
+        WireRejectReason::MAX_PENDING_EXCEEDED => "rejected_max_pending",
+        WireRejectReason::LATENCY_TARGET_EXCEEDED => "rejected_latency_target",
+        WireRejectReason::NAMESPACE_QUOTA_EXCEEDED => "rejected_quota",
+        WireRejectReason::SYSTEM_OVERLOAD => "rejected_overload",
+        WireRejectReason::NAMESPACE_DISABLED => "rejected_namespace_disabled",
+        _ => "rejected_other",
     }
 }
 
@@ -382,6 +479,11 @@ enum SubmitTaskHit {
 // CancelTask
 // ---------------------------------------------------------------------------
 
+#[tracing::instrument(
+    name = "taskq.cancel_task",
+    skip_all,
+    fields(task_id = req.task_id.as_deref().unwrap_or("")),
+)]
 async fn cancel_task_impl(
     state: Arc<CpState>,
     req: CancelTaskRequest,
@@ -723,6 +825,33 @@ mod tests {
             WireRejectReason::IDEMPOTENCY_KEY_REUSE_WITH_DIFFERENT_PAYLOAD
         );
         assert!(!err.retryable);
+    }
+
+    #[test]
+    fn reject_outcome_label_maps_known_reasons() {
+        // Arrange / Act / Assert: round-trip every wire reason that
+        // submit_task surfaces to ensure the dashboard label vocabulary
+        // stays stable.
+        assert_eq!(
+            reject_outcome_label(WireRejectReason::MAX_PENDING_EXCEEDED),
+            "rejected_max_pending"
+        );
+        assert_eq!(
+            reject_outcome_label(WireRejectReason::LATENCY_TARGET_EXCEEDED),
+            "rejected_latency_target"
+        );
+        assert_eq!(
+            reject_outcome_label(WireRejectReason::NAMESPACE_QUOTA_EXCEEDED),
+            "rejected_quota"
+        );
+        assert_eq!(
+            reject_outcome_label(WireRejectReason::SYSTEM_OVERLOAD),
+            "rejected_overload"
+        );
+        assert_eq!(
+            reject_outcome_label(WireRejectReason::NAMESPACE_DISABLED),
+            "rejected_namespace_disabled"
+        );
     }
 
     #[tokio::test]

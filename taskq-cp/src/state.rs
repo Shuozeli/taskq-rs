@@ -201,6 +201,13 @@ pub trait StorageTxDyn: Send {
         entry: AuditEntry,
     ) -> StorageTxFuture<'a, Result<(), StorageError>>;
 
+    fn delete_audit_logs_before<'a>(
+        &'a mut self,
+        namespace: &'a Namespace,
+        before: Timestamp,
+        n: usize,
+    ) -> StorageTxFuture<'a, Result<usize, StorageError>>;
+
     // ---- Phase 5c admin / cancel / reapers ----------------------------
 
     fn cancel_task<'a>(
@@ -465,6 +472,20 @@ where
         entry: AuditEntry,
     ) -> StorageTxFuture<'a, Result<(), StorageError>> {
         Box::pin(StorageTx::audit_log_append(&mut self.inner, entry))
+    }
+
+    fn delete_audit_logs_before<'a>(
+        &'a mut self,
+        namespace: &'a Namespace,
+        before: Timestamp,
+        n: usize,
+    ) -> StorageTxFuture<'a, Result<usize, StorageError>> {
+        Box::pin(StorageTx::delete_audit_logs_before(
+            &mut self.inner,
+            namespace,
+            before,
+            n,
+        ))
     }
 
     fn cancel_task<'a>(

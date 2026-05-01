@@ -32,16 +32,10 @@ use taskq_cp::error::CpError;
 use taskq_cp::health::HealthState;
 use taskq_cp::state::{CpState, DynStorage};
 use taskq_cp::strategy::StrategyRegistry;
-use taskq_cp::{health, observability, reapers, server, shutdown};
-
-/// Schema version this binary expects to find in `taskq_meta.schema_version`.
-///
-/// Bumped any time a migration is added under `taskq-storage-{postgres,sqlite}/migrations/`
-/// and corresponds to the highest migration the bundled binary knows how to
-/// apply. `design.md` §12.5: production CPs run `taskq-cp migrate` deliberately;
-/// `serve` refuses to start when the storage backend's recorded version does
-/// not match this constant unless `--auto-migrate` is passed.
-const SCHEMA_VERSION: u32 = 2;
+use taskq_cp::{
+    audit_pruner, health, metrics_refresher, observability, reapers, server, shutdown,
+    SCHEMA_VERSION,
+};
 
 /// Command-line interface for `taskq-cp`.
 ///
@@ -187,6 +181,16 @@ async fn run_serve(config: CpConfig, auto_migrate: bool) -> anyhow::Result<()> {
     let (reaper_a_handle, reaper_b_handle) =
         reapers::spawn_reapers(Arc::clone(&cp_state), shutdown_rx.clone());
 
+    // Phase 5d: periodic metrics refresher updates gauge instruments
+    // (pending_count, inflight_count, workers_registered, waiters_active,
+    // quota_usage_ratio) from storage every 30s. Spawned alongside the
+    // reapers so it shuts down on the same signal.
+    let metrics_handle = metrics_refresher::spawn(Arc::clone(&cp_state), shutdown_rx.clone());
+
+    // Phase 5d: audit-log retention pruner. Runs hourly per `design.md`
+    // §11.4; rate-limited at 1000 rows per pass per namespace.
+    let pruner_handle = audit_pruner::spawn(Arc::clone(&cp_state), shutdown_rx.clone());
+
     // Run the gRPC server. Blocks until shutdown fires.
     let serve_result = server::serve(Arc::clone(&cp_state), shutdown_rx).await;
     if let Err(err) = &serve_result {
@@ -207,6 +211,12 @@ async fn run_serve(config: CpConfig, auto_migrate: bool) -> anyhow::Result<()> {
     }
     if let Err(err) = reaper_b_handle.await {
         tracing::warn!(error = %err, "reaper-b task panicked");
+    }
+    if let Err(err) = metrics_handle.await {
+        tracing::warn!(error = %err, "metrics refresher task panicked");
+    }
+    if let Err(err) = pruner_handle.await {
+        tracing::warn!(error = %err, "audit pruner task panicked");
     }
 
     observability_state.shutdown();

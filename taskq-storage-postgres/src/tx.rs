@@ -840,6 +840,35 @@ impl<'a> StorageTx for PostgresTx<'a> {
         Ok(())
     }
 
+    async fn delete_audit_logs_before(
+        &mut self,
+        namespace: &Namespace,
+        before: Timestamp,
+        n: usize,
+    ) -> Result<usize> {
+        // Phase 5d: bounded-cost retention pruning per `design.md` §11.4.
+        // We use a CTE-style delete with `ctid IN (SELECT ... LIMIT n)` to
+        // honor the `n` cap (Postgres's `DELETE` does not support `LIMIT`
+        // directly).
+        let cutoff = timestamp_to_chrono(before);
+        let limit = n as i64;
+        let ns_str = namespace.as_str();
+        let deleted = self
+            .conn
+            .execute(
+                "DELETE FROM audit_log \
+                 WHERE ctid IN ( \
+                     SELECT ctid FROM audit_log \
+                      WHERE namespace = $1 AND timestamp < $2 \
+                      LIMIT $3 \
+                 )",
+                &[&ns_str, &cutoff, &limit],
+            )
+            .await
+            .map_err(map_db_error)?;
+        Ok(deleted as usize)
+    }
+
     // ========================================================================
     // Phase 5c admin / cancel / reaper-B
     // ========================================================================

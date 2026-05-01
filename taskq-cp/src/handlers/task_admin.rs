@@ -228,6 +228,7 @@ impl TaskAdmin for TaskAdminHandler {
 // SetNamespaceQuota
 // ---------------------------------------------------------------------------
 
+#[tracing::instrument(name = "taskq.admin.set_namespace_quota", skip_all)]
 async fn set_namespace_quota_impl(
     state: Arc<CpState>,
     req: SetNamespaceQuotaRequest,
@@ -318,6 +319,11 @@ async fn set_namespace_quota_impl(
 // GetNamespaceQuota
 // ---------------------------------------------------------------------------
 
+#[tracing::instrument(
+    name = "taskq.admin.get_namespace_quota",
+    skip_all,
+    fields(namespace = req.namespace.as_deref().unwrap_or("")),
+)]
 async fn get_namespace_quota_impl(
     state: Arc<CpState>,
     req: GetNamespaceQuotaRequest,
@@ -361,6 +367,11 @@ async fn get_namespace_quota_impl(
 // SetNamespaceConfig
 // ---------------------------------------------------------------------------
 
+#[tracing::instrument(
+    name = "taskq.admin.set_namespace_config",
+    skip_all,
+    fields(namespace = req.namespace.as_deref().unwrap_or("")),
+)]
 async fn set_namespace_config_impl(
     state: Arc<CpState>,
     req: SetNamespaceConfigRequest,
@@ -496,6 +507,11 @@ async fn set_namespace_config_impl(
 // EnableNamespace / DisableNamespace
 // ---------------------------------------------------------------------------
 
+#[tracing::instrument(
+    name = "taskq.admin.enable_namespace",
+    skip_all,
+    fields(namespace = req.namespace.as_deref().unwrap_or("")),
+)]
 async fn enable_namespace_impl(
     state: Arc<CpState>,
     req: EnableNamespaceRequest,
@@ -551,6 +567,11 @@ async fn enable_namespace_impl(
     Ok(resp)
 }
 
+#[tracing::instrument(
+    name = "taskq.admin.disable_namespace",
+    skip_all,
+    fields(namespace = req.namespace.as_deref().unwrap_or("")),
+)]
 async fn disable_namespace_impl(
     state: Arc<CpState>,
     req: DisableNamespaceRequest,
@@ -611,6 +632,11 @@ async fn disable_namespace_impl(
 // PurgeTasks
 // ---------------------------------------------------------------------------
 
+#[tracing::instrument(
+    name = "taskq.admin.purge_tasks",
+    skip_all,
+    fields(namespace = req.namespace.as_deref().unwrap_or("")),
+)]
 async fn purge_tasks_impl(
     state: Arc<CpState>,
     req: PurgeTasksRequest,
@@ -734,6 +760,11 @@ async fn purge_tasks_impl(
 // ReplayDeadLetters
 // ---------------------------------------------------------------------------
 
+#[tracing::instrument(
+    name = "taskq.admin.replay_dead_letters",
+    skip_all,
+    fields(namespace = req.namespace.as_deref().unwrap_or("")),
+)]
 async fn replay_dead_letters_impl(
     state: Arc<CpState>,
     req: ReplayDeadLettersRequest,
@@ -842,6 +873,14 @@ async fn replay_dead_letters_impl(
         tokio::time::sleep(pacing).await;
     }
 
+    // §11.3: emit `taskq_replay_total{namespace}` per batch of replayed tasks.
+    if !replayed.is_empty() {
+        state.metrics.replay_total.add(
+            replayed.len() as u64,
+            &[taskq_proto_namespace_label(&namespace)],
+        );
+    }
+
     let mut resp = ReplayDeadLettersResponse::default();
     resp.replayed = Some(replayed);
     resp.skipped_count = skipped;
@@ -850,10 +889,19 @@ async fn replay_dead_letters_impl(
     Ok(resp)
 }
 
+fn taskq_proto_namespace_label(ns: &Namespace) -> opentelemetry::KeyValue {
+    opentelemetry::KeyValue::new("namespace", ns.as_str().to_owned())
+}
+
 // ---------------------------------------------------------------------------
 // GetStats
 // ---------------------------------------------------------------------------
 
+#[tracing::instrument(
+    name = "taskq.admin.get_stats",
+    skip_all,
+    fields(namespace = req.namespace.as_deref().unwrap_or("")),
+)]
 async fn get_stats_impl(
     state: Arc<CpState>,
     req: GetStatsRequest,
@@ -913,6 +961,11 @@ async fn get_stats_impl(
 // ListWorkers
 // ---------------------------------------------------------------------------
 
+#[tracing::instrument(
+    name = "taskq.admin.list_workers",
+    skip_all,
+    fields(namespace = req.namespace.as_deref().unwrap_or("")),
+)]
 async fn list_workers_impl(
     state: Arc<CpState>,
     req: ListWorkersRequest,

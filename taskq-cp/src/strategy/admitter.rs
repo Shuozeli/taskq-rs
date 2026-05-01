@@ -327,6 +327,15 @@ mod tests {
             unreachable!("admin methods not exercised in admitter tests")
         }
 
+        fn delete_audit_logs_before<'a>(
+            &'a mut self,
+            _namespace: &'a Namespace,
+            _before: Timestamp,
+            _n: usize,
+        ) -> StorageTxFuture<'a, Result<usize, StorageError>> {
+            unreachable!("admin methods not exercised in admitter tests")
+        }
+
         fn cancel_task<'a>(
             &'a mut self,
             _task_id: TaskId,

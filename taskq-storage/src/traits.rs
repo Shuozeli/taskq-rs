@@ -361,6 +361,21 @@ pub trait StorageTx: Send {
         entry: AuditEntry,
     ) -> impl std::future::Future<Output = Result<()>> + Send;
 
+    /// Used by the Phase 5d audit-log retention pruner (`design.md` §11.4):
+    /// delete up to `n` `audit_log` rows for `namespace` whose `timestamp`
+    /// is strictly less than `before`. Rate-limited at the call site;
+    /// backends MUST honor the `n` cap so storage spike is bounded.
+    ///
+    /// Returns the number of rows deleted.
+    ///
+    /// SERIALIZABLE: yes (low-frequency, contention-tolerant).
+    fn delete_audit_logs_before(
+        &mut self,
+        namespace: &Namespace,
+        before: Timestamp,
+        n: usize,
+    ) -> impl std::future::Future<Output = Result<usize>> + Send;
+
     // ========================================================================
     // Phase 5c admin / cancel / reaper-B
     // ========================================================================

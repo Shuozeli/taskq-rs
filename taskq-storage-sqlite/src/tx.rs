@@ -756,6 +756,31 @@ impl StorageTx for SqliteTx {
         Ok(())
     }
 
+    async fn delete_audit_logs_before(
+        &mut self,
+        namespace: &Namespace,
+        before: Timestamp,
+        n: usize,
+    ) -> StorageResult<usize> {
+        // Phase 5d: bounded-cost retention pruning per `design.md` §11.4.
+        // Same `rowid IN (SELECT ... LIMIT n)` pattern used by
+        // `delete_expired_dedup` so the bundled SQLite (without
+        // `SQLITE_ENABLE_UPDATE_DELETE_LIMIT`) honors the cap.
+        let deleted = self
+            .conn()
+            .execute(
+                "DELETE FROM audit_log \
+                 WHERE rowid IN ( \
+                     SELECT rowid FROM audit_log \
+                      WHERE namespace = ?1 AND timestamp < ?2 \
+                      LIMIT ?3 \
+                 )",
+                params![namespace.as_str(), ts_to_millis(before), n as i64],
+            )
+            .map_err(map_sql_error)?;
+        Ok(deleted)
+    }
+
     // ------------------------------------------------------------------------
     // Phase 5c admin / cancel / reaper-B
     // ------------------------------------------------------------------------

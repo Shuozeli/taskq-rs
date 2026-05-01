@@ -123,6 +123,13 @@ async fn run_reaper_b(state: Arc<CpState>, mut shutdown: ShutdownReceiver) {
 /// Run one Reaper A tick. Reclaim every expired runtime row in a single
 /// SERIALIZABLE transaction (with 40001 retry) and wake one waiter per
 /// reclaimed task on commit.
+///
+/// Phase 5d: emits a `tracing::Span` for the tick (`taskq.reaper_a`) and,
+/// per reclaimed lease, an `info!` event carrying `task_id`. When the task
+/// row's persisted `traceparent` is non-empty, the event includes it so
+/// log-aggregation tooling can correlate the reclaim back to the original
+/// task's trace (`design.md` §11.2).
+#[tracing::instrument(name = "taskq.reaper_a", skip_all)]
 async fn reaper_a_tick(state: Arc<CpState>) -> Result<(), StorageError> {
     let now = current_timestamp();
     let metrics = state.metrics.clone();
@@ -135,7 +142,25 @@ async fn reaper_a_tick(state: Arc<CpState>) -> Result<(), StorageError> {
                 let expired = tx.list_expired_runtimes(now, REAPER_BATCH_SIZE).await?;
                 let mut reclaimed = Vec::with_capacity(expired.len());
                 for row in expired {
+                    // Best-effort: read the task's traceparent so the reclaim
+                    // emit-event correlates to the original parent trace.
+                    // `get_task_by_id` is a serializable read; failure here
+                    // does not block reclamation.
+                    let traceparent = match tx.get_task_by_id(row.task_id).await {
+                        Ok(Some(t)) => Some(t.traceparent),
+                        _ => None,
+                    };
                     reclaim_one_a(&mut *tx, &row).await?;
+                    if let Some(tp) = traceparent.as_ref() {
+                        if !tp.is_empty() {
+                            tracing::info!(
+                                task_id = %row.task_id,
+                                namespace = %row.namespace.as_str(),
+                                traceparent = ?tp.as_ref(),
+                                "reaper-a: reclaiming lease, continuing parent trace"
+                            );
+                        }
+                    }
                     reclaimed.push(row.namespace);
                 }
                 tx.commit_dyn().await?;
@@ -148,10 +173,15 @@ async fn reaper_a_tick(state: Arc<CpState>) -> Result<(), StorageError> {
     // pings WaiterPool::wake_one with an empty type filter so any worker
     // registered on the namespace gets a chance.
     for namespace in &reclaimed_namespaces {
-        state.metrics.lease_expired_total.add(
-            1,
-            &[KeyValue::new("namespace", namespace.as_str().to_owned())],
-        );
+        let ns_str = namespace.as_str().to_owned();
+        state
+            .metrics
+            .lease_expired_total
+            .add(1, &[KeyValue::new("namespace", ns_str.clone())]);
+        // Reaper A reclaim is not necessarily terminal — the task goes back
+        // to PENDING. We do not increment `terminal_total` here. Operators
+        // who want "expired" terminal events look at the dispatcher path
+        // when `expires_at` triggers EXPIRED on retry.
         state
             .waiter_pool
             .wake_one(namespace, &[] as &[TaskType])
@@ -184,6 +214,7 @@ async fn reclaim_one_a(
 /// `CpConfig::lease_window_seconds`; rows whose worker's last heartbeat
 /// predates `now - lease_window` are reclaimed and the worker is stamped
 /// `declared_dead_at = NOW()`.
+#[tracing::instrument(name = "taskq.reaper_b", skip_all)]
 async fn reaper_b_tick(state: Arc<CpState>) -> Result<(), StorageError> {
     let now = current_timestamp();
     let lease_window = Duration::from_secs(u64::from(state.config.lease_window_seconds));

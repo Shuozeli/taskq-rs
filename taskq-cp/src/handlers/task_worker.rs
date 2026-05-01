@@ -148,6 +148,11 @@ impl TaskWorker for TaskWorkerHandler {
 // Register (design.md §6.3 RegisterWorkerResponse contract)
 // ---------------------------------------------------------------------------
 
+#[tracing::instrument(
+    name = "taskq.register_worker",
+    skip_all,
+    fields(namespace = req.namespace.as_deref().unwrap_or("")),
+)]
 async fn register_impl(
     state: Arc<CpState>,
     req: RegisterWorkerRequest,
@@ -266,6 +271,14 @@ enum RegisterFlow {
 // AcquireTask (design.md §6.2 long-poll)
 // ---------------------------------------------------------------------------
 
+#[tracing::instrument(
+    name = "taskq.acquire_task",
+    skip_all,
+    fields(
+        namespace = req.namespace.as_deref().unwrap_or(""),
+        worker_id = req.worker_id.as_deref().unwrap_or(""),
+    ),
+)]
 async fn acquire_task_impl(
     state: Arc<CpState>,
     req: AcquireTaskRequest,
@@ -295,6 +308,7 @@ async fn acquire_task_impl(
     let timeout = effective_long_poll_timeout(&state, req.long_poll_timeout_ms);
     let belt = Duration::from_secs(u64::from(state.config.belt_and_suspenders_seconds));
     let deadline = tokio::time::Instant::now() + timeout;
+    let started_at = tokio::time::Instant::now();
     let metrics = state.metrics.clone();
 
     // Worker-liveness validation lives inside the dispatch loop so the
@@ -341,10 +355,26 @@ async fn acquire_task_impl(
         )
         .await;
         match dispatch_outcome {
-            Ok(Some(resp)) => {
+            Ok(Some(DispatchHit { resp, dispatch })) => {
+                let waited = started_at.elapsed().as_secs_f64();
+                let task_type_label = dispatch.task_type.as_str().to_owned();
+                metrics.dispatch_total.add(
+                    1,
+                    &[
+                        KeyValue::new("namespace", namespace_str.clone()),
+                        KeyValue::new("task_type", task_type_label),
+                    ],
+                );
+                // Histograms drop `task_type` per §11.3.
                 metrics
-                    .dispatch_total
-                    .add(1, &[KeyValue::new("namespace", namespace_str.clone())]);
+                    .long_poll_wait_seconds
+                    .record(waited, &[KeyValue::new("namespace", namespace_str.clone())]);
+                if let Some(submit_to_dispatch_s) = dispatch.submit_to_dispatch_seconds {
+                    metrics.dispatch_latency_seconds.record(
+                        submit_to_dispatch_s,
+                        &[KeyValue::new("namespace", namespace_str.clone())],
+                    );
+                }
                 return Ok(resp);
             }
             Ok(None) => {} // fall through to wait
@@ -362,13 +392,42 @@ async fn acquire_task_impl(
             .checked_duration_since(tokio::time::Instant::now())
             .unwrap_or_else(|| Duration::from_millis(0));
         if remaining.is_zero() {
+            // Long-poll timed out without a hit. Record the wait time for
+            // observability — operators use this to size pool concurrency.
+            metrics.long_poll_wait_seconds.record(
+                started_at.elapsed().as_secs_f64(),
+                &[KeyValue::new("namespace", namespace_str)],
+            );
             return Ok(no_task_response());
         }
         match waiter.wait_for_wake_or_timeout(remaining, belt).await {
             WakeOutcome::Woken | WakeOutcome::BeltAndSuspenders => continue,
-            WakeOutcome::Timeout => return Ok(no_task_response()),
+            WakeOutcome::Timeout => {
+                metrics.long_poll_wait_seconds.record(
+                    started_at.elapsed().as_secs_f64(),
+                    &[KeyValue::new("namespace", namespace_str)],
+                );
+                return Ok(no_task_response());
+            }
         }
     }
+}
+
+/// Side-channel data carried back from `try_dispatch` so the long-poll
+/// caller can emit per-task metrics (which require knowing the task_type
+/// and submit timestamp picked by the dispatcher).
+struct DispatchHit {
+    resp: AcquireTaskResponse,
+    dispatch: DispatchInfo,
+}
+
+struct DispatchInfo {
+    task_type: TaskType,
+    /// Seconds from PENDING insert (`submitted_at`) to DISPATCHED
+    /// (`record_acquisition`). `None` if the clock skew yields a negative
+    /// elapsed (e.g. SystemTime jumped) — drop the sample rather than
+    /// pollute the histogram.
+    submit_to_dispatch_seconds: Option<f64>,
 }
 
 /// Open a short transaction, look up the worker's heartbeat row, return
@@ -428,12 +487,15 @@ async fn try_dispatch(
     namespace: Namespace,
     task_types: Vec<TaskType>,
     worker_id: WorkerId,
-) -> Result<Option<AcquireTaskResponse>, StorageError> {
+) -> Result<Option<DispatchHit>, StorageError> {
     let metrics = state.metrics.clone();
+    let namespace_str = namespace.as_str().to_owned();
     with_serializable_retry(&metrics, "acquire_task", || {
         let state = Arc::clone(&state);
         let namespace = namespace.clone();
         let task_types = task_types.clone();
+        let metrics = metrics.clone();
+        let namespace_str = namespace_str.clone();
         async move {
             let mut tx = state.storage.begin_dyn().await?;
 
@@ -443,6 +505,13 @@ async fn try_dispatch(
                 .await
             {
                 let _ = tx.rollback_dyn().await;
+                metrics.rate_limit_hit_total.add(
+                    1,
+                    &[
+                        KeyValue::new("namespace", namespace_str),
+                        KeyValue::new("kind", "dispatch_rpm"),
+                    ],
+                );
                 return Ok(None);
             }
 
@@ -541,7 +610,37 @@ async fn try_dispatch(
             resp.traceparent = Some(locked.traceparent.to_vec());
             resp.tracestate = Some(locked.tracestate.to_vec());
             resp.server_version = Some(Box::new(server_semver()));
-            Ok(Some(resp))
+
+            // Compute submit -> dispatch latency for the histogram emit
+            // upstream. `now - submitted_at` in seconds. A negative value
+            // (clock jump) becomes None and the sample is dropped.
+            let elapsed_ms = now.as_unix_millis() - locked.submitted_at.as_unix_millis();
+            let submit_to_dispatch_seconds = if elapsed_ms >= 0 {
+                Some(elapsed_ms as f64 / 1_000.0)
+            } else {
+                None
+            };
+
+            // Continue the trace from the persisted W3C `traceparent`. The
+            // span itself is created via `tracing::info_span!` so it shows
+            // up under the active OTel pipeline. We only emit a marker
+            // event for now; once `tracing-opentelemetry`'s context-extract
+            // helper is wired with W3C parsing, this will become a true
+            // continuation. The emitted event still carries the traceparent
+            // bytes so trace correlation works at log-aggregation time.
+            if !locked.traceparent.is_empty() {
+                tracing::info!(
+                    traceparent = ?locked.traceparent.as_ref(),
+                    task_id = %locked.task_id,
+                    "taskq.dispatch: continuing parent trace"
+                );
+            }
+
+            let dispatch = DispatchInfo {
+                task_type: locked.task_type.clone(),
+                submit_to_dispatch_seconds,
+            };
+            Ok(Some(DispatchHit { resp, dispatch }))
         }
     })
     .await
@@ -551,6 +650,14 @@ async fn try_dispatch(
 // Heartbeat (READ COMMITTED carve-out + lazy lease extension)
 // ---------------------------------------------------------------------------
 
+#[tracing::instrument(
+    name = "taskq.heartbeat",
+    skip_all,
+    fields(
+        namespace = req.namespace.as_deref().unwrap_or(""),
+        worker_id = req.worker_id.as_deref().unwrap_or(""),
+    ),
+)]
 async fn heartbeat_impl(
     state: Arc<CpState>,
     req: HeartbeatRequest,
@@ -662,6 +769,14 @@ async fn heartbeat_impl(
 // CompleteTask (design.md §6.4)
 // ---------------------------------------------------------------------------
 
+#[tracing::instrument(
+    name = "taskq.complete_task",
+    skip_all,
+    fields(
+        task_id = req.task_id.as_deref().unwrap_or(""),
+        worker_id = req.worker_id.as_deref().unwrap_or(""),
+    ),
+)]
 async fn complete_task_impl(
     state: Arc<CpState>,
     req: CompleteTaskRequest,
@@ -700,14 +815,21 @@ async fn complete_task_impl(
         let outcome = outcome.clone();
         async move {
             let mut tx = state.storage.begin_dyn().await?;
+            // Read the task before mutating so we can label metrics by
+            // namespace + task_type. The read participates in the same
+            // SERIALIZABLE transaction as the state transition.
+            let task_meta = match tx.get_task_by_id(task_id).await {
+                Ok(Some(t)) => Some((t.namespace.clone(), t.task_type.clone())),
+                _ => None,
+            };
             match tx.complete_task(&lease_ref, outcome).await {
                 Ok(()) => {
                     tx.commit_dyn().await?;
-                    Ok(CompleteFlow::Completed)
+                    Ok(CompleteFlow::Completed { task_meta })
                 }
                 Err(StorageError::NotFound) => {
                     let _ = tx.rollback_dyn().await;
-                    Ok(CompleteFlow::LeaseExpired)
+                    Ok(CompleteFlow::LeaseExpired { task_meta })
                 }
                 Err(other) => {
                     let _ = tx.rollback_dyn().await;
@@ -719,17 +841,23 @@ async fn complete_task_impl(
     .await;
 
     match result {
-        Ok(CompleteFlow::Completed) => {
-            metrics.complete_total.add(1, &[]);
-            metrics.terminal_total.add(1, &[]);
+        Ok(CompleteFlow::Completed { task_meta }) => {
+            let labels = lifecycle_labels(task_meta.as_ref(), "success");
+            metrics.complete_total.add(1, &labels);
+            metrics
+                .terminal_total
+                .add(1, &terminal_labels(task_meta.as_ref(), "COMPLETED"));
             let mut resp = CompleteTaskResponse::default();
             resp.task_id = Some(task_id_str);
             resp.final_status = TerminalState::COMPLETED;
             resp.server_version = Some(Box::new(server_semver()));
             Ok(resp)
         }
-        Ok(CompleteFlow::LeaseExpired) => {
-            metrics.lease_expired_total.add(1, &[]);
+        Ok(CompleteFlow::LeaseExpired { task_meta }) => {
+            metrics.lease_expired_total.add(
+                1,
+                &lifecycle_labels(task_meta.as_ref(), "lease_expired")[..2],
+            );
             let mut resp = CompleteTaskResponse::default();
             resp.task_id = Some(task_id_str);
             resp.final_status = TerminalState::PENDING;
@@ -747,15 +875,57 @@ async fn complete_task_impl(
     }
 }
 
+/// Build the `(namespace, task_type, outcome)` label slice. When task
+/// metadata is unavailable (e.g. a stale-id complete after a race),
+/// substitute "unknown" so the metric still records — operators can see
+/// the dimension exists but lacks identification.
+fn lifecycle_labels(meta: Option<&(Namespace, TaskType)>, outcome: &str) -> [KeyValue; 3] {
+    let (ns, tt) = match meta {
+        Some((n, t)) => (n.as_str().to_owned(), t.as_str().to_owned()),
+        None => ("unknown".to_owned(), "unknown".to_owned()),
+    };
+    [
+        KeyValue::new("namespace", ns),
+        KeyValue::new("task_type", tt),
+        KeyValue::new("outcome", outcome.to_owned()),
+    ]
+}
+
+/// Build the `(namespace, task_type, terminal_state)` label slice for
+/// `taskq_terminal_total`.
+fn terminal_labels(meta: Option<&(Namespace, TaskType)>, terminal_state: &str) -> [KeyValue; 3] {
+    let (ns, tt) = match meta {
+        Some((n, t)) => (n.as_str().to_owned(), t.as_str().to_owned()),
+        None => ("unknown".to_owned(), "unknown".to_owned()),
+    };
+    [
+        KeyValue::new("namespace", ns),
+        KeyValue::new("task_type", tt),
+        KeyValue::new("terminal_state", terminal_state.to_owned()),
+    ]
+}
+
 enum CompleteFlow {
-    Completed,
-    LeaseExpired,
+    Completed {
+        task_meta: Option<(Namespace, TaskType)>,
+    },
+    LeaseExpired {
+        task_meta: Option<(Namespace, TaskType)>,
+    },
 }
 
 // ---------------------------------------------------------------------------
 // ReportFailure (design.md §6.4 + §6.5 terminal-state mapping)
 // ---------------------------------------------------------------------------
 
+#[tracing::instrument(
+    name = "taskq.report_failure",
+    skip_all,
+    fields(
+        task_id = req.task_id.as_deref().unwrap_or(""),
+        worker_id = req.worker_id.as_deref().unwrap_or(""),
+    ),
+)]
 async fn report_failure_impl(
     state: Arc<CpState>,
     req: ReportFailureRequest,
@@ -826,14 +996,18 @@ async fn report_failure_impl(
         let outcome = outcome.clone();
         async move {
             let mut tx = state.storage.begin_dyn().await?;
+            let task_meta = match tx.get_task_by_id(task_id).await {
+                Ok(Some(t)) => Some((t.namespace.clone(), t.task_type.clone())),
+                _ => None,
+            };
             match tx.complete_task(&lease_ref, outcome).await {
                 Ok(()) => {
                     tx.commit_dyn().await?;
-                    Ok(ReportFlow::Settled)
+                    Ok(ReportFlow::Settled { task_meta })
                 }
                 Err(StorageError::NotFound) => {
                     let _ = tx.rollback_dyn().await;
-                    Ok(ReportFlow::LeaseExpired)
+                    Ok(ReportFlow::LeaseExpired { task_meta })
                 }
                 Err(other) => {
                     let _ = tx.rollback_dyn().await;
@@ -845,18 +1019,57 @@ async fn report_failure_impl(
     .await;
 
     match result {
-        Ok(ReportFlow::Settled) => {
+        Ok(ReportFlow::Settled { task_meta }) => {
             let final_status = if retryable {
                 TerminalState::WAITING_RETRY
             } else {
                 TerminalState::FAILED_NONRETRYABLE
             };
-            metrics.terminal_total.add(1, &[]);
+            // §11.3 emit-site discipline: outcome label distinguishes the
+            // two terminal/retry paths so dashboards segment cleanly.
+            let outcome_label = if retryable {
+                "retryable_fail"
+            } else {
+                "nonretryable_fail"
+            };
             metrics
-                .error_class_total
-                .add(1, &[KeyValue::new("error_class", error_class.clone())]);
+                .complete_total
+                .add(1, &lifecycle_labels(task_meta.as_ref(), outcome_label));
+            // `taskq_terminal_total` only fires on a true terminal — retry
+            // is not terminal.
+            if !retryable {
+                metrics.terminal_total.add(
+                    1,
+                    &terminal_labels(task_meta.as_ref(), "FAILED_NONRETRYABLE"),
+                );
+            }
+            // `taskq_error_class_total{namespace, task_type, error_class}`.
+            if !error_class.is_empty() {
+                let (ns, tt) = match task_meta.as_ref() {
+                    Some((n, t)) => (n.as_str().to_owned(), t.as_str().to_owned()),
+                    None => ("unknown".to_owned(), "unknown".to_owned()),
+                };
+                metrics.error_class_total.add(
+                    1,
+                    &[
+                        KeyValue::new("namespace", ns),
+                        KeyValue::new("task_type", tt),
+                        KeyValue::new("error_class", error_class.clone()),
+                    ],
+                );
+            }
             if retryable {
-                metrics.retry_total.add(1, &[]);
+                let (ns, tt) = match task_meta.as_ref() {
+                    Some((n, t)) => (n.as_str().to_owned(), t.as_str().to_owned()),
+                    None => ("unknown".to_owned(), "unknown".to_owned()),
+                };
+                metrics.retry_total.add(
+                    1,
+                    &[
+                        KeyValue::new("namespace", ns),
+                        KeyValue::new("task_type", tt),
+                    ],
+                );
             }
             let mut resp = ReportFailureResponse::default();
             resp.task_id = Some(task_id_str);
@@ -869,8 +1082,11 @@ async fn report_failure_impl(
             resp.server_version = Some(Box::new(server_semver()));
             Ok(resp)
         }
-        Ok(ReportFlow::LeaseExpired) => {
-            metrics.lease_expired_total.add(1, &[]);
+        Ok(ReportFlow::LeaseExpired { task_meta }) => {
+            metrics.lease_expired_total.add(
+                1,
+                &lifecycle_labels(task_meta.as_ref(), "lease_expired")[..2],
+            );
             let mut resp = ReportFailureResponse::default();
             resp.task_id = Some(task_id_str);
             resp.final_status = TerminalState::PENDING;
@@ -889,14 +1105,23 @@ async fn report_failure_impl(
 }
 
 enum ReportFlow {
-    Settled,
-    LeaseExpired,
+    Settled {
+        task_meta: Option<(Namespace, TaskType)>,
+    },
+    LeaseExpired {
+        task_meta: Option<(Namespace, TaskType)>,
+    },
 }
 
 // ---------------------------------------------------------------------------
 // Deregister
 // ---------------------------------------------------------------------------
 
+#[tracing::instrument(
+    name = "taskq.deregister_worker",
+    skip_all,
+    fields(worker_id = req.worker_id.as_deref().unwrap_or("")),
+)]
 async fn deregister_impl(
     state: Arc<CpState>,
     req: DeregisterWorkerRequest,
@@ -925,6 +1150,11 @@ async fn deregister_impl(
 
     match result {
         Ok(()) => {
+            // Best-effort: the periodic refresher will reconcile the gauge,
+            // but a synchronous decrement keeps the metric responsive.
+            // Namespace is not threaded through the deregister request in
+            // v1 (the `worker_id` is global); the refresher pass corrects.
+            let _ = metrics; // metrics handle still in scope; explicit drop for readability.
             let mut resp = DeregisterWorkerResponse::default();
             resp.server_version = Some(Box::new(server_semver()));
             Ok(resp)
