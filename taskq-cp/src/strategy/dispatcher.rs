@@ -167,10 +167,12 @@ mod tests {
 
     use bytes::Bytes;
     use taskq_storage::{
-        CapacityDecision, CapacityKind, LockedTask, NewLease, StorageError, TaskId,
+        AuditEntry, CapacityDecision, CapacityKind, DedupRecord, HeartbeatAck, IdempotencyKey,
+        LeaseRef, LockedTask, NamespaceQuota, NewDedupRecord, NewLease, NewTask, RateDecision,
+        RateKind, StorageError, TaskId, TaskOutcome, WorkerId,
     };
 
-    use crate::state::{StorageTxDyn, StorageTxFuture};
+    use crate::state::{StorageTxDyn, StorageTxFuture, WakeSignalStream};
 
     /// Test fake recording the last `PickCriteria` it saw and returning a
     /// scripted `LockedTask`. Mirrors the admitter-tests fake; the two
@@ -218,6 +220,103 @@ mod tests {
             _lease: NewLease,
         ) -> StorageTxFuture<'a, Result<(), StorageError>> {
             Box::pin(async move { Ok(()) })
+        }
+
+        // --- methods not exercised by dispatcher strategies -------------
+
+        fn lookup_idempotency<'a>(
+            &'a mut self,
+            _ns: &'a Namespace,
+            _key: &'a IdempotencyKey,
+        ) -> StorageTxFuture<'a, Result<Option<DedupRecord>, StorageError>> {
+            unreachable!("submit-path methods not exercised in dispatcher tests")
+        }
+
+        fn insert_task<'a>(
+            &'a mut self,
+            _task: NewTask,
+            _dedup: NewDedupRecord,
+        ) -> StorageTxFuture<'a, Result<TaskId, StorageError>> {
+            unreachable!("submit-path methods not exercised in dispatcher tests")
+        }
+
+        fn subscribe_pending<'a>(
+            &'a mut self,
+            _ns: &'a Namespace,
+            _types: &'a [TaskType],
+        ) -> StorageTxFuture<'a, Result<WakeSignalStream, StorageError>> {
+            unreachable!("subscribe_pending not exercised in dispatcher tests")
+        }
+
+        fn complete_task<'a>(
+            &'a mut self,
+            _lease: &'a LeaseRef,
+            _outcome: TaskOutcome,
+        ) -> StorageTxFuture<'a, Result<(), StorageError>> {
+            unreachable!("worker-path methods not exercised in dispatcher tests")
+        }
+
+        fn mark_worker_dead<'a>(
+            &'a mut self,
+            _worker_id: &'a WorkerId,
+            _at: Timestamp,
+        ) -> StorageTxFuture<'a, Result<(), StorageError>> {
+            unreachable!("reaper-path methods not exercised in dispatcher tests")
+        }
+
+        fn try_consume_rate_quota<'a>(
+            &'a mut self,
+            _ns: &'a Namespace,
+            _kind: RateKind,
+            _n: u64,
+        ) -> StorageTxFuture<'a, Result<RateDecision, StorageError>> {
+            unreachable!("rate-quota methods not exercised in dispatcher tests")
+        }
+
+        fn record_worker_heartbeat<'a>(
+            &'a mut self,
+            _worker_id: &'a WorkerId,
+            _ns: &'a Namespace,
+            _at: Timestamp,
+        ) -> StorageTxFuture<'a, Result<HeartbeatAck, StorageError>> {
+            unreachable!("heartbeat methods not exercised in dispatcher tests")
+        }
+
+        fn extend_lease_lazy<'a>(
+            &'a mut self,
+            _lease: &'a LeaseRef,
+            _new_timeout: Timestamp,
+            _last_extended_at: Timestamp,
+        ) -> StorageTxFuture<'a, Result<(), StorageError>> {
+            unreachable!("heartbeat methods not exercised in dispatcher tests")
+        }
+
+        fn get_namespace_quota<'a>(
+            &'a mut self,
+            _ns: &'a Namespace,
+        ) -> StorageTxFuture<'a, Result<NamespaceQuota, StorageError>> {
+            unreachable!("admin methods not exercised in dispatcher tests")
+        }
+
+        fn audit_log_append<'a>(
+            &'a mut self,
+            _entry: AuditEntry,
+        ) -> StorageTxFuture<'a, Result<(), StorageError>> {
+            unreachable!("admin methods not exercised in dispatcher tests")
+        }
+
+        fn commit_dyn<'a>(self: Box<Self>) -> StorageTxFuture<'a, Result<(), StorageError>>
+        where
+            Self: 'a,
+        {
+            unreachable!("lifecycle methods not exercised in dispatcher tests")
+        }
+
+        fn rollback_dyn<'a>(self: Box<Self>) -> StorageTxFuture<'a, Result<(), StorageError>>
+        where
+            Self: 'a,
+        {
+            unreachable!("lifecycle methods not exercised in dispatcher tests")
         }
     }
 

@@ -1,29 +1,51 @@
 //! Caller-facing `TaskQueue` service handler.
 //!
-//! `design.md` §3.2 lists the methods on this service. Phase 5a leaves
-//! every method body as `todo!()`; Phase 5b implements the lifecycle
-//! handlers (`SubmitTask`, `GetTaskResult`, `BatchGetTaskResults`,
-//! `CancelTask`, `SubmitAndWait`).
+//! Implements `task_queue_server::TaskQueue` from [`taskq_proto`]: the five
+//! caller-facing RPCs `SubmitTask`, `GetTaskResult`, `BatchGetTaskResults`,
+//! `CancelTask`, `SubmitAndWait`. Reference: `design.md` §3.2, §6.1, §6.4,
+//! §6.7.
 //!
-//! ## Why no `pure-grpc-rs` service-trait `impl` in Phase 5a
+//! Every method:
 //!
-//! `taskq-proto` does not yet ship the generated `TaskQueueServer` /
-//! `TaskQueue` service trait — the FlatBuffers codegen emits message types
-//! only, not gRPC service stubs. Phase 5b will either (a) extend the
-//! `taskq-proto` `build.rs` to emit service stubs via `grpc-build`'s
-//! `flatbuffers` feature, or (b) hand-write the service trait alongside
-//! the handler in `taskq-proto::v1`. Either way the *handler struct* lives
-//! here, and Phase 5b's only change to this file is wiring the methods.
+//! - Begins a SERIALIZABLE transaction via `state.storage.begin_dyn()`.
+//! - Wraps the transaction body in
+//!   [`crate::handlers::retry::with_serializable_retry`] for transparent
+//!   `40001` retry up to 3 attempts (`design.md` §6.4).
+//! - Distinguishes [`StorageError::NotFound`] (return semantic error) from
+//!   [`StorageError::SerializationConflict`] (retry).
+//! - Records `taskq_storage_retry_attempts` (per `MetricsHandle`).
+//!
+//! Trace context (`traceparent` / `tracestate`) is read from the request
+//! body and persisted on the task row at submit time per `design.md` §11.2;
+//! Phase 5d wires the OTel span continuation.
 
 use std::sync::Arc;
 
+use bytes::Bytes;
+use grpc_core::{Request, Response, Status};
+use opentelemetry::KeyValue;
+use taskq_proto::task_queue_server::TaskQueue;
+use taskq_proto::{
+    BatchGetTaskResultsRequest, BatchGetTaskResultsResponse, CancelTaskRequest, CancelTaskResponse,
+    GetTaskResultRequest, GetTaskResultResponse, RejectReason as WireRejectReason, Rejection,
+    SemVer, SubmitAndWaitRequest, SubmitAndWaitResponse, SubmitTaskRequest, SubmitTaskResponse,
+    TerminalState,
+};
+use taskq_storage::{
+    IdempotencyKey, Namespace, NewDedupRecord, NewTask, RateDecision, RateKind, TaskId, TaskType,
+    Timestamp,
+};
+
+use crate::handlers::cancel::{cancel_internal, CancelOutcome};
+use crate::handlers::retry::with_serializable_retry;
 use crate::state::CpState;
+use crate::strategy::admitter::{Admit, RejectReason as StrategyRejectReason, SubmitCtx};
 
 /// Caller-facing `TaskQueue` service handler.
 ///
-/// Holds an `Arc<CpState>` so that a single instance can be cloned cheaply
-/// into each in-flight request. The actual cloning happens inside the
-/// `pure-grpc-rs` `tower::Service` adapter; Phase 5b wires that adapter.
+/// Holds an `Arc<CpState>` so a single instance is cloned cheaply into each
+/// in-flight request. The `pure-grpc-rs` `TaskQueueServer<T>` adapter does
+/// the cloning under the hood; the inner `state` Arc is bumped per call.
 #[derive(Clone)]
 pub struct TaskQueueHandler {
     pub state: Arc<CpState>,
@@ -33,37 +55,665 @@ impl TaskQueueHandler {
     pub fn new(state: Arc<CpState>) -> Self {
         Self { state }
     }
+}
 
-    // -----------------------------------------------------------------
-    // Phase 5b lifecycle handlers (tasks.md §5.2)
-    // -----------------------------------------------------------------
-
-    /// `SubmitTask` per `design.md` §6.1: admitter → idempotency lookup →
-    /// retry-config resolution → insert.
-    pub async fn submit_task(&self) {
-        // TODO(phase-5b): implement design.md §6.1 lifecycle.
-        todo!("phase-5b: TaskQueue::SubmitTask")
+impl TaskQueue for TaskQueueHandler {
+    fn submit_task(
+        &self,
+        request: Request<SubmitTaskRequest>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Response<SubmitTaskResponse>, Status>> + Send>,
+    > {
+        let state = Arc::clone(&self.state);
+        Box::pin(async move {
+            let req = request.into_inner();
+            let outcome = submit_task_impl(state, req).await;
+            Ok(Response::new(outcome))
+        })
     }
 
-    /// `GetTaskResult` — read a task's terminal-state result by `task_id`.
-    pub async fn get_task_result(&self) {
-        todo!("phase-5b: TaskQueue::GetTaskResult")
+    fn get_task_result(
+        &self,
+        _request: Request<GetTaskResultRequest>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Response<GetTaskResultResponse>, Status>>
+                + Send,
+        >,
+    > {
+        // Phase 5b: the storage trait does not yet expose `get_task_by_id`;
+        // surface UNIMPLEMENTED so callers get a clear error rather than a
+        // silent empty response. The handler shape is final; only the
+        // body flips when storage grows the method (Phase 5c task list).
+        Box::pin(async move {
+            Err(Status::unimplemented(
+                "GetTaskResult requires StorageTx::get_task_by_id (Phase 5c)",
+            ))
+        })
     }
 
-    /// `BatchGetTaskResults` — batched form of `GetTaskResult`.
-    pub async fn batch_get_task_results(&self) {
-        todo!("phase-5b: TaskQueue::BatchGetTaskResults")
+    fn batch_get_task_results(
+        &self,
+        _request: Request<BatchGetTaskResultsRequest>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Response<BatchGetTaskResultsResponse>, Status>>
+                + Send,
+        >,
+    > {
+        // See `get_task_result` for the rationale; the underlying read path
+        // is missing on the storage trait.
+        Box::pin(async move {
+            Err(Status::unimplemented(
+                "BatchGetTaskResults requires StorageTx::get_task_by_id (Phase 5c)",
+            ))
+        })
     }
 
-    /// `CancelTask` per `design.md` §6.7. Uses the shared `cancel_internal`
-    /// helper that `PurgeTasks` also calls.
-    pub async fn cancel_task(&self) {
-        todo!("phase-5b: TaskQueue::CancelTask")
+    fn cancel_task(
+        &self,
+        request: Request<CancelTaskRequest>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Response<CancelTaskResponse>, Status>> + Send>,
+    > {
+        let state = Arc::clone(&self.state);
+        Box::pin(async move {
+            let req = request.into_inner();
+            cancel_task_impl(state, req).await.map(Response::new)
+        })
     }
 
-    /// `SubmitAndWait` — `SubmitTask` followed by an internal long-poll on
-    /// the result.
-    pub async fn submit_and_wait(&self) {
-        todo!("phase-5b: TaskQueue::SubmitAndWait")
+    fn submit_and_wait(
+        &self,
+        request: Request<SubmitAndWaitRequest>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Response<SubmitAndWaitResponse>, Status>>
+                + Send,
+        >,
+    > {
+        let state = Arc::clone(&self.state);
+        Box::pin(async move {
+            let req = request.into_inner();
+            submit_and_wait_impl(state, req).await.map(Response::new)
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SubmitTask
+// ---------------------------------------------------------------------------
+
+/// `SubmitTask` per `design.md` §6.1.
+///
+/// Steps (numbered to match the design doc):
+///
+/// 1. Run the namespace's admitter (rate-quota check + capacity-quota check
+///    are the admitter's responsibility; the admitter itself takes a
+///    `&mut StorageTxDyn` so it participates in the SERIALIZABLE
+///    transaction).
+/// 2. Look up the idempotency key. Match on payload hash → existing-task
+///    return. Mismatch → `IDEMPOTENCY_KEY_REUSE_WITH_DIFFERENT_PAYLOAD`.
+/// 3. Resolve retry config (per-task → per-task-type → per-namespace).
+///    Phase 5b uses the wire request's per-task overrides directly; the
+///    per-task-type and per-namespace layers will plug in when
+///    `task_type_retry_config` / `namespace_quota` reads land.
+/// 4. Insert task + dedup row atomically via `insert_task` (the storage
+///    layer fuses steps 4 and 5 from the design doc into one call).
+/// 5. Commit.
+/// 6. Return `SubmitTaskResponse{ task_id, status: PENDING }`.
+async fn submit_task_impl(state: Arc<CpState>, req: SubmitTaskRequest) -> SubmitTaskResponse {
+    // Validate required fields on the wire body. Missing required fields
+    // are a permanent INVALID_PAYLOAD rejection per `design.md` §10.2.
+    let namespace_str = match req.namespace.as_deref() {
+        Some(ns) if !ns.is_empty() => ns.to_owned(),
+        _ => return reject_response(WireRejectReason::INVALID_PAYLOAD, "namespace is required"),
+    };
+    let task_type_str = match req.task_type.as_deref() {
+        Some(t) if !t.is_empty() => t.to_owned(),
+        _ => return reject_response(WireRejectReason::INVALID_PAYLOAD, "task_type is required"),
+    };
+    let idempotency_key_str = match req.idempotency_key.as_deref() {
+        Some(k) if !k.is_empty() => k.to_owned(),
+        _ => {
+            return reject_response(
+                WireRejectReason::INVALID_PAYLOAD,
+                "idempotency_key is required",
+            )
+        }
+    };
+    // Extract all wire-request fields up-front. The retry closure is
+    // `FnMut`, so any captured value used inside the loop body must be
+    // `Clone`. Owned String / Vec / boxed table fields are pulled out
+    // here once; per-attempt clones of the cheap newtypes below are
+    // cheap (Arc-like for `Namespace`).
+    let payload_bytes: Vec<u8> = req.payload.clone().unwrap_or_default();
+    let traceparent_bytes: Vec<u8> = req.traceparent.clone().unwrap_or_default();
+    let tracestate_bytes: Vec<u8> = req.tracestate.clone().unwrap_or_default();
+    let priority = req.priority;
+    let max_retries_req = req.max_retries;
+    let expires_at_ms_req = req.expires_at.as_ref().map(|t| t.unix_millis);
+    let retry_initial_ms_req = req.retry_config.as_ref().map(|r| r.initial_ms);
+    let retry_max_ms_req = req.retry_config.as_ref().map(|r| r.max_ms);
+    let retry_coefficient_req = req.retry_config.as_ref().map(|r| r.coefficient);
+    let retry_max_retries_req = req.retry_config.as_ref().map(|r| r.max_retries);
+
+    let payload_hash = blake3_hash(&payload_bytes);
+
+    let namespace = Namespace::new(namespace_str.clone());
+    let task_type = TaskType::new(task_type_str);
+    let idempotency_key = IdempotencyKey::new(idempotency_key_str);
+    let now = current_timestamp();
+
+    // Storage transaction with transparent 40001 retry.
+    let metrics = state.metrics.clone();
+    let result = with_serializable_retry(&metrics, "submit_task", || {
+        let state = Arc::clone(&state);
+        let namespace = namespace.clone();
+        let task_type = task_type.clone();
+        let idempotency_key = idempotency_key.clone();
+        let payload_bytes = payload_bytes.clone();
+        let traceparent_bytes = traceparent_bytes.clone();
+        let tracestate_bytes = tracestate_bytes.clone();
+        async move {
+            let mut tx = state.storage.begin_dyn().await?;
+
+            // Step 1: admit. We intentionally call the admitter even when
+            // no namespace strategy is configured; the default fallback is
+            // "Always" so unconfigured namespaces still admit.
+            let strategy = state.strategy_registry.for_namespace(&namespace);
+            let admit = if let Some(strategy) = strategy {
+                let ctx = SubmitCtx {
+                    namespace: namespace.clone(),
+                    task_type: task_type.clone(),
+                    priority,
+                    payload_bytes: payload_bytes.len(),
+                    now,
+                };
+                strategy.admitter.admit(&ctx, &mut *tx).await
+            } else {
+                Admit::Accept
+            };
+            match admit {
+                Admit::Accept => {}
+                Admit::Reject(reason) => {
+                    let _ = tx.rollback_dyn().await;
+                    return Ok(Err(reason));
+                }
+            }
+
+            // Submit-side rate quota: best-effort, eventually consistent.
+            // Hitting the limit returns a structured rejection.
+            if let Ok(RateDecision::RateLimited { .. }) = tx
+                .try_consume_rate_quota(&namespace, RateKind::SubmitRpm, 1)
+                .await
+            {
+                let _ = tx.rollback_dyn().await;
+                return Ok(Err(StrategyRejectReason::SystemOverload));
+            }
+
+            // Step 2: idempotency lookup.
+            let existing = tx.lookup_idempotency(&namespace, &idempotency_key).await?;
+            if let Some(record) = existing {
+                if record.payload_hash == payload_hash {
+                    // Idempotency HIT: return existing task_id.
+                    let task_id_str = record.task_id.to_string();
+                    let _ = tx.commit_dyn().await;
+                    return Ok(Ok(SubmitTaskHit::Existing(task_id_str)));
+                }
+                // Mismatch — IDEMPOTENCY_KEY_REUSE_WITH_DIFFERENT_PAYLOAD.
+                let _ = tx.rollback_dyn().await;
+                return Ok(Ok(SubmitTaskHit::PayloadMismatch {
+                    existing_task_id: record.task_id.to_string(),
+                    existing_payload_hash: record.payload_hash,
+                }));
+            }
+
+            // Steps 3-5: insert task + dedup row.
+            let task_id = TaskId::generate();
+            let expires_at = expires_at_ms_req
+                .map(Timestamp::from_unix_millis)
+                .unwrap_or_else(|| {
+                    // Default TTL: 24h from submit. Per-namespace override
+                    // hooks land in Phase 5c.
+                    Timestamp::from_unix_millis(now.as_unix_millis() + 24 * 60 * 60 * 1000)
+                });
+            let max_retries = retry_max_retries_req.unwrap_or(max_retries_req);
+            let retry_initial_ms = retry_initial_ms_req.unwrap_or(1_000);
+            let retry_max_ms = retry_max_ms_req.unwrap_or(300_000);
+            let retry_coefficient = retry_coefficient_req.unwrap_or(2.0);
+
+            let dedup_expires_at =
+                Timestamp::from_unix_millis(expires_at.as_unix_millis() + 24 * 60 * 60 * 1000);
+
+            let new_task = NewTask {
+                task_id,
+                namespace: namespace.clone(),
+                task_type: task_type.clone(),
+                priority,
+                payload: Bytes::from(payload_bytes),
+                payload_hash,
+                submitted_at: now,
+                expires_at,
+                max_retries,
+                retry_initial_ms,
+                retry_max_ms,
+                retry_coefficient,
+                traceparent: Bytes::from(traceparent_bytes),
+                tracestate: Bytes::from(tracestate_bytes),
+                format_version: 1,
+            };
+            let new_dedup = NewDedupRecord {
+                namespace: namespace.clone(),
+                key: idempotency_key.clone(),
+                payload_hash,
+                expires_at: dedup_expires_at,
+            };
+
+            let inserted_id = tx.insert_task(new_task, new_dedup).await?;
+            tx.commit_dyn().await?;
+
+            // Wake one waiter on this namespace so the new PENDING task is
+            // picked up promptly. The waiter pool's `wake_one` is a no-op
+            // when there are no waiters.
+            state.waiter_pool.wake_one(&namespace, &[task_type]).await;
+
+            Ok(Ok(SubmitTaskHit::Created(inserted_id.to_string())))
+        }
+    })
+    .await;
+
+    match result {
+        Ok(Ok(SubmitTaskHit::Created(task_id))) => {
+            metrics
+                .submit_total
+                .add(1, &[KeyValue::new("namespace", namespace_str.clone())]);
+            metrics.submit_payload_bytes.record(
+                payload_bytes.len() as u64,
+                &[KeyValue::new("namespace", namespace_str)],
+            );
+            ok_submit_response(task_id, TerminalState::PENDING, false)
+        }
+        Ok(Ok(SubmitTaskHit::Existing(task_id))) => {
+            metrics
+                .idempotency_hit_total
+                .add(1, &[KeyValue::new("namespace", namespace_str)]);
+            ok_submit_response(task_id, TerminalState::PENDING, true)
+        }
+        Ok(Ok(SubmitTaskHit::PayloadMismatch {
+            existing_task_id,
+            existing_payload_hash,
+        })) => {
+            metrics
+                .idempotency_payload_mismatch_total
+                .add(1, &[KeyValue::new("namespace", namespace_str)]);
+            payload_mismatch_response(existing_task_id, existing_payload_hash.to_vec())
+        }
+        Ok(Err(reason)) => {
+            let wire = strategy_reject_to_wire(reason);
+            metrics.rejection_total.add(
+                1,
+                &[
+                    KeyValue::new("namespace", namespace_str),
+                    KeyValue::new("reason", format!("{wire:?}")),
+                ],
+            );
+            reject_response(wire, "admit-time rejection")
+        }
+        Err(err) => {
+            tracing::error!(error = %err, "submit_task storage error");
+            reject_response(WireRejectReason::SYSTEM_OVERLOAD, "storage error")
+        }
+    }
+}
+
+/// Result type for a single retry attempt of `SubmitTask`. Distinguishes the
+/// happy paths (created / hit) from the structured payload-mismatch path.
+enum SubmitTaskHit {
+    Created(String),
+    Existing(String),
+    PayloadMismatch {
+        existing_task_id: String,
+        existing_payload_hash: [u8; 32],
+    },
+}
+
+// ---------------------------------------------------------------------------
+// CancelTask
+// ---------------------------------------------------------------------------
+
+async fn cancel_task_impl(
+    state: Arc<CpState>,
+    req: CancelTaskRequest,
+) -> Result<CancelTaskResponse, Status> {
+    let task_id_str = req
+        .task_id
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| Status::invalid_argument("task_id is required"))?
+        .to_owned();
+    let task_id = parse_task_id(&task_id_str)?;
+    let metrics = state.metrics.clone();
+
+    let outcome = with_serializable_retry(&metrics, "cancel_task", || {
+        let state = Arc::clone(&state);
+        async move {
+            let mut tx = state.storage.begin_dyn().await?;
+            let result = cancel_internal(&mut *tx, task_id).await?;
+            tx.commit_dyn().await?;
+            Ok(result)
+        }
+    })
+    .await;
+
+    match outcome {
+        Ok(CancelOutcome::Unsupported) => Err(Status::unimplemented(
+            "CancelTask requires StorageTx::cancel_task (Phase 5c)",
+        )),
+        Err(err) => {
+            tracing::error!(error = %err, "cancel_task storage error");
+            Err(Status::internal("storage error during cancel_task"))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SubmitAndWait
+// ---------------------------------------------------------------------------
+
+async fn submit_and_wait_impl(
+    state: Arc<CpState>,
+    req: SubmitAndWaitRequest,
+) -> Result<SubmitAndWaitResponse, Status> {
+    let submit = req
+        .submit
+        .ok_or_else(|| Status::invalid_argument("submit is required"))?;
+    let timeout_ms = if req.wait_timeout_ms == 0 {
+        u64::from(state.config.long_poll_default_timeout_seconds) * 1_000
+    } else {
+        req.wait_timeout_ms
+            .min(u64::from(state.config.long_poll_max_seconds) * 1_000)
+    };
+
+    // Submit first.
+    let submit_resp = submit_task_impl(Arc::clone(&state), *submit).await;
+    if let Some(err) = submit_resp.error.as_ref() {
+        let mut resp = SubmitAndWaitResponse::default();
+        resp.timed_out = false;
+        resp.server_version = Some(Box::new(server_semver()));
+        resp.error = Some(err.clone());
+        return Ok(resp);
+    }
+
+    // Phase 5b: the long-poll wait branch needs a `get_task_by_id` storage
+    // method. Without it we honour the API shape — return immediately
+    // marking timed_out=true so the caller knows to poll later — and let
+    // Phase 5c flip this to a real wait once the storage method lands.
+    let _ = timeout_ms;
+    let mut resp = SubmitAndWaitResponse::default();
+    resp.timed_out = true;
+    resp.server_version = Some(Box::new(server_semver()));
+    let mut rej = Rejection::default();
+    rej.reason = WireRejectReason::SYSTEM_OVERLOAD;
+    rej.retryable = true;
+    rej.hint = Some(
+        "SubmitAndWait wait branch needs StorageTx::get_task_by_id; Phase 5c will wire it"
+            .to_owned(),
+    );
+    rej.existing_task_id = submit_resp.task_id.clone();
+    rej.server_version = Some(Box::new(server_semver()));
+    resp.error = Some(Box::new(rej));
+    Ok(resp)
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn ok_submit_response(
+    task_id: String,
+    status: TerminalState,
+    existing_task: bool,
+) -> SubmitTaskResponse {
+    let mut resp = SubmitTaskResponse::default();
+    resp.task_id = Some(task_id);
+    resp.status = status;
+    resp.existing_task = existing_task;
+    resp.server_version = Some(Box::new(server_semver()));
+    resp
+}
+
+fn reject_response(reason: WireRejectReason, hint: &str) -> SubmitTaskResponse {
+    let mut resp = SubmitTaskResponse::default();
+    resp.status = TerminalState::PENDING;
+    resp.server_version = Some(Box::new(server_semver()));
+    let mut rej = Rejection::default();
+    rej.reason = reason;
+    rej.retryable = matches!(
+        reason,
+        WireRejectReason::SYSTEM_OVERLOAD
+            | WireRejectReason::MAX_PENDING_EXCEEDED
+            | WireRejectReason::LATENCY_TARGET_EXCEEDED
+            | WireRejectReason::NAMESPACE_QUOTA_EXCEEDED
+            | WireRejectReason::REPLICA_WAITER_LIMIT_EXCEEDED
+    );
+    rej.hint = Some(hint.to_owned());
+    rej.server_version = Some(Box::new(server_semver()));
+    resp.error = Some(Box::new(rej));
+    resp
+}
+
+fn payload_mismatch_response(
+    existing_task_id: String,
+    existing_payload_hash: Vec<u8>,
+) -> SubmitTaskResponse {
+    let mut resp = SubmitTaskResponse::default();
+    resp.status = TerminalState::PENDING;
+    resp.server_version = Some(Box::new(server_semver()));
+    let mut rej = Rejection::default();
+    rej.reason = WireRejectReason::IDEMPOTENCY_KEY_REUSE_WITH_DIFFERENT_PAYLOAD;
+    rej.retryable = false;
+    rej.hint = Some("idempotency key reused with a different payload".to_owned());
+    rej.existing_task_id = Some(existing_task_id);
+    rej.existing_payload_hash = Some(existing_payload_hash);
+    rej.server_version = Some(Box::new(server_semver()));
+    resp.error = Some(Box::new(rej));
+    resp
+}
+
+fn strategy_reject_to_wire(reason: StrategyRejectReason) -> WireRejectReason {
+    match reason {
+        StrategyRejectReason::NamespaceQuotaExceeded => WireRejectReason::NAMESPACE_QUOTA_EXCEEDED,
+        StrategyRejectReason::MaxPendingExceeded => WireRejectReason::MAX_PENDING_EXCEEDED,
+        StrategyRejectReason::LatencyTargetExceeded => WireRejectReason::LATENCY_TARGET_EXCEEDED,
+        StrategyRejectReason::SystemOverload => WireRejectReason::SYSTEM_OVERLOAD,
+        StrategyRejectReason::NamespaceDisabled => WireRejectReason::NAMESPACE_DISABLED,
+    }
+}
+
+fn server_semver() -> SemVer {
+    let mut s = SemVer::default();
+    s.major = 1;
+    s.minor = 0;
+    s.patch = 0;
+    s
+}
+
+fn current_timestamp() -> Timestamp {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    Timestamp::from_unix_millis(ms)
+}
+
+fn blake3_hash(bytes: &[u8]) -> [u8; 32] {
+    // Minimal BLAKE3 stand-in: the storage trait specifies a 32-byte
+    // payload hash; we use a deterministic xxhash-style fold over the
+    // bytes for v1. The protocol does not pin a specific hash family —
+    // all matching is "did the same caller resubmit the same bytes?"
+    // The CP layer hashes once and stores; clients never see the bytes.
+    //
+    // TODO(phase-5d): swap for a real blake3 when the dep is added at
+    // workspace level; until then this fold is good enough for unit-test
+    // determinism + the idempotency-mismatch detection path.
+    let mut h: [u8; 32] = [0; 32];
+    let mut accumulator: u64 = 0xcbf29ce484222325; // FNV-1a offset basis
+    for (i, byte) in bytes.iter().enumerate() {
+        accumulator ^= u64::from(*byte);
+        accumulator = accumulator.wrapping_mul(0x100000001b3);
+        let target = i % 32;
+        h[target] = h[target].wrapping_add((accumulator & 0xff) as u8);
+    }
+    // Stir the length into the hash so empty / size-only changes diverge.
+    let len = (bytes.len() as u64).to_le_bytes();
+    for (i, b) in len.iter().enumerate() {
+        h[i] = h[i].wrapping_add(*b);
+    }
+    h
+}
+
+fn parse_task_id(s: &str) -> Result<TaskId, Status> {
+    use std::str::FromStr;
+    uuid::Uuid::from_str(s)
+        .map(TaskId::from_uuid)
+        .map_err(|err| Status::invalid_argument(format!("invalid task_id: {err}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
+    use crate::config::{CpConfig, OtelExporterConfig, StorageBackendConfig};
+    use crate::observability::MetricsHandle;
+    use crate::shutdown::channel;
+    use crate::strategy::StrategyRegistry;
+
+    /// Build a minimal CP state backed by an in-memory SQLite for fast,
+    /// hermetic handler tests.
+    async fn build_state() -> Arc<CpState> {
+        let storage = taskq_storage_sqlite::SqliteStorage::open_in_memory()
+            .await
+            .expect("SqliteStorage::open_in_memory");
+        let storage_arc: Arc<dyn crate::state::DynStorage> = Arc::new(storage);
+        let config = Arc::new(CpConfig {
+            bind_addr: "127.0.0.1:50051".parse::<SocketAddr>().unwrap(),
+            health_addr: "127.0.0.1:9090".parse::<SocketAddr>().unwrap(),
+            storage_backend: StorageBackendConfig::Sqlite {
+                path: ":memory:".to_owned(),
+            },
+            otel_exporter: OtelExporterConfig::Disabled,
+            quota_cache_ttl_seconds: 5,
+            long_poll_default_timeout_seconds: 30,
+            long_poll_max_seconds: 60,
+            belt_and_suspenders_seconds: 10,
+            waiter_limit_per_replica: 100,
+            lease_window_seconds: 30,
+        });
+        let (_tx, rx) = channel();
+        Arc::new(CpState::new(
+            storage_arc,
+            Arc::new(StrategyRegistry::empty()),
+            MetricsHandle::noop(),
+            rx,
+            config,
+        ))
+    }
+
+    /// Build a minimal `SubmitTaskRequest` populated with required fields.
+    /// Tests use this and override individual fields. This keeps the test
+    /// bodies independent of generated-struct field churn (FlatBuffers Object
+    /// API types are `#[non_exhaustive]` so direct struct literals are
+    /// rejected).
+    fn build_submit_request(
+        ns: &str,
+        task_type: &str,
+        idempotency_key: &str,
+        payload: Vec<u8>,
+    ) -> SubmitTaskRequest {
+        let mut req = SubmitTaskRequest::default();
+        req.namespace = Some(ns.to_owned());
+        req.task_type = Some(task_type.to_owned());
+        req.payload = Some(payload);
+        req.idempotency_key = Some(idempotency_key.to_owned());
+        req
+    }
+
+    #[tokio::test]
+    async fn submit_task_returns_created_task_id_on_happy_path() {
+        // Arrange
+        let state = build_state().await;
+        let mut req = build_submit_request("test-ns", "test-type", "key-1", b"hello".to_vec());
+        req.max_retries = 3;
+
+        // Act
+        let resp = submit_task_impl(state, req).await;
+
+        // Assert
+        assert!(resp.error.is_none(), "expected ok response: {resp:?}");
+        assert!(resp.task_id.is_some());
+        assert_eq!(resp.status, TerminalState::PENDING);
+        assert!(!resp.existing_task);
+    }
+
+    #[tokio::test]
+    async fn submit_task_returns_existing_task_on_idempotency_hit() {
+        // Arrange
+        let state = build_state().await;
+        let req = build_submit_request("ns", "type", "key-2", b"hello".to_vec());
+
+        // Act: first submit creates, second hits the idempotency key.
+        let first = submit_task_impl(Arc::clone(&state), req.clone()).await;
+        let second = submit_task_impl(state, req).await;
+
+        // Assert
+        assert!(first.error.is_none(), "first submit should succeed");
+        assert!(!first.existing_task);
+        assert!(second.error.is_none(), "second submit should hit dedup");
+        assert!(second.existing_task);
+        assert_eq!(first.task_id, second.task_id);
+    }
+
+    #[tokio::test]
+    async fn submit_task_rejects_idempotency_payload_mismatch() {
+        // Arrange
+        let state = build_state().await;
+        let req_a = build_submit_request("ns", "type", "key-3", b"alpha".to_vec());
+        let mut req_b = req_a.clone();
+        req_b.payload = Some(b"beta".to_vec());
+
+        // Act
+        let first = submit_task_impl(Arc::clone(&state), req_a).await;
+        let second = submit_task_impl(state, req_b).await;
+
+        // Assert
+        assert!(first.error.is_none());
+        let err = second.error.expect("second submit should reject");
+        assert_eq!(
+            err.reason,
+            WireRejectReason::IDEMPOTENCY_KEY_REUSE_WITH_DIFFERENT_PAYLOAD
+        );
+        assert!(!err.retryable);
+    }
+
+    #[tokio::test]
+    async fn submit_task_rejects_missing_required_fields() {
+        // Arrange
+        let state = build_state().await;
+        let mut req = SubmitTaskRequest::default();
+        req.task_type = Some("type".to_owned());
+        req.payload = Some(vec![]);
+        req.idempotency_key = Some("key".to_owned());
+
+        // Act
+        let resp = submit_task_impl(state, req).await;
+
+        // Assert
+        let err = resp.error.expect("response should be a rejection");
+        assert_eq!(err.reason, WireRejectReason::INVALID_PAYLOAD);
     }
 }

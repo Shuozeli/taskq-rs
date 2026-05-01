@@ -43,7 +43,8 @@ pub use crate::shutdown::{
     channel as shutdown_channel, wait_for_signal, ShutdownReceiver, ShutdownSender,
 };
 pub use crate::state::{
-    CpState, DynStorage, NamespaceConfigCache, StorageTxDyn, StorageTxFuture, WaiterPool,
+    CpState, DynStorage, NamespaceConfigCache, StorageTxDyn, StorageTxFuture, WaiterHandle,
+    WaiterLimitExceeded, WaiterPool, WakeOutcome, WakeSignalStream,
 };
 pub use crate::strategy::{
     admitter::{

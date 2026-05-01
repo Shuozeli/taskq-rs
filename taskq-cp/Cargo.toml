@@ -71,6 +71,19 @@ anyhow = "1"
 # (Phase 2 already committed to that shape).
 async-trait = "0.1"
 
+# Stream trait surface used by the StorageTxDyn shim's subscribe_pending
+# method. Native taskq-storage::StorageTx returns
+# `Box<dyn Stream<Item = WakeSignal> + Send + Unpin + 'static>`; the
+# CP-side dyn shim mirrors that shape and so needs the Stream trait in
+# scope.
+futures-core = "0.3"
+
+# Worker IDs / Task IDs are UUIDv7 (`design.md` §4). Handlers parse the
+# wire's string form back into structured ids and generate fresh ids for
+# `Register`. taskq-storage already depends on `uuid` for its newtypes;
+# we re-import locally so the parser path stays in the handler.
+uuid = { version = "1", features = ["v4", "v7"] }
+
 # Strategy params and audit-log payloads cross between `JSON` (in the DB) and
 # Rust structs; serde_json is the bridge.
 serde_json = "1"

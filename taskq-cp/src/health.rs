@@ -191,9 +191,27 @@ mod tests {
     }
 
     /// Empty stand-in implementing `DynStorage` for tests that don't touch
-    /// storage. Phase 5b's tests will use a real `SqliteStorage`.
+    /// storage. The `begin_dyn` impl always errors; the health-server tests
+    /// never start a transaction, so the path is unreachable in practice.
     struct NoopStorage;
-    impl crate::state::DynStorage for NoopStorage {}
+    impl crate::state::DynStorage for NoopStorage {
+        fn begin_dyn(
+            &self,
+        ) -> crate::state::StorageTxFuture<
+            '_,
+            std::result::Result<
+                Box<dyn crate::state::StorageTxDyn + '_>,
+                taskq_storage::StorageError,
+            >,
+        > {
+            Box::pin(async move {
+                Err(taskq_storage::StorageError::backend(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "NoopStorage::begin_dyn — health-server tests do not exercise transactions",
+                )))
+            })
+        }
+    }
 
     #[tokio::test]
     async fn healthz_returns_ok_in_steady_state() {

@@ -15,6 +15,8 @@ use std::sync::Arc;
 
 use grpc_core::{Request, Status};
 use grpc_server::{Router, Server};
+use taskq_proto::task_queue_server::TaskQueueServer;
+use taskq_proto::task_worker_server::TaskWorkerServer;
 
 use crate::error::{CpError, Result};
 use crate::handlers::{TaskAdminHandler, TaskQueueHandler, TaskWorkerHandler};
@@ -58,19 +60,19 @@ pub const AUTH_HEADER: &str = "authorization";
 pub async fn serve(state: Arc<CpState>, shutdown: ShutdownReceiver) -> Result<()> {
     let bind = state.config.bind_addr;
 
-    // Hand the per-service handler structs to Phase 5b (currently empty
-    // stubs). They participate in `CpState` cloning even before they have
-    // method bodies so the registration pattern is final-shape.
-    let _task_queue = TaskQueueHandler::new(Arc::clone(&state));
-    let _task_worker = TaskWorkerHandler::new(Arc::clone(&state));
-    let _task_admin = TaskAdminHandler::new(Arc::clone(&state));
+    // Phase 5b: TaskQueue + TaskWorker handlers are wired into the router.
+    // TaskAdmin is held but not registered — its method bodies still
+    // `todo!()` and Phase 5c will implement the handlers + register the
+    // service.
+    let task_queue = TaskQueueHandler::new(Arc::clone(&state));
+    let task_worker = TaskWorkerHandler::new(Arc::clone(&state));
+    let _task_admin: TaskAdminHandler = TaskAdminHandler::new(Arc::clone(&state));
+    // TODO(phase-5c): once admin handlers land, register `TaskAdminServer::new(_task_admin)`
+    // alongside the other two services below.
 
-    // Empty router. Phase 5b will:
-    //   router = router
-    //       .add_service(NAME, InterceptedService::new(TaskQueueServer::new(_task_queue), interceptor()));
-    //       .add_service(NAME, InterceptedService::new(TaskWorkerServer::new(_task_worker), interceptor()));
-    //       .add_service(NAME, InterceptedService::new(TaskAdminServer::new(_task_admin), interceptor()));
-    let router = Router::new();
+    let router = Router::new()
+        .add_service("taskq.v1.TaskQueue", TaskQueueServer::new(task_queue))
+        .add_service("taskq.v1.TaskWorker", TaskWorkerServer::new(task_worker));
 
     tracing::info!(addr = %bind, "starting taskq-cp gRPC server");
 
