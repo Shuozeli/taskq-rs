@@ -24,8 +24,8 @@ taskq-proto = { path = "../taskq-proto" }
 # pure-grpc-rs server framework. Pinned to a commit so cross-repo CI is reproducible.
 # The two crates we consume are the server (handler + router + interceptor) and
 # `grpc-core` (Status, Request, Response types used in service signatures).
-grpc-server = { git = "https://github.com/Shuozeli/pure-grpc-rs.git", rev = "120046b9a233139c13452aae37742a1890728d25" }
-grpc-core = { git = "https://github.com/Shuozeli/pure-grpc-rs.git", rev = "120046b9a233139c13452aae37742a1890728d25", default-features = false }
+grpc-server = { git = "https://github.com/Shuozeli/pure-grpc-rs.git", rev = "58c35d952a414a7229622c7d1306acf6597e8170" }
+grpc-core = { git = "https://github.com/Shuozeli/pure-grpc-rs.git", rev = "58c35d952a414a7229622c7d1306acf6597e8170", default-features = false }
 
 # Async runtime. `signal` for SIGTERM/SIGINT in shutdown.rs.
 tokio = { version = "1", features = ["full"] }

@@ -12,8 +12,24 @@ publish = false
 # same major shipped by flatbuffers-rs codegen so wire-format constants line up.
 flatbuffers = "25"
 
+# pure-grpc-rs runtime crates referenced by the generated <stem>_grpc.rs
+# (per pure-grpc-rs commit 58c35d9 — codegen now emits FlatBufferGrpcMessage
+# impls + server + client modules as siblings to the generated FBs types).
+# Pinned to the same revision as the build-dep below.
+grpc-core = { git = "https://github.com/Shuozeli/pure-grpc-rs.git", rev = "58c35d952a414a7229622c7d1306acf6597e8170", default-features = false }
+grpc-server = { git = "https://github.com/Shuozeli/pure-grpc-rs.git", rev = "58c35d952a414a7229622c7d1306acf6597e8170" }
+grpc-client = { git = "https://github.com/Shuozeli/pure-grpc-rs.git", rev = "58c35d952a414a7229622c7d1306acf6597e8170" }
+grpc-codec-flatbuffers = { git = "https://github.com/Shuozeli/pure-grpc-rs.git", rev = "58c35d952a414a7229622c7d1306acf6597e8170" }
+
+# Used by the generated server/client modules.
+http = "1"
+http-body = "1"
+tower-service = "0.3"
+bytes = "1"
+
 [build-dependencies]
 # `grpc-build`'s `flatbuffers` feature drives the FlatBuffers compile + Rust
-# message-type codegen via `compile_fbs`. Pinned to the same `pure-grpc-rs`
-# revision the rest of the workspace consumes (`taskq-cp`).
-grpc-build = { git = "https://github.com/Shuozeli/pure-grpc-rs.git", rev = "120046b9a233139c13452aae37742a1890728d25", default-features = false, features = ["flatbuffers"] }
+# message-type codegen via `compile_fbs`. As of pure-grpc-rs commit 58c35d9
+# this also emits a sibling <stem>_grpc.rs containing owned wrappers,
+# FlatBufferGrpcMessage impls, and per-rpc_service server + client modules.
+grpc-build = { git = "https://github.com/Shuozeli/pure-grpc-rs.git", rev = "58c35d952a414a7229622c7d1306acf6597e8170", default-features = false, features = ["flatbuffers"] }
