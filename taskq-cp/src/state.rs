@@ -36,9 +36,9 @@ use tokio::sync::{Mutex, Notify, RwLock};
 use taskq_storage::{
     AuditEntry, CancelOutcome, CapacityDecision, CapacityKind, DeadWorkerRuntime, DedupRecord,
     ExpiredRuntime, IdempotencyKey, LeaseRef, LockedTask, Namespace, NamespaceQuota,
-    NewDedupRecord, NewLease, NewTask, PickCriteria, RateDecision, RateKind, RuntimeRef, Storage,
-    StorageError, StorageTx, Task, TaskId, TaskOutcome, TaskStatus, TaskType, Timestamp,
-    WakeSignal, WorkerId, WorkerInfo,
+    NamespaceQuotaUpsert, NewDedupRecord, NewLease, NewTask, PickCriteria, RateDecision, RateKind,
+    ReplayOutcome, RuntimeRef, Storage, StorageError, StorageTx, Task, TaskFilter, TaskId,
+    TaskOutcome, TaskStatus, TaskType, TerminalState, Timestamp, WakeSignal, WorkerId, WorkerInfo,
 };
 
 use crate::config::CpConfig;
@@ -249,6 +249,57 @@ pub trait StorageTxDyn: Send {
     fn disable_namespace<'a>(
         &'a mut self,
         namespace: &'a Namespace,
+    ) -> StorageTxFuture<'a, Result<(), StorageError>>;
+
+    // ---- Phase 5e admin writes -----------------------------------------
+
+    fn upsert_namespace_quota<'a>(
+        &'a mut self,
+        namespace: &'a Namespace,
+        quota: NamespaceQuotaUpsert,
+    ) -> StorageTxFuture<'a, Result<(), StorageError>>;
+
+    fn list_tasks_by_filter<'a>(
+        &'a mut self,
+        namespace: &'a Namespace,
+        filter: TaskFilter,
+        limit: usize,
+    ) -> StorageTxFuture<'a, Result<Vec<Task>, StorageError>>;
+
+    fn list_tasks_by_terminal_status<'a>(
+        &'a mut self,
+        namespace: &'a Namespace,
+        statuses: Vec<TerminalState>,
+        limit: usize,
+    ) -> StorageTxFuture<'a, Result<Vec<Task>, StorageError>>;
+
+    fn replay_task<'a>(
+        &'a mut self,
+        task_id: TaskId,
+    ) -> StorageTxFuture<'a, Result<ReplayOutcome, StorageError>>;
+
+    fn add_error_classes<'a>(
+        &'a mut self,
+        namespace: &'a Namespace,
+        classes: &'a [String],
+    ) -> StorageTxFuture<'a, Result<(), StorageError>>;
+
+    fn deprecate_error_class<'a>(
+        &'a mut self,
+        namespace: &'a Namespace,
+        class: &'a str,
+    ) -> StorageTxFuture<'a, Result<(), StorageError>>;
+
+    fn add_task_types<'a>(
+        &'a mut self,
+        namespace: &'a Namespace,
+        types: &'a [TaskType],
+    ) -> StorageTxFuture<'a, Result<(), StorageError>>;
+
+    fn deprecate_task_type<'a>(
+        &'a mut self,
+        namespace: &'a Namespace,
+        task_type: &'a TaskType,
     ) -> StorageTxFuture<'a, Result<(), StorageError>>;
 
     // ---- Lifecycle -----------------------------------------------------
@@ -488,6 +539,97 @@ where
         namespace: &'a Namespace,
     ) -> StorageTxFuture<'a, Result<(), StorageError>> {
         Box::pin(StorageTx::disable_namespace(&mut self.inner, namespace))
+    }
+
+    fn upsert_namespace_quota<'a>(
+        &'a mut self,
+        namespace: &'a Namespace,
+        quota: NamespaceQuotaUpsert,
+    ) -> StorageTxFuture<'a, Result<(), StorageError>> {
+        Box::pin(StorageTx::upsert_namespace_quota(
+            &mut self.inner,
+            namespace,
+            quota,
+        ))
+    }
+
+    fn list_tasks_by_filter<'a>(
+        &'a mut self,
+        namespace: &'a Namespace,
+        filter: TaskFilter,
+        limit: usize,
+    ) -> StorageTxFuture<'a, Result<Vec<Task>, StorageError>> {
+        Box::pin(StorageTx::list_tasks_by_filter(
+            &mut self.inner,
+            namespace,
+            filter,
+            limit,
+        ))
+    }
+
+    fn list_tasks_by_terminal_status<'a>(
+        &'a mut self,
+        namespace: &'a Namespace,
+        statuses: Vec<TerminalState>,
+        limit: usize,
+    ) -> StorageTxFuture<'a, Result<Vec<Task>, StorageError>> {
+        Box::pin(StorageTx::list_tasks_by_terminal_status(
+            &mut self.inner,
+            namespace,
+            statuses,
+            limit,
+        ))
+    }
+
+    fn replay_task<'a>(
+        &'a mut self,
+        task_id: TaskId,
+    ) -> StorageTxFuture<'a, Result<ReplayOutcome, StorageError>> {
+        Box::pin(StorageTx::replay_task(&mut self.inner, task_id))
+    }
+
+    fn add_error_classes<'a>(
+        &'a mut self,
+        namespace: &'a Namespace,
+        classes: &'a [String],
+    ) -> StorageTxFuture<'a, Result<(), StorageError>> {
+        Box::pin(StorageTx::add_error_classes(
+            &mut self.inner,
+            namespace,
+            classes,
+        ))
+    }
+
+    fn deprecate_error_class<'a>(
+        &'a mut self,
+        namespace: &'a Namespace,
+        class: &'a str,
+    ) -> StorageTxFuture<'a, Result<(), StorageError>> {
+        Box::pin(StorageTx::deprecate_error_class(
+            &mut self.inner,
+            namespace,
+            class,
+        ))
+    }
+
+    fn add_task_types<'a>(
+        &'a mut self,
+        namespace: &'a Namespace,
+        types: &'a [TaskType],
+    ) -> StorageTxFuture<'a, Result<(), StorageError>> {
+        Box::pin(StorageTx::add_task_types(&mut self.inner, namespace, types))
+    }
+
+    fn deprecate_task_type<'a>(
+        &'a mut self,
+        namespace: &'a Namespace,
+        task_type: &'a TaskType,
+    ) -> StorageTxFuture<'a, Result<(), StorageError>> {
+        Box::pin(StorageTx::deprecate_task_type(
+            &mut self.inner,
+            namespace,
+            task_type,
+        ))
     }
 
     fn commit_dyn<'a>(self: Box<Self>) -> StorageTxFuture<'a, Result<(), StorageError>>

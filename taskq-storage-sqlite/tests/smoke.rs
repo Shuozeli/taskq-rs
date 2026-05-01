@@ -13,7 +13,8 @@ use taskq_storage::{
     ids::{IdempotencyKey, Namespace, TaskId, TaskType, Timestamp, WorkerId},
     traits::{Storage, StorageTx},
     types::{
-        NewDedupRecord, NewLease, NewTask, PickCriteria, PickOrdering, TaskOutcome, TaskTypeFilter,
+        NamespaceQuotaUpsert, NewDedupRecord, NewLease, NewTask, PickCriteria, PickOrdering,
+        ReplayOutcome, TaskFilter, TaskOutcome, TaskStatus, TaskTypeFilter, TerminalState,
     },
 };
 use taskq_storage_sqlite::SqliteStorage;
@@ -172,4 +173,280 @@ async fn duplicate_idempotency_key_returns_constraint_violation() {
         other => panic!("expected ConstraintViolation, got {other:?}"),
     }
     tx.rollback().await.expect("rollback");
+}
+
+fn well_formed_upsert() -> NamespaceQuotaUpsert {
+    NamespaceQuotaUpsert {
+        max_pending: Some(100),
+        max_inflight: Some(10),
+        max_workers: Some(20),
+        max_waiters_per_replica: Some(5000),
+        max_submit_rpm: Some(600),
+        max_dispatch_rpm: Some(120),
+        max_replay_per_second: Some(50),
+        max_retries_ceiling: 5,
+        max_idempotency_ttl_seconds: 86_400,
+        max_payload_bytes: 4_096,
+        max_details_bytes: 1_024,
+        min_heartbeat_interval_seconds: 5,
+        lazy_extension_threshold_seconds: 30,
+        max_error_classes: 16,
+        max_task_types: 8,
+        trace_sampling_ratio: 0.5,
+        log_level_override: None,
+        audit_log_retention_days: 14,
+        metrics_export_enabled: true,
+    }
+}
+
+#[tokio::test]
+async fn upsert_namespace_quota_inserts_then_overwrites_writable_subset() {
+    // Arrange: open an in-memory backend.
+    let storage = SqliteStorage::open_in_memory()
+        .await
+        .expect("open in-memory sqlite");
+
+    // Act 1: first upsert creates the row.
+    let mut tx = storage.begin().await.expect("begin tx");
+    tx.upsert_namespace_quota(&Namespace::new("ns-x"), well_formed_upsert())
+        .await
+        .expect("first upsert");
+    tx.commit().await.expect("commit");
+
+    // Act 2: second upsert with mutated value overwrites it.
+    let mut bumped = well_formed_upsert();
+    bumped.max_retries_ceiling = 9;
+    let mut tx = storage.begin().await.expect("begin tx");
+    tx.upsert_namespace_quota(&Namespace::new("ns-x"), bumped)
+        .await
+        .expect("second upsert");
+    tx.commit().await.expect("commit");
+
+    // Assert: the persisted quota reflects the latest write.
+    let mut tx = storage.begin().await.expect("begin tx");
+    let quota = tx
+        .get_namespace_quota(&Namespace::new("ns-x"))
+        .await
+        .expect("quota present");
+    tx.commit().await.expect("commit");
+    assert_eq!(quota.max_retries_ceiling, 9);
+    assert_eq!(quota.max_payload_bytes, 4_096);
+}
+
+#[tokio::test]
+async fn list_tasks_by_filter_returns_oldest_first_for_namespace() {
+    // Arrange: insert two tasks in `ns-list` with different submit times.
+    let storage = SqliteStorage::open_in_memory()
+        .await
+        .expect("open in-memory sqlite");
+    let early_id = TaskId::generate();
+    let late_id = TaskId::generate();
+
+    let mut tx = storage.begin().await.expect("begin tx");
+    let (mut early_task, early_dedup) = new_task(early_id, "ns-list", "k-early");
+    early_task.submitted_at = Timestamp::from_unix_millis(1_000);
+    tx.insert_task(early_task, early_dedup)
+        .await
+        .expect("insert early");
+    let (mut late_task, late_dedup) = new_task(late_id, "ns-list", "k-late");
+    late_task.submitted_at = Timestamp::from_unix_millis(2_000);
+    tx.insert_task(late_task, late_dedup)
+        .await
+        .expect("insert late");
+    tx.commit().await.expect("commit");
+
+    // Act
+    let mut tx = storage.begin().await.expect("begin tx");
+    let tasks = tx
+        .list_tasks_by_filter(&Namespace::new("ns-list"), TaskFilter::default(), 10)
+        .await
+        .expect("list");
+    tx.commit().await.expect("commit");
+
+    // Assert
+    assert_eq!(tasks.len(), 2);
+    assert_eq!(tasks[0].task_id, early_id);
+    assert_eq!(tasks[1].task_id, late_id);
+}
+
+#[tokio::test]
+async fn list_tasks_by_terminal_status_only_returns_terminal_failures() {
+    // Arrange: provision one PENDING task (excluded) and one
+    // FAILED_NONRETRYABLE task (included).
+    let storage = SqliteStorage::open_in_memory()
+        .await
+        .expect("open in-memory sqlite");
+    let pending_id = TaskId::generate();
+    let failed_id = TaskId::generate();
+    let worker_id = WorkerId::generate();
+    let now = Timestamp::from_unix_millis(1_000);
+
+    let mut tx = storage.begin().await.expect("begin tx");
+    let (pending_task, pending_dedup) = new_task(pending_id, "ns-term", "k-p");
+    tx.insert_task(pending_task, pending_dedup)
+        .await
+        .expect("insert pending");
+    let (failed_task, failed_dedup) = new_task(failed_id, "ns-term", "k-f");
+    tx.insert_task(failed_task, failed_dedup)
+        .await
+        .expect("insert failed");
+    tx.record_acquisition(NewLease {
+        task_id: failed_id,
+        attempt_number: 0,
+        worker_id,
+        acquired_at: now,
+        timeout_at: Timestamp::from_unix_millis(60_000),
+    })
+    .await
+    .expect("record acquisition");
+    tx.complete_task(
+        &taskq_storage::types::LeaseRef {
+            task_id: failed_id,
+            attempt_number: 0,
+            worker_id,
+        },
+        TaskOutcome::FailedNonretryable {
+            error_class: "boom".to_owned(),
+            error_message: "test".to_owned(),
+            error_details: Bytes::new(),
+            recorded_at: now,
+        },
+    )
+    .await
+    .expect("complete-as-failed");
+    tx.commit().await.expect("commit");
+
+    // Act
+    let mut tx = storage.begin().await.expect("begin tx");
+    let tasks = tx
+        .list_tasks_by_terminal_status(
+            &Namespace::new("ns-term"),
+            vec![TerminalState::FailedNonretryable],
+            10,
+        )
+        .await
+        .expect("list");
+    tx.commit().await.expect("commit");
+
+    // Assert
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].task_id, failed_id);
+}
+
+#[tokio::test]
+async fn replay_task_resets_failed_task_to_pending() {
+    // Arrange: create + fail a task so it lands in FAILED_NONRETRYABLE.
+    let storage = SqliteStorage::open_in_memory()
+        .await
+        .expect("open in-memory sqlite");
+    let task_id = TaskId::generate();
+    let worker_id = WorkerId::generate();
+    let now = Timestamp::from_unix_millis(1_000);
+
+    let mut tx = storage.begin().await.expect("begin tx");
+    let (task, dedup) = new_task(task_id, "ns-replay", "k1");
+    tx.insert_task(task, dedup).await.expect("insert");
+    tx.record_acquisition(NewLease {
+        task_id,
+        attempt_number: 0,
+        worker_id,
+        acquired_at: now,
+        timeout_at: Timestamp::from_unix_millis(60_000),
+    })
+    .await
+    .expect("record acquisition");
+    tx.complete_task(
+        &taskq_storage::types::LeaseRef {
+            task_id,
+            attempt_number: 0,
+            worker_id,
+        },
+        TaskOutcome::FailedNonretryable {
+            error_class: "boom".to_owned(),
+            error_message: "test".to_owned(),
+            error_details: Bytes::new(),
+            recorded_at: now,
+        },
+    )
+    .await
+    .expect("complete-as-failed");
+    tx.commit().await.expect("commit");
+
+    // Act
+    let mut tx = storage.begin().await.expect("begin tx");
+    let outcome = tx.replay_task(task_id).await.expect("replay");
+    tx.commit().await.expect("commit");
+
+    // Assert
+    assert_eq!(outcome, ReplayOutcome::Replayed);
+    let mut tx = storage.begin().await.expect("begin tx");
+    let task = tx
+        .get_task_by_id(task_id)
+        .await
+        .expect("ok")
+        .expect("present");
+    tx.commit().await.expect("commit");
+    assert_eq!(task.status, TaskStatus::Pending);
+    assert_eq!(task.attempt_number, 0);
+}
+
+#[tokio::test]
+async fn replay_task_refuses_when_status_is_not_terminal_failure() {
+    // Arrange: a freshly-inserted PENDING task is not eligible for replay.
+    let storage = SqliteStorage::open_in_memory()
+        .await
+        .expect("open in-memory sqlite");
+    let task_id = TaskId::generate();
+    let mut tx = storage.begin().await.expect("begin tx");
+    let (task, dedup) = new_task(task_id, "ns-pending", "k1");
+    tx.insert_task(task, dedup).await.expect("insert");
+    tx.commit().await.expect("commit");
+
+    // Act
+    let mut tx = storage.begin().await.expect("begin tx");
+    let outcome = tx.replay_task(task_id).await.expect("replay");
+    tx.commit().await.expect("commit");
+
+    // Assert
+    assert_eq!(outcome, ReplayOutcome::NotInTerminalFailureState);
+}
+
+#[tokio::test]
+async fn add_error_classes_is_idempotent_on_repeated_insert() {
+    // Arrange
+    let storage = SqliteStorage::open_in_memory()
+        .await
+        .expect("open in-memory sqlite");
+    let ns = Namespace::new("ns-classes");
+    let classes = vec!["transient".to_owned(), "permanent".to_owned()];
+
+    // Act: insert twice.
+    let mut tx = storage.begin().await.expect("begin tx");
+    tx.add_error_classes(&ns, &classes).await.expect("add 1");
+    tx.add_error_classes(&ns, &classes).await.expect("add 2");
+    tx.commit().await.expect("commit");
+
+    // Assert: no error, second insert was a no-op via INSERT OR IGNORE.
+    // (We don't yet have a count primitive; the success of the second
+    // insert is the assertion — a non-idempotent insert would have
+    // surfaced a PK constraint violation.)
+}
+
+#[tokio::test]
+async fn add_task_types_is_idempotent_on_repeated_insert() {
+    // Arrange
+    let storage = SqliteStorage::open_in_memory()
+        .await
+        .expect("open in-memory sqlite");
+    let ns = Namespace::new("ns-types");
+    let types = vec![TaskType::new("email"), TaskType::new("sms")];
+
+    // Act: insert twice.
+    let mut tx = storage.begin().await.expect("begin tx");
+    tx.add_task_types(&ns, &types).await.expect("add 1");
+    tx.add_task_types(&ns, &types).await.expect("add 2");
+    tx.commit().await.expect("commit");
+
+    // Assert: completed without error — INSERT OR IGNORE prevents the
+    // PK violation on the second pass.
 }

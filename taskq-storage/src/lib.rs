@@ -41,6 +41,7 @@ pub use crate::traits::{Storage, StorageTx};
 pub use crate::types::{
     AuditEntry, CancelOutcome, CapacityDecision, CapacityKind, DeadWorkerRuntime, DedupRecord,
     ExpiredRuntime, HeartbeatAck, LeaseRef, LockedTask, NamespaceFilter, NamespaceQuota,
-    NewDedupRecord, NewLease, NewTask, PickCriteria, PickOrdering, RateDecision, RateKind,
-    RuntimeRef, Task, TaskOutcome, TaskStatus, TaskTypeFilter, WakeSignal, WorkerInfo,
+    NamespaceQuotaUpsert, NewDedupRecord, NewLease, NewTask, PickCriteria, PickOrdering,
+    RateDecision, RateKind, ReplayOutcome, RuntimeRef, Task, TaskFilter, TaskOutcome, TaskStatus,
+    TaskTypeFilter, TerminalState, WakeSignal, WorkerInfo,
 };

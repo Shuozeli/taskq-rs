@@ -29,9 +29,9 @@ use crate::error::Result;
 use crate::ids::{IdempotencyKey, Namespace, TaskId, TaskType, Timestamp, WorkerId};
 use crate::types::{
     AuditEntry, CancelOutcome, CapacityDecision, CapacityKind, DeadWorkerRuntime, DedupRecord,
-    ExpiredRuntime, HeartbeatAck, LeaseRef, LockedTask, NamespaceQuota, NewDedupRecord, NewLease,
-    NewTask, PickCriteria, RateDecision, RateKind, RuntimeRef, Task, TaskOutcome, TaskStatus,
-    WakeSignal, WorkerInfo,
+    ExpiredRuntime, HeartbeatAck, LeaseRef, LockedTask, NamespaceQuota, NamespaceQuotaUpsert,
+    NewDedupRecord, NewLease, NewTask, PickCriteria, RateDecision, RateKind, ReplayOutcome,
+    RuntimeRef, Task, TaskFilter, TaskOutcome, TaskStatus, TerminalState, WakeSignal, WorkerInfo,
 };
 
 /// Connection-lifecycle trait. A `Storage` factory hands out `StorageTx`
@@ -448,6 +448,122 @@ pub trait StorageTx: Send {
     fn disable_namespace(
         &mut self,
         namespace: &Namespace,
+    ) -> impl std::future::Future<Output = Result<()>> + Send;
+
+    // ========================================================================
+    // Phase 5e admin writes
+    // ========================================================================
+
+    /// Used by admin `SetNamespaceQuota` (`design.md` §6.7): UPSERT the
+    /// writable subset of `namespace_quota` for `namespace`.
+    ///
+    /// Implementations MUST NOT touch the `disabled` flag (separate
+    /// `enable_namespace` / `disable_namespace` path) or the strategy
+    /// columns (`admitter_kind`, `admitter_params`, `dispatcher_kind`,
+    /// `dispatcher_params` — owned by the future `set_namespace_config`
+    /// path). The row is created with `disabled = FALSE` and
+    /// `admitter_kind = 'Always'` / `dispatcher_kind = 'PriorityFifo'`
+    /// when the namespace has no prior row, mirroring the
+    /// `system_default` shape from migrations/0001.
+    ///
+    /// SERIALIZABLE: yes.
+    fn upsert_namespace_quota(
+        &mut self,
+        namespace: &Namespace,
+        quota: NamespaceQuotaUpsert,
+    ) -> impl std::future::Future<Output = Result<()>> + Send;
+
+    /// Used by admin `PurgeTasks` (`design.md` §6.7): list up to `limit`
+    /// tasks in `namespace` matching `filter`. Each `Some` field on
+    /// [`TaskFilter`] narrows the result; an all-`None` filter returns up to
+    /// `limit` tasks ordered by `submitted_at ASC` so admin paths process
+    /// the oldest tasks first.
+    ///
+    /// Returns the matching [`Task`] rows; the caller drives a per-task
+    /// cancel-then-delete loop (rate-limited by the admin RPC).
+    ///
+    /// SERIALIZABLE: yes (rides the admin transaction; reads are inline).
+    fn list_tasks_by_filter(
+        &mut self,
+        namespace: &Namespace,
+        filter: TaskFilter,
+        limit: usize,
+    ) -> impl std::future::Future<Output = Result<Vec<Task>>> + Send;
+
+    /// Used by admin `ReplayDeadLetters` (`design.md` §6.7): list up to
+    /// `limit` tasks in `namespace` whose status is one of `statuses`. The
+    /// caller drives a per-task `replay_task` call to validate idempotency-
+    /// key state and reset the row.
+    ///
+    /// SERIALIZABLE: yes.
+    fn list_tasks_by_terminal_status(
+        &mut self,
+        namespace: &Namespace,
+        statuses: Vec<TerminalState>,
+        limit: usize,
+    ) -> impl std::future::Future<Output = Result<Vec<Task>>> + Send;
+
+    /// Used by admin `ReplayDeadLetters` (`design.md` §6.7): replay one
+    /// task back to `PENDING` if it is in a terminal failure state AND its
+    /// idempotency key has not been claimed by a different task.
+    ///
+    /// On success the row is updated as:
+    /// - `status = PENDING`
+    /// - `attempt_number = 0`
+    /// - `original_failure_count` preserved (incremented if previously zero
+    ///   to capture this replay's prior attempt count)
+    /// - `retry_after = NULL`
+    ///
+    /// SERIALIZABLE: yes.
+    fn replay_task(
+        &mut self,
+        task_id: TaskId,
+    ) -> impl std::future::Future<Output = Result<ReplayOutcome>> + Send;
+
+    /// Used by admin `SetNamespaceConfig` (`design.md` §6.7, §11.3): insert
+    /// the listed error classes into `error_class_registry` for `namespace`.
+    /// Idempotent — pre-existing rows are left as-is (Postgres `ON CONFLICT
+    /// DO NOTHING`, SQLite `INSERT OR IGNORE`).
+    ///
+    /// SERIALIZABLE: yes.
+    fn add_error_classes(
+        &mut self,
+        namespace: &Namespace,
+        classes: &[String],
+    ) -> impl std::future::Future<Output = Result<()>> + Send;
+
+    /// Used by admin `SetNamespaceConfig` (`design.md` §6.7): mark the
+    /// listed error class as `deprecated = TRUE` so subsequent
+    /// `ReportFailure` calls emit a structured warning. No-op when the
+    /// row is missing.
+    ///
+    /// SERIALIZABLE: yes.
+    fn deprecate_error_class(
+        &mut self,
+        namespace: &Namespace,
+        class: &str,
+    ) -> impl std::future::Future<Output = Result<()>> + Send;
+
+    /// Used by admin `SetNamespaceConfig` (`design.md` §6.7, §11.3): insert
+    /// the listed task types into `task_type_registry` for `namespace`.
+    /// Idempotent — pre-existing rows are left as-is.
+    ///
+    /// SERIALIZABLE: yes.
+    fn add_task_types(
+        &mut self,
+        namespace: &Namespace,
+        types: &[TaskType],
+    ) -> impl std::future::Future<Output = Result<()>> + Send;
+
+    /// Used by admin `SetNamespaceConfig` (`design.md` §6.7): mark the
+    /// listed task type as `deprecated = TRUE`. No-op when the row is
+    /// missing.
+    ///
+    /// SERIALIZABLE: yes.
+    fn deprecate_task_type(
+        &mut self,
+        namespace: &Namespace,
+        task_type: &TaskType,
     ) -> impl std::future::Future<Output = Result<()>> + Send;
 
     // ========================================================================

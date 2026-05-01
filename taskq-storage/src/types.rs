@@ -520,3 +520,100 @@ pub struct WorkerInfo {
     /// leases has `inflight_count = 0` even before its heartbeat lapses.
     pub inflight_count: u32,
 }
+
+// ============================================================================
+// Phase 5e admin writes (StorageTx::upsert_namespace_quota / list_tasks_by_filter
+// / list_tasks_by_terminal_status / replay_task / registry add+deprecate)
+// ============================================================================
+
+/// Writable subset of `namespace_quota` consumed by
+/// [`crate::traits::StorageTx::upsert_namespace_quota`]. Mirrors the columns
+/// that `SetNamespaceQuota` (`design.md` §6.7) lets operators rewrite. The
+/// strategy choice (admitter/dispatcher kind + params) is updated through a
+/// separate `set_namespace_config` path; the `disabled` flag is flipped via
+/// `enable_namespace` / `disable_namespace`.
+#[derive(Debug, Clone)]
+pub struct NamespaceQuotaUpsert {
+    // Capacity quotas.
+    pub max_pending: Option<u64>,
+    pub max_inflight: Option<u64>,
+    pub max_workers: Option<u32>,
+    pub max_waiters_per_replica: Option<u32>,
+
+    // Rate quotas.
+    pub max_submit_rpm: Option<u64>,
+    pub max_dispatch_rpm: Option<u64>,
+    pub max_replay_per_second: Option<u32>,
+
+    // Per-task ceilings.
+    pub max_retries_ceiling: u32,
+    pub max_idempotency_ttl_seconds: u64,
+    pub max_payload_bytes: u32,
+    pub max_details_bytes: u32,
+    pub min_heartbeat_interval_seconds: u32,
+
+    // Lease/heartbeat invariant.
+    pub lazy_extension_threshold_seconds: u32,
+
+    // Cardinality budget.
+    pub max_error_classes: u32,
+    pub max_task_types: u32,
+
+    // Observability config.
+    pub trace_sampling_ratio: f32,
+    pub log_level_override: Option<String>,
+    pub audit_log_retention_days: u32,
+    pub metrics_export_enabled: bool,
+}
+
+/// Filter consumed by [`crate::traits::StorageTx::list_tasks_by_filter`]. Each
+/// `Some` field narrows the result; an all-`None` filter returns up to
+/// `limit` tasks for the namespace. Used by admin `PurgeTasks` (`design.md`
+/// §6.7) to enumerate target tasks.
+#[derive(Debug, Clone, Default)]
+pub struct TaskFilter {
+    pub task_types: Option<Vec<TaskType>>,
+    pub statuses: Option<Vec<TaskStatus>>,
+    pub submitted_before: Option<Timestamp>,
+    pub submitted_after: Option<Timestamp>,
+}
+
+/// Terminal failure states consumed by
+/// [`crate::traits::StorageTx::list_tasks_by_terminal_status`] /
+/// [`crate::traits::StorageTx::replay_task`]. Subset of [`TaskStatus`] that
+/// `ReplayDeadLetters` (`design.md` §6.7) is allowed to operate on — only
+/// tasks in one of these states can be replayed back to `PENDING`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalState {
+    FailedNonretryable,
+    FailedExhausted,
+    Expired,
+}
+
+impl TerminalState {
+    /// Project the variant onto its [`TaskStatus`] counterpart.
+    pub fn as_task_status(self) -> TaskStatus {
+        match self {
+            Self::FailedNonretryable => TaskStatus::FailedNonretryable,
+            Self::FailedExhausted => TaskStatus::FailedExhausted,
+            Self::Expired => TaskStatus::Expired,
+        }
+    }
+}
+
+/// Outcome of a [`crate::traits::StorageTx::replay_task`] call. Per
+/// `design.md` §6.7 a replay only fires when the task is in a terminal
+/// failure state AND its idempotency-key has not been re-claimed by another
+/// submission since.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayOutcome {
+    /// Task reset to `PENDING` with `attempt_number = 0`,
+    /// `original_failure_count` preserved.
+    Replayed,
+    /// Idempotency key now points to a different task — replay refused.
+    KeyClaimedElsewhere,
+    /// Task is not in a terminal failure state — replay refused.
+    NotInTerminalFailureState,
+    /// Task does not exist.
+    NotFound,
+}

@@ -193,9 +193,9 @@ mod tests {
     use taskq_storage::{
         AuditEntry, CancelOutcome, CapacityDecision, CapacityKind, DeadWorkerRuntime, DedupRecord,
         ExpiredRuntime, HeartbeatAck, IdempotencyKey, LeaseRef, LockedTask, Namespace,
-        NamespaceQuota, NewDedupRecord, NewLease, NewTask, PickCriteria, RateDecision, RateKind,
-        RuntimeRef, StorageError, Task, TaskId, TaskOutcome, TaskStatus, TaskType, Timestamp,
-        WorkerId, WorkerInfo,
+        NamespaceQuota, NamespaceQuotaUpsert, NewDedupRecord, NewLease, NewTask, PickCriteria,
+        RateDecision, RateKind, ReplayOutcome, RuntimeRef, StorageError, Task, TaskFilter, TaskId,
+        TaskOutcome, TaskStatus, TaskType, TerminalState, Timestamp, WorkerId, WorkerInfo,
     };
 
     use crate::state::{StorageTxDyn, StorageTxFuture, WakeSignalStream};
@@ -391,6 +391,71 @@ mod tests {
             _ns: &'a Namespace,
         ) -> StorageTxFuture<'a, Result<(), StorageError>> {
             unreachable!("Phase 5c admin methods not exercised in admitter tests")
+        }
+
+        fn upsert_namespace_quota<'a>(
+            &'a mut self,
+            _ns: &'a Namespace,
+            _quota: NamespaceQuotaUpsert,
+        ) -> StorageTxFuture<'a, Result<(), StorageError>> {
+            unreachable!("Phase 5e admin writes not exercised in admitter tests")
+        }
+
+        fn list_tasks_by_filter<'a>(
+            &'a mut self,
+            _ns: &'a Namespace,
+            _filter: TaskFilter,
+            _limit: usize,
+        ) -> StorageTxFuture<'a, Result<Vec<Task>, StorageError>> {
+            unreachable!("Phase 5e admin writes not exercised in admitter tests")
+        }
+
+        fn list_tasks_by_terminal_status<'a>(
+            &'a mut self,
+            _ns: &'a Namespace,
+            _statuses: Vec<TerminalState>,
+            _limit: usize,
+        ) -> StorageTxFuture<'a, Result<Vec<Task>, StorageError>> {
+            unreachable!("Phase 5e admin writes not exercised in admitter tests")
+        }
+
+        fn replay_task<'a>(
+            &'a mut self,
+            _task_id: TaskId,
+        ) -> StorageTxFuture<'a, Result<ReplayOutcome, StorageError>> {
+            unreachable!("Phase 5e admin writes not exercised in admitter tests")
+        }
+
+        fn add_error_classes<'a>(
+            &'a mut self,
+            _ns: &'a Namespace,
+            _classes: &'a [String],
+        ) -> StorageTxFuture<'a, Result<(), StorageError>> {
+            unreachable!("Phase 5e admin writes not exercised in admitter tests")
+        }
+
+        fn deprecate_error_class<'a>(
+            &'a mut self,
+            _ns: &'a Namespace,
+            _class: &'a str,
+        ) -> StorageTxFuture<'a, Result<(), StorageError>> {
+            unreachable!("Phase 5e admin writes not exercised in admitter tests")
+        }
+
+        fn add_task_types<'a>(
+            &'a mut self,
+            _ns: &'a Namespace,
+            _types: &'a [TaskType],
+        ) -> StorageTxFuture<'a, Result<(), StorageError>> {
+            unreachable!("Phase 5e admin writes not exercised in admitter tests")
+        }
+
+        fn deprecate_task_type<'a>(
+            &'a mut self,
+            _ns: &'a Namespace,
+            _task_type: &'a TaskType,
+        ) -> StorageTxFuture<'a, Result<(), StorageError>> {
+            unreachable!("Phase 5e admin writes not exercised in admitter tests")
         }
 
         fn commit_dyn<'a>(self: Box<Self>) -> StorageTxFuture<'a, Result<(), StorageError>>

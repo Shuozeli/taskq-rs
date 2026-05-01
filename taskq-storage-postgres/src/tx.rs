@@ -24,8 +24,9 @@ use taskq_storage::ids::{IdempotencyKey, Namespace, TaskId, TaskType, Timestamp,
 use taskq_storage::types::{
     AuditEntry, CancelOutcome, CapacityDecision, CapacityKind, DeadWorkerRuntime, DedupRecord,
     ExpiredRuntime, HeartbeatAck, LeaseRef, LockedTask, NamespaceFilter, NamespaceQuota,
-    NewDedupRecord, NewLease, NewTask, PickCriteria, PickOrdering, RateDecision, RateKind,
-    RuntimeRef, Task, TaskOutcome, TaskStatus, TaskTypeFilter, WakeSignal, WorkerInfo,
+    NamespaceQuotaUpsert, NewDedupRecord, NewLease, NewTask, PickCriteria, PickOrdering,
+    RateDecision, RateKind, ReplayOutcome, RuntimeRef, Task, TaskFilter, TaskOutcome, TaskStatus,
+    TaskTypeFilter, TerminalState, WakeSignal, WorkerInfo,
 };
 use taskq_storage::{StorageError, StorageTx};
 use tokio::sync::mpsc;
@@ -1116,6 +1117,363 @@ impl<'a> StorageTx for PostgresTx<'a> {
     }
 
     // ========================================================================
+    // Phase 5e admin writes
+    // ========================================================================
+
+    async fn upsert_namespace_quota(
+        &mut self,
+        namespace: &Namespace,
+        quota: NamespaceQuotaUpsert,
+    ) -> Result<()> {
+        // §6.7 SetNamespaceQuota: rewrite the writable subset of the row;
+        // strategy choice + `disabled` are owned by other paths. The INSERT
+        // shape supplies stub values for `admitter_kind` / `dispatcher_kind`
+        // when the namespace has no prior row (matching the
+        // `system_default` defaults from migrations/0001).
+        let max_pending = quota.max_pending.map(|v| v as i64);
+        let max_inflight = quota.max_inflight.map(|v| v as i64);
+        let max_workers = quota.max_workers.map(|v| v as i32);
+        let max_waiters_per_replica = quota.max_waiters_per_replica.map(|v| v as i32);
+        let max_submit_rpm = quota.max_submit_rpm.map(|v| v as i64);
+        let max_dispatch_rpm = quota.max_dispatch_rpm.map(|v| v as i64);
+        let max_replay_per_second = quota.max_replay_per_second.map(|v| v as i32);
+        let max_retries_ceiling = quota.max_retries_ceiling as i32;
+        let max_idempotency_ttl_seconds = quota.max_idempotency_ttl_seconds as i64;
+        let max_payload_bytes = quota.max_payload_bytes as i32;
+        let max_details_bytes = quota.max_details_bytes as i32;
+        let min_heartbeat_interval_seconds = quota.min_heartbeat_interval_seconds as i32;
+        let lazy_extension_threshold_seconds = quota.lazy_extension_threshold_seconds as i32;
+        let max_error_classes = quota.max_error_classes as i32;
+        let max_task_types = quota.max_task_types as i32;
+        let trace_sampling_ratio = quota.trace_sampling_ratio;
+        let log_level_override = quota.log_level_override.clone();
+        let audit_log_retention_days = quota.audit_log_retention_days as i32;
+        let metrics_export_enabled = quota.metrics_export_enabled;
+        let empty_params: Vec<u8> = Vec::new();
+
+        self.conn
+            .execute(
+                "INSERT INTO namespace_quota (\
+                    namespace, admitter_kind, admitter_params, dispatcher_kind, dispatcher_params, \
+                    max_pending, max_inflight, max_workers, max_waiters_per_replica, \
+                    max_submit_rpm, max_dispatch_rpm, max_replay_per_second, \
+                    max_retries_ceiling, max_idempotency_ttl_seconds, max_payload_bytes, \
+                    max_details_bytes, min_heartbeat_interval_seconds, \
+                    lazy_extension_threshold_seconds, max_error_classes, max_task_types, \
+                    trace_sampling_ratio, log_level_override, audit_log_retention_days, \
+                    metrics_export_enabled) \
+                 VALUES ($1, 'Always', $21, 'PriorityFifo', $21, \
+                    $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, \
+                    $17, $18, $19, $20) \
+                 ON CONFLICT (namespace) DO UPDATE SET \
+                    max_pending = EXCLUDED.max_pending, \
+                    max_inflight = EXCLUDED.max_inflight, \
+                    max_workers = EXCLUDED.max_workers, \
+                    max_waiters_per_replica = EXCLUDED.max_waiters_per_replica, \
+                    max_submit_rpm = EXCLUDED.max_submit_rpm, \
+                    max_dispatch_rpm = EXCLUDED.max_dispatch_rpm, \
+                    max_replay_per_second = EXCLUDED.max_replay_per_second, \
+                    max_retries_ceiling = EXCLUDED.max_retries_ceiling, \
+                    max_idempotency_ttl_seconds = EXCLUDED.max_idempotency_ttl_seconds, \
+                    max_payload_bytes = EXCLUDED.max_payload_bytes, \
+                    max_details_bytes = EXCLUDED.max_details_bytes, \
+                    min_heartbeat_interval_seconds = EXCLUDED.min_heartbeat_interval_seconds, \
+                    lazy_extension_threshold_seconds = EXCLUDED.lazy_extension_threshold_seconds, \
+                    max_error_classes = EXCLUDED.max_error_classes, \
+                    max_task_types = EXCLUDED.max_task_types, \
+                    trace_sampling_ratio = EXCLUDED.trace_sampling_ratio, \
+                    log_level_override = EXCLUDED.log_level_override, \
+                    audit_log_retention_days = EXCLUDED.audit_log_retention_days, \
+                    metrics_export_enabled = EXCLUDED.metrics_export_enabled",
+                &[
+                    &namespace.as_str(),
+                    &max_pending,
+                    &max_inflight,
+                    &max_workers,
+                    &max_waiters_per_replica,
+                    &max_submit_rpm,
+                    &max_dispatch_rpm,
+                    &max_replay_per_second,
+                    &max_retries_ceiling,
+                    &max_idempotency_ttl_seconds,
+                    &max_payload_bytes,
+                    &max_details_bytes,
+                    &min_heartbeat_interval_seconds,
+                    &lazy_extension_threshold_seconds,
+                    &max_error_classes,
+                    &max_task_types,
+                    &trace_sampling_ratio,
+                    &log_level_override,
+                    &audit_log_retention_days,
+                    &metrics_export_enabled,
+                    &empty_params,
+                ],
+            )
+            .await
+            .map_err(map_db_error)?;
+        Ok(())
+    }
+
+    async fn list_tasks_by_filter(
+        &mut self,
+        namespace: &Namespace,
+        filter: TaskFilter,
+        limit: usize,
+    ) -> Result<Vec<Task>> {
+        // §6.7 PurgeTasks: dynamic WHERE built from `filter`. Predicates are
+        // bound parameters; the `ANY($N::text[])` form keeps the SQL static
+        // while still supporting variable-length IN-lists.
+        let mut sql = String::from(
+            "SELECT task_id, namespace, task_type, status::text, priority, payload, \
+                    payload_hash, submitted_at, expires_at, attempt_number, max_retries, \
+                    retry_initial_ms, retry_max_ms, retry_coefficient, retry_after, \
+                    traceparent, tracestate, format_version, original_failure_count \
+               FROM tasks \
+              WHERE namespace = $1",
+        );
+        let mut params: Vec<Box<dyn ToSql + Sync + Send>> = Vec::new();
+        params.push(Box::new(namespace.as_str().to_owned()));
+
+        let task_types_owned: Option<Vec<String>> = filter
+            .task_types
+            .as_ref()
+            .map(|v| v.iter().map(|t| t.as_str().to_owned()).collect());
+        if let Some(ref types) = task_types_owned {
+            sql.push_str(&format!(
+                " AND task_type = ANY(${}::text[])",
+                params.len() + 1
+            ));
+            params.push(Box::new(types.clone()));
+        }
+
+        let statuses_owned: Option<Vec<String>> = filter
+            .statuses
+            .as_ref()
+            .map(|v| v.iter().map(|s| s.as_db_str().to_owned()).collect());
+        if let Some(ref statuses) = statuses_owned {
+            sql.push_str(&format!(
+                " AND status::text = ANY(${}::text[])",
+                params.len() + 1
+            ));
+            params.push(Box::new(statuses.clone()));
+        }
+
+        if let Some(before) = filter.submitted_before {
+            sql.push_str(&format!(" AND submitted_at < ${}", params.len() + 1));
+            params.push(Box::new(timestamp_to_chrono(before)));
+        }
+        if let Some(after) = filter.submitted_after {
+            sql.push_str(&format!(" AND submitted_at > ${}", params.len() + 1));
+            params.push(Box::new(timestamp_to_chrono(after)));
+        }
+
+        sql.push_str(&format!(
+            " ORDER BY submitted_at ASC LIMIT ${}",
+            params.len() + 1
+        ));
+        params.push(Box::new(limit as i64));
+
+        let param_refs: Vec<&(dyn ToSql + Sync)> = params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn ToSql + Sync))
+            .collect();
+
+        let rows = self
+            .conn
+            .query(sql.as_str(), &param_refs)
+            .await
+            .map_err(map_db_error)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            out.push(task_from_row(&row)?);
+        }
+        Ok(out)
+    }
+
+    async fn list_tasks_by_terminal_status(
+        &mut self,
+        namespace: &Namespace,
+        statuses: Vec<TerminalState>,
+        limit: usize,
+    ) -> Result<Vec<Task>> {
+        // §6.7 ReplayDeadLetters: identical shape to `list_tasks_by_filter`
+        // but the status set is constrained to terminal failure variants.
+        let status_strs: Vec<String> = statuses
+            .iter()
+            .map(|s| s.as_task_status().as_db_str().to_owned())
+            .collect();
+        let limit = limit as i64;
+        let rows = self
+            .conn
+            .query(
+                "SELECT task_id, namespace, task_type, status::text, priority, payload, \
+                        payload_hash, submitted_at, expires_at, attempt_number, max_retries, \
+                        retry_initial_ms, retry_max_ms, retry_coefficient, retry_after, \
+                        traceparent, tracestate, format_version, original_failure_count \
+                   FROM tasks \
+                  WHERE namespace = $1 \
+                    AND status::text = ANY($2::text[]) \
+                  ORDER BY submitted_at ASC \
+                  LIMIT $3",
+                &[&namespace.as_str(), &status_strs, &limit],
+            )
+            .await
+            .map_err(map_db_error)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            out.push(task_from_row(&row)?);
+        }
+        Ok(out)
+    }
+
+    async fn replay_task(&mut self, task_id: TaskId) -> Result<ReplayOutcome> {
+        // §6.7 ReplayDeadLetters: validate state, validate idempotency-key
+        // ownership, then reset row to PENDING. Per the design we preserve
+        // `original_failure_count` and reset `attempt_number` to 0 so the
+        // replayed task starts fresh while still tracking its prior failure
+        // count for forensics.
+        let task_id_uuid = task_id.into_uuid();
+
+        let row = self
+            .conn
+            .query_opt(
+                "SELECT status::text, namespace, attempt_number, original_failure_count \
+                   FROM tasks WHERE task_id = $1 FOR UPDATE",
+                &[&task_id_uuid],
+            )
+            .await
+            .map_err(map_db_error)?;
+        let Some(row) = row else {
+            return Ok(ReplayOutcome::NotFound);
+        };
+        let status_str: String = row.get(0);
+        let namespace_str: String = row.get(1);
+        let attempt_number: i32 = row.get(2);
+        let original_failure_count: i32 = row.get(3);
+        let Some(status) = TaskStatus::from_db_str(&status_str) else {
+            return Err(StorageError::ConstraintViolation(format!(
+                "tasks.status has unknown value: {status_str}"
+            )));
+        };
+
+        let in_terminal_failure = matches!(
+            status,
+            TaskStatus::FailedNonretryable | TaskStatus::FailedExhausted | TaskStatus::Expired
+        );
+        if !in_terminal_failure {
+            return Ok(ReplayOutcome::NotInTerminalFailureState);
+        }
+
+        // Idempotency-key ownership: any dedup row for this namespace must
+        // either point at this task or not exist at all. If a different
+        // task owns the key, the replay would create a phantom duplicate;
+        // refuse.
+        let claimed_elsewhere: Option<i64> = self
+            .conn
+            .query_opt(
+                "SELECT 1 FROM idempotency_keys \
+                  WHERE namespace = $1 AND task_id != $2 \
+                    AND EXISTS (SELECT 1 FROM idempotency_keys k2 \
+                                 WHERE k2.namespace = $1 AND k2.task_id = $2)",
+                &[&namespace_str, &task_id_uuid],
+            )
+            .await
+            .map_err(map_db_error)?
+            .map(|r| r.get::<_, i32>(0) as i64);
+        if claimed_elsewhere.is_some() {
+            return Ok(ReplayOutcome::KeyClaimedElsewhere);
+        }
+
+        // Compute the new `original_failure_count`: preserve the existing
+        // value if it's already non-zero (a re-replay), otherwise capture
+        // the current `attempt_number` so forensics retain the prior
+        // attempt count even after the row resets.
+        let new_original_failure_count = if original_failure_count > 0 {
+            original_failure_count
+        } else {
+            attempt_number
+        };
+
+        self.conn
+            .execute(
+                "UPDATE tasks SET status = 'PENDING'::taskq_task_status, \
+                                  attempt_number = 0, \
+                                  retry_after = NULL, \
+                                  original_failure_count = $2 \
+                  WHERE task_id = $1",
+                &[&task_id_uuid, &new_original_failure_count],
+            )
+            .await
+            .map_err(map_db_error)?;
+
+        Ok(ReplayOutcome::Replayed)
+    }
+
+    async fn add_error_classes(&mut self, namespace: &Namespace, classes: &[String]) -> Result<()> {
+        if classes.is_empty() {
+            return Ok(());
+        }
+        for class in classes {
+            self.conn
+                .execute(
+                    "INSERT INTO error_class_registry (namespace, error_class) \
+                     VALUES ($1, $2) \
+                     ON CONFLICT (namespace, error_class) DO NOTHING",
+                    &[&namespace.as_str(), &class.as_str()],
+                )
+                .await
+                .map_err(map_db_error)?;
+        }
+        Ok(())
+    }
+
+    async fn deprecate_error_class(&mut self, namespace: &Namespace, class: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE error_class_registry SET deprecated = TRUE \
+                  WHERE namespace = $1 AND error_class = $2",
+                &[&namespace.as_str(), &class],
+            )
+            .await
+            .map_err(map_db_error)?;
+        Ok(())
+    }
+
+    async fn add_task_types(&mut self, namespace: &Namespace, types: &[TaskType]) -> Result<()> {
+        if types.is_empty() {
+            return Ok(());
+        }
+        for ty in types {
+            self.conn
+                .execute(
+                    "INSERT INTO task_type_registry (namespace, task_type) \
+                     VALUES ($1, $2) \
+                     ON CONFLICT (namespace, task_type) DO NOTHING",
+                    &[&namespace.as_str(), &ty.as_str()],
+                )
+                .await
+                .map_err(map_db_error)?;
+        }
+        Ok(())
+    }
+
+    async fn deprecate_task_type(
+        &mut self,
+        namespace: &Namespace,
+        task_type: &TaskType,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE task_type_registry SET deprecated = TRUE \
+                  WHERE namespace = $1 AND task_type = $2",
+                &[&namespace.as_str(), &task_type.as_str()],
+            )
+            .await
+            .map_err(map_db_error)?;
+        Ok(())
+    }
+
+    // ========================================================================
     // Lifecycle
     // ========================================================================
 
@@ -1139,6 +1497,60 @@ impl<'a> StorageTx for PostgresTx<'a> {
 // ----------------------------------------------------------------------------
 // Helpers
 // ----------------------------------------------------------------------------
+
+/// Decode a full `tasks` row into a [`Task`]. The column order MUST match
+/// every callsite — see `get_task_by_id`, `list_tasks_by_filter`, and
+/// `list_tasks_by_terminal_status`.
+fn task_from_row(row: &Row) -> Result<Task> {
+    let task_id: Uuid = row.get(0);
+    let namespace_str: String = row.get(1);
+    let task_type_str: String = row.get(2);
+    let status_str: String = row.get(3);
+    let priority: i32 = row.get(4);
+    let payload: Vec<u8> = row.get(5);
+    let payload_hash_bytes: Vec<u8> = row.get(6);
+    let submitted_at: DateTime<Utc> = row.get(7);
+    let expires_at: DateTime<Utc> = row.get(8);
+    let attempt_number: i32 = row.get(9);
+    let max_retries: i32 = row.get(10);
+    let retry_initial_ms: i64 = row.get(11);
+    let retry_max_ms: i64 = row.get(12);
+    let retry_coefficient: f32 = row.get(13);
+    let retry_after: Option<DateTime<Utc>> = row.get(14);
+    let traceparent: Vec<u8> = row.get(15);
+    let tracestate: Vec<u8> = row.get(16);
+    let format_version: i32 = row.get(17);
+    let original_failure_count: i32 = row.get(18);
+
+    let payload_hash: [u8; 32] = payload_hash_bytes.as_slice().try_into().map_err(|_| {
+        StorageError::ConstraintViolation("tasks.payload_hash != 32 bytes".to_owned())
+    })?;
+    let status = TaskStatus::from_db_str(&status_str).ok_or_else(|| {
+        StorageError::ConstraintViolation(format!("tasks.status unknown: {status_str}"))
+    })?;
+
+    Ok(Task {
+        task_id: TaskId::from_uuid(task_id),
+        namespace: Namespace::new(namespace_str),
+        task_type: TaskType::new(task_type_str),
+        status,
+        priority,
+        payload: Bytes::from(payload),
+        payload_hash,
+        submitted_at: chrono_to_timestamp(submitted_at),
+        expires_at: chrono_to_timestamp(expires_at),
+        attempt_number: attempt_number as u32,
+        max_retries: max_retries as u32,
+        retry_initial_ms: retry_initial_ms as u64,
+        retry_max_ms: retry_max_ms as u64,
+        retry_coefficient,
+        retry_after: retry_after.map(chrono_to_timestamp),
+        traceparent: Bytes::from(traceparent),
+        tracestate: Bytes::from(tracestate),
+        format_version: format_version as u32,
+        original_failure_count: original_failure_count as u32,
+    })
+}
 
 fn locked_task_from_row(row: &Row) -> Result<LockedTask> {
     let task_id: Uuid = row.get(0);
