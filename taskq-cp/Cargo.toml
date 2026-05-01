@@ -7,4 +7,74 @@ repository.workspace = true
 description = "taskq-rs control-plane gRPC server binary"
 publish = false
 
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "taskq-cp"
+path = "src/main.rs"
+
 [dependencies]
+# Workspace-internal trait surface and backend implementations.
+taskq-storage = { path = "../taskq-storage" }
+taskq-storage-postgres = { path = "../taskq-storage-postgres" }
+taskq-storage-sqlite = { path = "../taskq-storage-sqlite" }
+taskq-proto = { path = "../taskq-proto" }
+
+# pure-grpc-rs server framework. Pinned to a commit so cross-repo CI is reproducible.
+# The two crates we consume are the server (handler + router + interceptor) and
+# `grpc-core` (Status, Request, Response types used in service signatures).
+grpc-server = { git = "https://github.com/Shuozeli/pure-grpc-rs.git", rev = "120046b9a233139c13452aae37742a1890728d25" }
+grpc-core = { git = "https://github.com/Shuozeli/pure-grpc-rs.git", rev = "120046b9a233139c13452aae37742a1890728d25", default-features = false }
+
+# Async runtime. `signal` for SIGTERM/SIGINT in shutdown.rs.
+tokio = { version = "1", features = ["full"] }
+
+# CLI parsing per Phase 5a deliverable list.
+clap = { version = "4", features = ["derive", "env"] }
+
+# Config loading: TOML body + serde-driven structs.
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+# OTel pipeline (design.md §11.1).
+opentelemetry = "0.24"
+opentelemetry_sdk = { version = "0.24", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.17", features = ["tonic", "metrics", "trace"] }
+opentelemetry-prometheus = "0.17"
+opentelemetry-stdout = { version = "0.5", features = ["metrics", "trace"] }
+prometheus = "0.13"
+
+# Logging / tracing.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-opentelemetry = "0.25"
+
+# Health endpoint server (separate port from gRPC).
+axum = "0.7"
+
+# Error handling.
+thiserror = "1"
+anyhow = "1"
+
+# Async traits for object-safe dyn dispatch on Admitter / Dispatcher.
+# Native `async fn in trait` is not object-safe (a `dyn Admitter` cannot call a
+# returned `impl Future`), so the strategy traits use `async-trait`. The storage
+# trait sticks with native async-fn-in-trait because backends are static-dispatch
+# (Phase 2 already committed to that shape).
+async-trait = "0.1"
+
+# Strategy params and audit-log payloads cross between `JSON` (in the DB) and
+# Rust structs; serde_json is the bridge.
+serde_json = "1"
+
+# Cheap byte buffers; matches taskq-proto and taskq-storage.
+bytes = "1"
+
+# Time conversions (ISO timestamps in TOML config, etc.).
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+# `oneshot` extension on tower::Service used by health-server tests.
+tower = { version = "0.5", features = ["util"] }
