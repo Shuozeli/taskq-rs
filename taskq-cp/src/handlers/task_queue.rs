@@ -407,9 +407,34 @@ async fn cancel_task_impl(
     .await;
 
     match outcome {
-        Ok(CancelOutcome::Unsupported) => Err(Status::unimplemented(
-            "CancelTask requires StorageTx::cancel_task (Phase 5c)",
-        )),
+        Ok(CancelOutcome::TransitionedToCancelled) => {
+            // §6.7: state-transition succeeded; the task is now CANCELLED.
+            let mut resp = CancelTaskResponse::default();
+            resp.task_id = Some(task_id_str);
+            resp.final_status = TerminalState::CANCELLED;
+            resp.server_version = Some(Box::new(server_semver()));
+            Ok(resp)
+        }
+        Ok(CancelOutcome::AlreadyTerminal { state }) => {
+            // §6.7: idempotent. Map the storage-level TaskStatus to the
+            // wire TerminalState so callers see what state we observed.
+            let final_status = match state {
+                taskq_storage::TaskStatus::Cancelled => TerminalState::CANCELLED,
+                taskq_storage::TaskStatus::Completed => TerminalState::COMPLETED,
+                taskq_storage::TaskStatus::FailedNonretryable => TerminalState::FAILED_NONRETRYABLE,
+                taskq_storage::TaskStatus::FailedExhausted => TerminalState::FAILED_EXHAUSTED,
+                taskq_storage::TaskStatus::Expired => TerminalState::EXPIRED,
+                _ => TerminalState::CANCELLED,
+            };
+            let mut resp = CancelTaskResponse::default();
+            resp.task_id = Some(task_id_str);
+            resp.final_status = final_status;
+            resp.server_version = Some(Box::new(server_semver()));
+            Ok(resp)
+        }
+        Ok(CancelOutcome::NotFound) => Err(Status::not_found(format!(
+            "task_id {task_id_str} does not exist"
+        ))),
         Err(err) => {
             tracing::error!(error = %err, "cancel_task storage error");
             Err(Status::internal("storage error during cancel_task"))

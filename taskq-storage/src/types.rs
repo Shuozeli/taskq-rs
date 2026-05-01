@@ -386,3 +386,137 @@ pub struct AuditEntry {
     /// sha256 of the original request body for external verification.
     pub request_hash: [u8; 32],
 }
+
+// ============================================================================
+// Phase 5c admin reads
+// ============================================================================
+
+/// Lifecycle states a task may occupy. Mirrors the wire-level
+/// `taskq.v1.TerminalState` plus the in-flight `PENDING` / `DISPATCHED` /
+/// `WAITING_RETRY` states from `design.md` §5.
+///
+/// Used by `count_tasks_by_status` (admin `GetStats`) and as a structured
+/// alternative to ad-hoc string columns in admin paths.
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+pub enum TaskStatus {
+    Pending,
+    Dispatched,
+    Completed,
+    FailedNonretryable,
+    FailedExhausted,
+    Expired,
+    WaitingRetry,
+    Cancelled,
+}
+
+impl TaskStatus {
+    /// Stringify to the wire spelling the storage backends use in their
+    /// `tasks.status` columns.
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Pending => "PENDING",
+            Self::Dispatched => "DISPATCHED",
+            Self::Completed => "COMPLETED",
+            Self::FailedNonretryable => "FAILED_NONRETRYABLE",
+            Self::FailedExhausted => "FAILED_EXHAUSTED",
+            Self::Expired => "EXPIRED",
+            Self::WaitingRetry => "WAITING_RETRY",
+            Self::Cancelled => "CANCELLED",
+        }
+    }
+
+    /// Inverse of [`TaskStatus::as_db_str`]; backends use this to decode
+    /// status columns to a typed value.
+    pub fn from_db_str(s: &str) -> Option<Self> {
+        match s {
+            "PENDING" => Some(Self::Pending),
+            "DISPATCHED" => Some(Self::Dispatched),
+            "COMPLETED" => Some(Self::Completed),
+            "FAILED_NONRETRYABLE" => Some(Self::FailedNonretryable),
+            "FAILED_EXHAUSTED" => Some(Self::FailedExhausted),
+            "EXPIRED" => Some(Self::Expired),
+            "WAITING_RETRY" => Some(Self::WaitingRetry),
+            "CANCELLED" => Some(Self::Cancelled),
+            _ => None,
+        }
+    }
+
+    /// True for the §5 terminal states (no further transitions).
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Completed
+                | Self::Cancelled
+                | Self::FailedNonretryable
+                | Self::FailedExhausted
+                | Self::Expired
+        )
+    }
+}
+
+/// Outcome of a `cancel_task` call. `design.md` §6.7 distinguishes
+/// "transitioned to CANCELLED" from "already terminal" (idempotent no-op).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelOutcome {
+    /// Task was non-terminal; storage flipped it to CANCELLED and deleted
+    /// the matching `idempotency_keys` row in the same transaction.
+    TransitionedToCancelled,
+    /// Task was already in a terminal state (`COMPLETED`, `CANCELLED`,
+    /// `FAILED_NONRETRYABLE`, `FAILED_EXHAUSTED`, `EXPIRED`). The CP
+    /// surfaces this as a successful no-op so `CancelTask` is idempotent.
+    AlreadyTerminal { state: TaskStatus },
+    /// The task does not exist in storage — caller should surface
+    /// `Status::not_found(...)` to the operator.
+    NotFound,
+}
+
+/// Snapshot of a single `tasks` row. Returned by `get_task_by_id`; carries
+/// every column the CP layer cares about for `GetTaskResult` and for the
+/// per-task replay-validation flow in `replay_dead_letters` (admin §6.7).
+#[derive(Debug, Clone)]
+pub struct Task {
+    pub task_id: TaskId,
+    pub namespace: Namespace,
+    pub task_type: TaskType,
+    pub status: TaskStatus,
+    pub priority: i32,
+    pub payload: Bytes,
+    pub payload_hash: [u8; 32],
+    pub submitted_at: Timestamp,
+    pub expires_at: Timestamp,
+    pub attempt_number: u32,
+    pub max_retries: u32,
+    pub retry_initial_ms: u64,
+    pub retry_max_ms: u64,
+    pub retry_coefficient: f32,
+    pub retry_after: Option<Timestamp>,
+    pub traceparent: Bytes,
+    pub tracestate: Bytes,
+    pub format_version: u32,
+    pub original_failure_count: u32,
+}
+
+/// Row returned by `list_dead_worker_runtimes`. Reaper B uses it to reclaim
+/// the lease and stamp `declared_dead_at` on the worker's heartbeat row in
+/// the same SERIALIZABLE transaction (`design.md` §6.6).
+#[derive(Debug, Clone)]
+pub struct DeadWorkerRuntime {
+    pub task_id: TaskId,
+    pub attempt_number: u32,
+    pub worker_id: WorkerId,
+    pub namespace: Namespace,
+    pub last_heartbeat_at: Timestamp,
+}
+
+/// Worker snapshot returned by `list_workers` (admin `ListWorkers` RPC).
+#[derive(Debug, Clone)]
+pub struct WorkerInfo {
+    pub worker_id: WorkerId,
+    pub namespace: Namespace,
+    pub last_heartbeat_at: Timestamp,
+    pub declared_dead_at: Option<Timestamp>,
+    /// Number of `DISPATCHED` tasks currently assigned to this worker.
+    /// Reads from `task_runtime`, so a worker that completed all its
+    /// leases has `inflight_count = 0` even before its heartbeat lapses.
+    pub inflight_count: u32,
+}

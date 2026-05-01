@@ -94,6 +94,11 @@ bytes = "1"
 # Time conversions (ISO timestamps in TOML config, etc.).
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
 
+# Phase 5c admin handlers: sha256 of audit-log request bodies (`design.md` §11.4)
+# and ±10% jittered TTL on the namespace-config cache (`design.md` §1.1).
+sha2 = "0.10"
+rand = "0.8"
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 # `oneshot` extension on tower::Service used by health-server tests.

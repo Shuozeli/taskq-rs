@@ -16,7 +16,7 @@
 //! authoritative state. A real bucket (with a wall-clock-aligned token
 //! refill) lives in the CP layer and is unrelated to the backend.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -32,10 +32,10 @@ use taskq_storage::{
     ids::{IdempotencyKey, Namespace, TaskId, TaskType, Timestamp, WorkerId},
     traits::StorageTx,
     types::{
-        AuditEntry, CapacityDecision, CapacityKind, DedupRecord, ExpiredRuntime, HeartbeatAck,
-        LeaseRef, LockedTask, NamespaceFilter, NamespaceQuota, NewDedupRecord, NewLease, NewTask,
-        PickCriteria, PickOrdering, RateDecision, RateKind, RuntimeRef, TaskOutcome,
-        TaskTypeFilter, WakeSignal,
+        AuditEntry, CancelOutcome, CapacityDecision, CapacityKind, DeadWorkerRuntime, DedupRecord,
+        ExpiredRuntime, HeartbeatAck, LeaseRef, LockedTask, NamespaceFilter, NamespaceQuota,
+        NewDedupRecord, NewLease, NewTask, PickCriteria, PickOrdering, RateDecision, RateKind,
+        RuntimeRef, Task, TaskOutcome, TaskStatus, TaskTypeFilter, WakeSignal, WorkerInfo,
     },
 };
 
@@ -756,6 +756,269 @@ impl StorageTx for SqliteTx {
     }
 
     // ------------------------------------------------------------------------
+    // Phase 5c admin / cancel / reaper-B
+    // ------------------------------------------------------------------------
+
+    async fn cancel_task(&mut self, task_id: TaskId) -> StorageResult<CancelOutcome> {
+        let task_id_text = task_id_to_text(&task_id);
+
+        // Look up the row. SQLite's single-writer scope makes "FOR UPDATE"
+        // implicit — the BEGIN IMMEDIATE that opened this Tx already holds
+        // the writer lock.
+        let row: Option<(String, String)> = self
+            .conn()
+            .query_row(
+                "SELECT status, namespace FROM tasks WHERE task_id = ?1",
+                params![&task_id_text],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(map_sql_error)?;
+
+        let Some((status_str, namespace_str)) = row else {
+            return Ok(CancelOutcome::NotFound);
+        };
+        let Some(status) = TaskStatus::from_db_str(&status_str) else {
+            return Err(StorageError::ConstraintViolation(format!(
+                "tasks.status has unknown value: {status_str}"
+            )));
+        };
+
+        if status.is_terminal() {
+            return Ok(CancelOutcome::AlreadyTerminal { state: status });
+        }
+
+        let conn = self.conn();
+        conn.execute(
+            "UPDATE tasks SET status = 'CANCELLED' WHERE task_id = ?1",
+            params![&task_id_text],
+        )
+        .map_err(map_sql_error)?;
+        conn.execute(
+            "DELETE FROM idempotency_keys WHERE namespace = ?1 AND task_id = ?2",
+            params![&namespace_str, &task_id_text],
+        )
+        .map_err(map_sql_error)?;
+        conn.execute(
+            "DELETE FROM task_runtime WHERE task_id = ?1",
+            params![&task_id_text],
+        )
+        .map_err(map_sql_error)?;
+
+        Ok(CancelOutcome::TransitionedToCancelled)
+    }
+
+    async fn get_task_by_id(&mut self, task_id: TaskId) -> StorageResult<Option<Task>> {
+        let task_id_text = task_id_to_text(&task_id);
+        let row: Option<TaskRow> = self
+            .conn()
+            .query_row(
+                "SELECT task_id, namespace, task_type, status, priority, payload, payload_hash, \
+                        submitted_at, expires_at, attempt_number, max_retries, retry_initial_ms, \
+                        retry_max_ms, retry_coefficient, retry_after, traceparent, tracestate, \
+                        format_version, original_failure_count \
+                   FROM tasks WHERE task_id = ?1",
+                params![&task_id_text],
+                |row| {
+                    Ok(TaskRow {
+                        task_id: row.get(0)?,
+                        namespace: row.get(1)?,
+                        task_type: row.get(2)?,
+                        status: row.get(3)?,
+                        priority: row.get(4)?,
+                        payload: row.get(5)?,
+                        payload_hash: row.get(6)?,
+                        submitted_at: row.get(7)?,
+                        expires_at: row.get(8)?,
+                        attempt_number: row.get::<_, i64>(9)? as u32,
+                        max_retries: row.get::<_, i64>(10)? as u32,
+                        retry_initial_ms: row.get::<_, i64>(11)? as u64,
+                        retry_max_ms: row.get::<_, i64>(12)? as u64,
+                        retry_coefficient: row.get::<_, f64>(13)? as f32,
+                        retry_after: row.get(14)?,
+                        traceparent: row.get(15)?,
+                        tracestate: row.get(16)?,
+                        format_version: row.get::<_, i64>(17)? as u32,
+                        original_failure_count: row.get::<_, i64>(18)? as u32,
+                    })
+                },
+            )
+            .optional()
+            .map_err(map_sql_error)?;
+
+        let Some(row) = row else { return Ok(None) };
+
+        if row.payload_hash.len() != 32 {
+            return Err(StorageError::ConstraintViolation(format!(
+                "tasks.payload_hash has unexpected length {}",
+                row.payload_hash.len()
+            )));
+        }
+        let mut payload_hash = [0u8; 32];
+        payload_hash.copy_from_slice(&row.payload_hash);
+
+        let status = TaskStatus::from_db_str(&row.status).ok_or_else(|| {
+            StorageError::ConstraintViolation(format!("tasks.status unknown: {}", row.status))
+        })?;
+
+        Ok(Some(Task {
+            task_id: parse_task_id(&row.task_id)?,
+            namespace: Namespace::new(row.namespace),
+            task_type: TaskType::new(row.task_type),
+            status,
+            priority: row.priority,
+            payload: Bytes::from(row.payload),
+            payload_hash,
+            submitted_at: millis_to_ts(row.submitted_at),
+            expires_at: millis_to_ts(row.expires_at),
+            attempt_number: row.attempt_number,
+            max_retries: row.max_retries,
+            retry_initial_ms: row.retry_initial_ms,
+            retry_max_ms: row.retry_max_ms,
+            retry_coefficient: row.retry_coefficient,
+            retry_after: row.retry_after.map(millis_to_ts),
+            traceparent: Bytes::from(row.traceparent),
+            tracestate: Bytes::from(row.tracestate),
+            format_version: row.format_version,
+            original_failure_count: row.original_failure_count,
+        }))
+    }
+
+    async fn list_dead_worker_runtimes(
+        &mut self,
+        stale_before: Timestamp,
+        n: usize,
+    ) -> StorageResult<Vec<DeadWorkerRuntime>> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT r.task_id, r.attempt_number, r.worker_id, t.namespace, h.last_heartbeat_at \
+                 FROM task_runtime r \
+                 JOIN tasks t ON t.task_id = r.task_id \
+                 JOIN worker_heartbeats h ON h.worker_id = r.worker_id \
+                 WHERE h.last_heartbeat_at < ?1 \
+                   AND h.declared_dead_at IS NULL \
+                 ORDER BY h.last_heartbeat_at ASC \
+                 LIMIT ?2",
+            )
+            .map_err(map_sql_error)?;
+        let rows = stmt
+            .query_map(params![ts_to_millis(stale_before), n as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)? as u32,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })
+            .map_err(map_sql_error)?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            let (task_id_text, attempt_number, worker_id_text, namespace, last_hb_ms) =
+                row.map_err(map_sql_error)?;
+            out.push(DeadWorkerRuntime {
+                task_id: parse_task_id(&task_id_text)?,
+                attempt_number,
+                worker_id: parse_worker_id(&worker_id_text)?,
+                namespace: Namespace::new(namespace),
+                last_heartbeat_at: millis_to_ts(last_hb_ms),
+            });
+        }
+        Ok(out)
+    }
+
+    async fn count_tasks_by_status(
+        &mut self,
+        namespace: &Namespace,
+    ) -> StorageResult<HashMap<TaskStatus, u64>> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare("SELECT status, COUNT(*) FROM tasks WHERE namespace = ?1 GROUP BY status")
+            .map_err(map_sql_error)?;
+        let rows = stmt
+            .query_map(params![namespace.as_str()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(map_sql_error)?;
+        let mut out = HashMap::new();
+        for row in rows {
+            let (status_str, count) = row.map_err(map_sql_error)?;
+            if let Some(status) = TaskStatus::from_db_str(&status_str) {
+                out.insert(status, count as u64);
+            }
+        }
+        Ok(out)
+    }
+
+    async fn list_workers(
+        &mut self,
+        namespace: &Namespace,
+        include_dead: bool,
+    ) -> StorageResult<Vec<WorkerInfo>> {
+        let conn = self.conn();
+        let sql = if include_dead {
+            "SELECT h.worker_id, h.namespace, h.last_heartbeat_at, h.declared_dead_at, \
+                    COALESCE((SELECT COUNT(*) FROM task_runtime r WHERE r.worker_id = h.worker_id), 0) \
+               FROM worker_heartbeats h \
+              WHERE h.namespace = ?1 \
+              ORDER BY h.last_heartbeat_at DESC"
+        } else {
+            "SELECT h.worker_id, h.namespace, h.last_heartbeat_at, h.declared_dead_at, \
+                    COALESCE((SELECT COUNT(*) FROM task_runtime r WHERE r.worker_id = h.worker_id), 0) \
+               FROM worker_heartbeats h \
+              WHERE h.namespace = ?1 AND h.declared_dead_at IS NULL \
+              ORDER BY h.last_heartbeat_at DESC"
+        };
+        let mut stmt = conn.prepare(sql).map_err(map_sql_error)?;
+        let rows = stmt
+            .query_map(params![namespace.as_str()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })
+            .map_err(map_sql_error)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (worker_id_text, ns, last_hb, declared_dead, inflight) =
+                row.map_err(map_sql_error)?;
+            out.push(WorkerInfo {
+                worker_id: parse_worker_id(&worker_id_text)?,
+                namespace: Namespace::new(ns),
+                last_heartbeat_at: millis_to_ts(last_hb),
+                declared_dead_at: declared_dead.map(millis_to_ts),
+                inflight_count: inflight as u32,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn enable_namespace(&mut self, namespace: &Namespace) -> StorageResult<()> {
+        self.conn()
+            .execute(
+                "UPDATE namespace_quota SET disabled = 0 WHERE namespace = ?1",
+                params![namespace.as_str()],
+            )
+            .map_err(map_sql_error)?;
+        Ok(())
+    }
+
+    async fn disable_namespace(&mut self, namespace: &Namespace) -> StorageResult<()> {
+        self.conn()
+            .execute(
+                "UPDATE namespace_quota SET disabled = 1 WHERE namespace = ?1",
+                params![namespace.as_str()],
+            )
+            .map_err(map_sql_error)?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------------
     // Lifecycle
     // ------------------------------------------------------------------------
 
@@ -771,6 +1034,30 @@ impl StorageTx for SqliteTx {
             .map_err(map_sql_error)?;
         Ok(())
     }
+}
+
+/// Helper row type for `get_task_by_id` to keep the rusqlite closure
+/// free of borrow-from-Self issues. Mirrors the columns selected.
+struct TaskRow {
+    task_id: String,
+    namespace: String,
+    task_type: String,
+    status: String,
+    priority: i32,
+    payload: Vec<u8>,
+    payload_hash: Vec<u8>,
+    submitted_at: i64,
+    expires_at: i64,
+    attempt_number: u32,
+    max_retries: u32,
+    retry_initial_ms: u64,
+    retry_max_ms: u64,
+    retry_coefficient: f32,
+    retry_after: Option<i64>,
+    traceparent: Vec<u8>,
+    tracestate: Vec<u8>,
+    format_version: u32,
+    original_failure_count: u32,
 }
 
 // ============================================================================

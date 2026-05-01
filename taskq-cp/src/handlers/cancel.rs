@@ -6,41 +6,17 @@
 //! key — physical deletion (not a flag) implements that release. The pair
 //! lives behind one helper so the two RPC paths cannot drift.
 //!
-//! Phase 5b implements the helper signature; **the underlying storage trait
-//! does not yet expose a `cancel_task_in_tx` method** (see Phase 5c work
-//! item in `tasks.md` §5.5). Until that lands, the helper returns a
-//! [`CancelOutcome::Unsupported`] variant that callers translate into a
-//! `Status::unimplemented(...)` reply. This keeps the call sites in
-//! `task_queue::cancel_task` and (Phase 5c) `task_admin::purge_tasks` final-
-//! shape so wiring lands once and only the storage trait grows.
+//! Phase 5c lifts the storage-level state-transition pair onto the
+//! [`StorageTx::cancel_task`] trait method. The CP-side helper here is a
+//! thin re-export of [`taskq_storage::CancelOutcome`] so call sites do not
+//! depend on the storage crate directly for outcome matching, and so we can
+//! grow the helper later (e.g. wake one waiter on cancel) without touching
+//! every caller.
 
+pub(crate) use taskq_storage::CancelOutcome;
 use taskq_storage::{StorageError, TaskId};
 
 use crate::state::StorageTxDyn;
-
-/// Outcome of a single `cancel_internal` call.
-///
-/// `design.md` §6.7 distinguishes "was non-terminal, now CANCELLED" from
-/// "already terminal" (idempotent no-op). Phase 5b ships only `Unsupported`
-/// to signal that the storage backend does not yet expose the underlying
-/// state-transition + dedup-deletion pair as a single atomic operation; the
-/// caller surfaces that via `Status::unimplemented(...)`. Phase 5c will
-/// extend this enum with `TransitionedToCancelled` and
-/// `AlreadyTerminal { state: TerminalState }` once `StorageTx::cancel_task`
-/// lands; the `cancel_task` / `purge_tasks` call sites already handle the
-/// `Unsupported` arm so the only edit at that point is on the helper body.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum CancelOutcome {
-    /// The storage backend does not yet implement the cancel-state-transition
-    /// and dedup-deletion pair as a single atomic operation. The CP returns
-    /// `UNIMPLEMENTED` to the caller. Phase 5c flips this to a real outcome.
-    Unsupported,
-}
-
-// `TerminalState` is referenced by the docstring on `CancelOutcome` for the
-// future `AlreadyTerminal { state }` variant. Phase 5c will reintroduce it
-// inline; until then the doc-link target lives at the wire layer
-// (`taskq.v1.TerminalState`) so we don't carry a dead enum here.
 
 /// Cancel `task_id` inside the caller-owned transaction `tx`.
 ///
@@ -52,172 +28,147 @@ pub(crate) enum CancelOutcome {
 /// 3. If terminal: return [`CancelOutcome::AlreadyTerminal { state }`] —
 ///    no-op for state, but the caller may still want to delete the dedup
 ///    row in the `PurgeTasks` path.
+/// 4. If the task does not exist: return [`CancelOutcome::NotFound`].
 ///
-/// Phase 5b: the storage trait does not yet expose this state-transition
-/// pair as one atomic call (the existing `complete_task` path covers the
-/// worker-driven terminal transitions but not admin/caller-initiated
-/// cancellation). Until Phase 5c grows the trait, this helper returns
-/// [`CancelOutcome::Unsupported`] and the caller surfaces
-/// `Status::unimplemented(...)`. The shape is otherwise final.
+/// The helper intentionally delegates the entire dance to
+/// [`StorageTx::cancel_task`] so the two backend implementations can keep
+/// the SQL contracts they prefer (Postgres `SELECT ... FOR UPDATE` /
+/// SQLite `BEGIN IMMEDIATE`-implicit lock) without the CP layer
+/// reimplementing them.
 pub(crate) async fn cancel_internal(
-    _tx: &mut dyn StorageTxDyn,
-    _task_id: TaskId,
+    tx: &mut dyn StorageTxDyn,
+    task_id: TaskId,
 ) -> Result<CancelOutcome, StorageError> {
-    // TODO(phase-5c): once `StorageTx::cancel_task` lands, replace the body
-    // with the SELECT-FOR-UPDATE / UPDATE / DELETE FROM idempotency_keys
-    // sequence and map storage outcomes to the CancelOutcome variants
-    // above. The signature is final; this is the only line that flips.
-    Ok(CancelOutcome::Unsupported)
+    tx.cancel_task(task_id).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use taskq_storage::{
-        AuditEntry, CapacityDecision, CapacityKind, DedupRecord, HeartbeatAck, IdempotencyKey,
-        LeaseRef, LockedTask, Namespace, NamespaceQuota, NewDedupRecord, NewLease, NewTask,
-        PickCriteria, RateDecision, RateKind, TaskOutcome, TaskType, Timestamp, WakeSignal,
-        WorkerId,
-    };
+    use std::sync::Arc;
 
-    use crate::state::{StorageTxFuture, WakeSignalStream};
+    use taskq_storage::TaskStatus;
 
-    /// Stub transaction that satisfies `StorageTxDyn` without touching any
-    /// real backend. Every method panics — `cancel_internal` only inspects
-    /// the trait object indirectly, never calling any of the storage
-    /// methods until Phase 5c lands the cancel-state-transition method.
-    struct StubTx;
+    use crate::state::CpState;
 
-    impl StorageTxDyn for StubTx {
-        fn lookup_idempotency<'a>(
-            &'a mut self,
-            _ns: &'a Namespace,
-            _key: &'a IdempotencyKey,
-        ) -> StorageTxFuture<'a, Result<Option<DedupRecord>, StorageError>> {
-            unreachable!("cancel_internal does not invoke lookup_idempotency in Phase 5b")
-        }
-        fn insert_task<'a>(
-            &'a mut self,
-            _task: NewTask,
-            _dedup: NewDedupRecord,
-        ) -> StorageTxFuture<'a, Result<TaskId, StorageError>> {
-            unreachable!()
-        }
-        fn pick_and_lock_pending<'a>(
-            &'a mut self,
-            _criteria: PickCriteria,
-        ) -> StorageTxFuture<'a, Result<Option<LockedTask>, StorageError>> {
-            unreachable!()
-        }
-        fn record_acquisition<'a>(
-            &'a mut self,
-            _lease: NewLease,
-        ) -> StorageTxFuture<'a, Result<(), StorageError>> {
-            unreachable!()
-        }
-        fn subscribe_pending<'a>(
-            &'a mut self,
-            _ns: &'a Namespace,
-            _types: &'a [TaskType],
-        ) -> StorageTxFuture<'a, Result<WakeSignalStream, StorageError>> {
-            unreachable!()
-        }
-        fn complete_task<'a>(
-            &'a mut self,
-            _lease: &'a LeaseRef,
-            _outcome: TaskOutcome,
-        ) -> StorageTxFuture<'a, Result<(), StorageError>> {
-            unreachable!()
-        }
-        fn mark_worker_dead<'a>(
-            &'a mut self,
-            _worker_id: &'a WorkerId,
-            _at: Timestamp,
-        ) -> StorageTxFuture<'a, Result<(), StorageError>> {
-            unreachable!()
-        }
-        fn check_capacity_quota<'a>(
-            &'a mut self,
-            _ns: &'a Namespace,
-            _kind: CapacityKind,
-        ) -> StorageTxFuture<'a, Result<CapacityDecision, StorageError>> {
-            unreachable!()
-        }
-        fn oldest_pending_age_ms<'a>(
-            &'a mut self,
-            _ns: &'a Namespace,
-        ) -> StorageTxFuture<'a, Result<Option<u64>, StorageError>> {
-            unreachable!()
-        }
-        fn try_consume_rate_quota<'a>(
-            &'a mut self,
-            _ns: &'a Namespace,
-            _kind: RateKind,
-            _n: u64,
-        ) -> StorageTxFuture<'a, Result<RateDecision, StorageError>> {
-            unreachable!()
-        }
-        fn record_worker_heartbeat<'a>(
-            &'a mut self,
-            _worker_id: &'a WorkerId,
-            _ns: &'a Namespace,
-            _at: Timestamp,
-        ) -> StorageTxFuture<'a, Result<HeartbeatAck, StorageError>> {
-            unreachable!()
-        }
-        fn extend_lease_lazy<'a>(
-            &'a mut self,
-            _lease: &'a LeaseRef,
-            _new_timeout: Timestamp,
-            _last_extended_at: Timestamp,
-        ) -> StorageTxFuture<'a, Result<(), StorageError>> {
-            unreachable!()
-        }
-        fn get_namespace_quota<'a>(
-            &'a mut self,
-            _ns: &'a Namespace,
-        ) -> StorageTxFuture<'a, Result<NamespaceQuota, StorageError>> {
-            unreachable!()
-        }
-        fn audit_log_append<'a>(
-            &'a mut self,
-            _entry: AuditEntry,
-        ) -> StorageTxFuture<'a, Result<(), StorageError>> {
-            unreachable!()
-        }
-        fn commit_dyn<'a>(self: Box<Self>) -> StorageTxFuture<'a, Result<(), StorageError>>
-        where
-            Self: 'a,
-        {
-            unreachable!()
-        }
-        fn rollback_dyn<'a>(self: Box<Self>) -> StorageTxFuture<'a, Result<(), StorageError>>
-        where
-            Self: 'a,
-        {
-            unreachable!()
-        }
+    /// Build a minimal CP state backed by an in-memory SQLite. Used by the
+    /// test below to exercise the full helper -> backend round trip.
+    async fn build_state() -> Arc<CpState> {
+        use std::net::SocketAddr;
+
+        use taskq_storage_sqlite::SqliteStorage;
+
+        use crate::config::{CpConfig, OtelExporterConfig, StorageBackendConfig};
+        use crate::observability::MetricsHandle;
+        use crate::shutdown::channel;
+        use crate::state::DynStorage;
+        use crate::strategy::StrategyRegistry;
+
+        let storage = SqliteStorage::open_in_memory()
+            .await
+            .expect("SqliteStorage::open_in_memory");
+        let storage_arc: Arc<dyn DynStorage> = Arc::new(storage);
+        let config = Arc::new(CpConfig {
+            bind_addr: "127.0.0.1:50051".parse::<SocketAddr>().unwrap(),
+            health_addr: "127.0.0.1:9090".parse::<SocketAddr>().unwrap(),
+            storage_backend: StorageBackendConfig::Sqlite {
+                path: ":memory:".to_owned(),
+            },
+            otel_exporter: OtelExporterConfig::Disabled,
+            quota_cache_ttl_seconds: 5,
+            long_poll_default_timeout_seconds: 30,
+            long_poll_max_seconds: 60,
+            belt_and_suspenders_seconds: 10,
+            waiter_limit_per_replica: 100,
+            lease_window_seconds: 30,
+        });
+        let (_tx, rx) = channel();
+        Arc::new(CpState::new(
+            storage_arc,
+            Arc::new(StrategyRegistry::empty()),
+            MetricsHandle::noop(),
+            rx,
+            config,
+        ))
     }
 
-    // Keep the unused-import warning quiet for items pulled in only so the
-    // stub's signatures parse. Without these, removing one would silently
-    // cascade.
-    #[allow(dead_code)]
-    const _COMPILE_GUARD: Option<WakeSignal> = None;
-
     #[tokio::test]
-    async fn cancel_internal_returns_unsupported_until_storage_method_lands() {
+    async fn cancel_internal_returns_not_found_for_unknown_task() {
         // Arrange
-        let mut tx = StubTx;
+        let state = build_state().await;
+        let mut tx = state
+            .storage
+            .begin_dyn()
+            .await
+            .expect("begin_dyn must succeed");
         let task_id = TaskId::generate();
 
         // Act
-        let outcome = cancel_internal(&mut tx as &mut dyn StorageTxDyn, task_id)
-            .await
-            .expect("Phase 5b helper does not propagate storage errors");
+        let outcome = cancel_internal(&mut *tx, task_id).await.unwrap();
+        let _ = tx.rollback_dyn().await;
 
         // Assert
-        assert_eq!(outcome, CancelOutcome::Unsupported);
+        assert_eq!(outcome, CancelOutcome::NotFound);
+    }
+
+    #[tokio::test]
+    async fn cancel_internal_idempotent_on_terminal_after_first_cancel() {
+        // Arrange: insert a pending task via a normal submit-style insert,
+        // cancel it once, then call again to observe AlreadyTerminal.
+        use bytes::Bytes;
+        use taskq_storage::{
+            IdempotencyKey, Namespace, NewDedupRecord, NewTask, TaskType, Timestamp,
+        };
+
+        let state = build_state().await;
+        let now = Timestamp::from_unix_millis(1_700_000_000_000);
+        let task_id = TaskId::generate();
+
+        let mut tx = state.storage.begin_dyn().await.unwrap();
+        let new_task = NewTask {
+            task_id,
+            namespace: Namespace::new("ns"),
+            task_type: TaskType::new("type"),
+            priority: 0,
+            payload: Bytes::from_static(b"{}"),
+            payload_hash: [0u8; 32],
+            submitted_at: now,
+            expires_at: Timestamp::from_unix_millis(now.as_unix_millis() + 86_400_000),
+            max_retries: 3,
+            retry_initial_ms: 1_000,
+            retry_max_ms: 10_000,
+            retry_coefficient: 2.0,
+            traceparent: Bytes::new(),
+            tracestate: Bytes::new(),
+            format_version: 1,
+        };
+        let dedup = NewDedupRecord {
+            namespace: Namespace::new("ns"),
+            key: IdempotencyKey::new("k1"),
+            payload_hash: [0u8; 32],
+            expires_at: Timestamp::from_unix_millis(now.as_unix_millis() + 86_400_000),
+        };
+        tx.insert_task(new_task, dedup).await.unwrap();
+        tx.commit_dyn().await.unwrap();
+
+        // Act — first cancel.
+        let mut tx = state.storage.begin_dyn().await.unwrap();
+        let first = cancel_internal(&mut *tx, task_id).await.unwrap();
+        tx.commit_dyn().await.unwrap();
+
+        // Act — second cancel (should be a no-op terminal observation).
+        let mut tx = state.storage.begin_dyn().await.unwrap();
+        let second = cancel_internal(&mut *tx, task_id).await.unwrap();
+        tx.commit_dyn().await.unwrap();
+
+        // Assert
+        assert_eq!(first, CancelOutcome::TransitionedToCancelled);
+        assert_eq!(
+            second,
+            CancelOutcome::AlreadyTerminal {
+                state: TaskStatus::Cancelled
+            }
+        );
     }
 }

@@ -17,10 +17,16 @@ use crate::errors::{map_db_error, map_pool_error};
 /// Compile-time bundle of `(filename, sql_body)` pairs in lexical order.
 /// Adding a new migration means adding both the file under `migrations/` and
 /// a new entry in this slice. Order is load-bearing.
-const MIGRATIONS: &[(&str, &str)] = &[(
-    "0001_initial.sql",
-    include_str!("../migrations/0001_initial.sql"),
-)];
+const MIGRATIONS: &[(&str, &str)] = &[
+    (
+        "0001_initial.sql",
+        include_str!("../migrations/0001_initial.sql"),
+    ),
+    (
+        "0002_phase5c_admin.sql",
+        include_str!("../migrations/0002_phase5c_admin.sql"),
+    ),
+];
 
 /// Apply all bundled migrations against `pool`. Idempotent: re-running after
 /// a successful migration is a no-op.

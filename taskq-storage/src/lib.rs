@@ -39,8 +39,8 @@ pub use crate::error::{BoxedError, Result, StorageError};
 pub use crate::ids::{IdempotencyKey, Namespace, TaskId, TaskType, Timestamp, WorkerId};
 pub use crate::traits::{Storage, StorageTx};
 pub use crate::types::{
-    AuditEntry, CapacityDecision, CapacityKind, DedupRecord, ExpiredRuntime, HeartbeatAck,
-    LeaseRef, LockedTask, NamespaceFilter, NamespaceQuota, NewDedupRecord, NewLease, NewTask,
-    PickCriteria, PickOrdering, RateDecision, RateKind, RuntimeRef, TaskOutcome, TaskTypeFilter,
-    WakeSignal,
+    AuditEntry, CancelOutcome, CapacityDecision, CapacityKind, DeadWorkerRuntime, DedupRecord,
+    ExpiredRuntime, HeartbeatAck, LeaseRef, LockedTask, NamespaceFilter, NamespaceQuota,
+    NewDedupRecord, NewLease, NewTask, PickCriteria, PickOrdering, RateDecision, RateKind,
+    RuntimeRef, Task, TaskOutcome, TaskStatus, TaskTypeFilter, WakeSignal, WorkerInfo,
 };

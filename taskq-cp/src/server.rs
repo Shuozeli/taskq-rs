@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use grpc_core::{Request, Status};
 use grpc_server::{Router, Server};
+use taskq_proto::task_admin_server::TaskAdminServer;
 use taskq_proto::task_queue_server::TaskQueueServer;
 use taskq_proto::task_worker_server::TaskWorkerServer;
 
@@ -60,19 +61,15 @@ pub const AUTH_HEADER: &str = "authorization";
 pub async fn serve(state: Arc<CpState>, shutdown: ShutdownReceiver) -> Result<()> {
     let bind = state.config.bind_addr;
 
-    // Phase 5b: TaskQueue + TaskWorker handlers are wired into the router.
-    // TaskAdmin is held but not registered — its method bodies still
-    // `todo!()` and Phase 5c will implement the handlers + register the
-    // service.
+    // Phase 5c: all three services are wired into the router.
     let task_queue = TaskQueueHandler::new(Arc::clone(&state));
     let task_worker = TaskWorkerHandler::new(Arc::clone(&state));
-    let _task_admin: TaskAdminHandler = TaskAdminHandler::new(Arc::clone(&state));
-    // TODO(phase-5c): once admin handlers land, register `TaskAdminServer::new(_task_admin)`
-    // alongside the other two services below.
+    let task_admin = TaskAdminHandler::new(Arc::clone(&state));
 
     let router = Router::new()
         .add_service("taskq.v1.TaskQueue", TaskQueueServer::new(task_queue))
-        .add_service("taskq.v1.TaskWorker", TaskWorkerServer::new(task_worker));
+        .add_service("taskq.v1.TaskWorker", TaskWorkerServer::new(task_worker))
+        .add_service("taskq.v1.TaskAdmin", TaskAdminServer::new(task_admin));
 
     tracing::info!(addr = %bind, "starting taskq-cp gRPC server");
 

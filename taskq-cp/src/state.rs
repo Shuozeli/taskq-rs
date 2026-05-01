@@ -34,10 +34,11 @@ use futures_core::Stream;
 use tokio::sync::{Mutex, Notify, RwLock};
 
 use taskq_storage::{
-    AuditEntry, CapacityDecision, CapacityKind, DedupRecord, IdempotencyKey, LeaseRef, LockedTask,
-    Namespace, NamespaceQuota, NewDedupRecord, NewLease, NewTask, PickCriteria, RateDecision,
-    RateKind, Storage, StorageError, StorageTx, TaskId, TaskOutcome, TaskType, Timestamp,
-    WakeSignal, WorkerId,
+    AuditEntry, CancelOutcome, CapacityDecision, CapacityKind, DeadWorkerRuntime, DedupRecord,
+    ExpiredRuntime, IdempotencyKey, LeaseRef, LockedTask, Namespace, NamespaceQuota,
+    NewDedupRecord, NewLease, NewTask, PickCriteria, RateDecision, RateKind, RuntimeRef, Storage,
+    StorageError, StorageTx, Task, TaskId, TaskOutcome, TaskStatus, TaskType, Timestamp,
+    WakeSignal, WorkerId, WorkerInfo,
 };
 
 use crate::config::CpConfig;
@@ -198,6 +199,56 @@ pub trait StorageTxDyn: Send {
     fn audit_log_append<'a>(
         &'a mut self,
         entry: AuditEntry,
+    ) -> StorageTxFuture<'a, Result<(), StorageError>>;
+
+    // ---- Phase 5c admin / cancel / reapers ----------------------------
+
+    fn cancel_task<'a>(
+        &'a mut self,
+        task_id: TaskId,
+    ) -> StorageTxFuture<'a, Result<CancelOutcome, StorageError>>;
+
+    fn get_task_by_id<'a>(
+        &'a mut self,
+        task_id: TaskId,
+    ) -> StorageTxFuture<'a, Result<Option<Task>, StorageError>>;
+
+    fn list_expired_runtimes<'a>(
+        &'a mut self,
+        before: Timestamp,
+        n: usize,
+    ) -> StorageTxFuture<'a, Result<Vec<ExpiredRuntime>, StorageError>>;
+
+    fn reclaim_runtime<'a>(
+        &'a mut self,
+        runtime: &'a RuntimeRef,
+    ) -> StorageTxFuture<'a, Result<(), StorageError>>;
+
+    fn list_dead_worker_runtimes<'a>(
+        &'a mut self,
+        stale_before: Timestamp,
+        n: usize,
+    ) -> StorageTxFuture<'a, Result<Vec<DeadWorkerRuntime>, StorageError>>;
+
+    fn count_tasks_by_status<'a>(
+        &'a mut self,
+        namespace: &'a Namespace,
+    ) -> StorageTxFuture<'a, Result<HashMap<TaskStatus, u64>, StorageError>>;
+
+    fn list_workers<'a>(
+        &'a mut self,
+        namespace: &'a Namespace,
+        include_dead: bool,
+    ) -> StorageTxFuture<'a, Result<Vec<WorkerInfo>, StorageError>>;
+
+    fn enable_namespace<'a>(
+        &'a mut self,
+        namespace: &'a Namespace,
+    ) -> StorageTxFuture<'a, Result<(), StorageError>>;
+
+    fn disable_namespace<'a>(
+        &'a mut self,
+        namespace: &'a Namespace,
     ) -> StorageTxFuture<'a, Result<(), StorageError>>;
 
     // ---- Lifecycle -----------------------------------------------------
@@ -365,6 +416,80 @@ where
         Box::pin(StorageTx::audit_log_append(&mut self.inner, entry))
     }
 
+    fn cancel_task<'a>(
+        &'a mut self,
+        task_id: TaskId,
+    ) -> StorageTxFuture<'a, Result<CancelOutcome, StorageError>> {
+        Box::pin(StorageTx::cancel_task(&mut self.inner, task_id))
+    }
+
+    fn get_task_by_id<'a>(
+        &'a mut self,
+        task_id: TaskId,
+    ) -> StorageTxFuture<'a, Result<Option<Task>, StorageError>> {
+        Box::pin(StorageTx::get_task_by_id(&mut self.inner, task_id))
+    }
+
+    fn list_expired_runtimes<'a>(
+        &'a mut self,
+        before: Timestamp,
+        n: usize,
+    ) -> StorageTxFuture<'a, Result<Vec<ExpiredRuntime>, StorageError>> {
+        Box::pin(StorageTx::list_expired_runtimes(&mut self.inner, before, n))
+    }
+
+    fn reclaim_runtime<'a>(
+        &'a mut self,
+        runtime: &'a RuntimeRef,
+    ) -> StorageTxFuture<'a, Result<(), StorageError>> {
+        Box::pin(StorageTx::reclaim_runtime(&mut self.inner, runtime))
+    }
+
+    fn list_dead_worker_runtimes<'a>(
+        &'a mut self,
+        stale_before: Timestamp,
+        n: usize,
+    ) -> StorageTxFuture<'a, Result<Vec<DeadWorkerRuntime>, StorageError>> {
+        Box::pin(StorageTx::list_dead_worker_runtimes(
+            &mut self.inner,
+            stale_before,
+            n,
+        ))
+    }
+
+    fn count_tasks_by_status<'a>(
+        &'a mut self,
+        namespace: &'a Namespace,
+    ) -> StorageTxFuture<'a, Result<HashMap<TaskStatus, u64>, StorageError>> {
+        Box::pin(StorageTx::count_tasks_by_status(&mut self.inner, namespace))
+    }
+
+    fn list_workers<'a>(
+        &'a mut self,
+        namespace: &'a Namespace,
+        include_dead: bool,
+    ) -> StorageTxFuture<'a, Result<Vec<WorkerInfo>, StorageError>> {
+        Box::pin(StorageTx::list_workers(
+            &mut self.inner,
+            namespace,
+            include_dead,
+        ))
+    }
+
+    fn enable_namespace<'a>(
+        &'a mut self,
+        namespace: &'a Namespace,
+    ) -> StorageTxFuture<'a, Result<(), StorageError>> {
+        Box::pin(StorageTx::enable_namespace(&mut self.inner, namespace))
+    }
+
+    fn disable_namespace<'a>(
+        &'a mut self,
+        namespace: &'a Namespace,
+    ) -> StorageTxFuture<'a, Result<(), StorageError>> {
+        Box::pin(StorageTx::disable_namespace(&mut self.inner, namespace))
+    }
+
     fn commit_dyn<'a>(self: Box<Self>) -> StorageTxFuture<'a, Result<(), StorageError>>
     where
         Self: 'a,
@@ -434,26 +559,66 @@ impl CpState {
 // Namespace config cache (Phase 5c)
 // ---------------------------------------------------------------------------
 
-/// Per-namespace `NamespaceQuota` cache. `design.md` §1.1 carve-out says
-/// rate quotas are eventually consistent within the cache TTL (default 5s)
-/// with ±10% jitter to prevent synchronized expiry. `design.md` §9.1 says
-/// capacity quotas are NOT cached — they're read inline transactionally.
+/// Per-namespace `NamespaceQuota` cache. `design.md` §1.1 carve-out: rate
+/// quotas are eventually consistent within the cache TTL (default 5s) with
+/// ±10% jitter to prevent synchronized expiry. `design.md` §9.1: capacity
+/// quotas are NOT cached — they're read inline transactionally; this cache
+/// only ever satisfies rate-quota lookups.
 ///
-/// Phase 5b stores the structure; Phase 5c implements singleflight, jitter,
-/// and the actual `get_or_load` path.
+/// ## Singleflight
+///
+/// Concurrent misses on the same namespace fan-in: the first task that
+/// observes a miss takes a per-entry `Notify`, executes the storage read,
+/// installs the value, and notifies all waiters. Subsequent misses on the
+/// same namespace observe the in-flight loader and `await` the `Notify`
+/// instead of issuing a duplicate read.
+///
+/// ## Jitter
+///
+/// Each insert picks a TTL drawn uniformly from `[ttl × 0.9, ttl × 1.1]`
+/// so a fleet of replicas does not synchronize cache expiry on a clock
+/// boundary.
 pub struct NamespaceConfigCache {
-    /// Configured TTL. Phase 5c applies ±10% jitter on insert.
+    /// Configured TTL (the centre of the ±10% jittered range).
     pub ttl: Duration,
-    /// Ready slot for cached entries. `RwLock` because reads dominate;
-    /// inserts on cache miss are rare.
-    entries: RwLock<HashMap<Namespace, CachedQuota>>,
+    /// Per-namespace entry slot. The outer `RwLock` guards entry creation;
+    /// per-entry mutability happens through the inner `Mutex<CacheEntry>`
+    /// so reads on hot entries do not lock the whole map.
+    entries: RwLock<HashMap<Namespace, Arc<Mutex<CacheEntry>>>>,
+}
+
+/// Cache slot. `value` is `None` while the first loader is in flight;
+/// followers `await` `notify` and re-read after wakeup.
+struct CacheEntry {
+    value: Option<CachedQuota>,
+    /// `true` while a loader is in flight. Followers do not start a
+    /// duplicate load; they wait on `notify`.
+    loading: bool,
+    /// Wakeup signal for followers waiting on the in-flight loader.
+    notify: Arc<Notify>,
+}
+
+impl CacheEntry {
+    fn empty() -> Self {
+        Self {
+            value: None,
+            loading: false,
+            notify: Arc::new(Notify::new()),
+        }
+    }
 }
 
 #[derive(Clone)]
 pub struct CachedQuota {
     pub quota: Arc<NamespaceQuota>,
-    /// When this cache entry expires. Phase 5c jitters the ±10% on insert.
+    /// When this cache entry expires. Includes the per-entry ±10% jitter.
     pub expires_at: std::time::Instant,
+}
+
+impl CachedQuota {
+    fn is_fresh(&self) -> bool {
+        self.expires_at > std::time::Instant::now()
+    }
 }
 
 impl NamespaceConfigCache {
@@ -464,24 +629,191 @@ impl NamespaceConfigCache {
         }
     }
 
-    /// Lookup an entry without populating. Returns `None` on miss or expiry.
-    pub async fn peek(&self, ns: &Namespace) -> Option<CachedQuota> {
-        let map = self.entries.read().await;
-        map.get(ns).cloned().filter(|entry| {
-            // Eviction is lazy in the read path; the write path can prune.
-            entry.expires_at > std::time::Instant::now()
-        })
+    /// Pick a jittered TTL for a fresh insert. ±10% of the configured TTL.
+    fn jittered_ttl(&self) -> Duration {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let frac: f64 = rng.gen_range(-0.1..0.1);
+        let nanos = self.ttl.as_secs_f64() * (1.0 + frac);
+        Duration::from_secs_f64(nanos.max(0.0))
     }
 
-    /// Phase 5c implements singleflight + jittered TTL on top of this raw
-    /// `insert` primitive.
+    /// Look up the rate-quota config for `namespace`, loading from storage
+    /// on miss with singleflight semantics.
+    ///
+    /// Returns the cached `NamespaceQuota` directly. On miss the loader
+    /// `loader_fn` is called once per (namespace, expiry-window) pair; all
+    /// other callers wait for it via the per-entry `Notify`.
+    pub async fn get_or_load<F, Fut>(
+        &self,
+        ns: &Namespace,
+        loader_fn: F,
+    ) -> Result<Arc<NamespaceQuota>, StorageError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<NamespaceQuota, StorageError>>,
+    {
+        // Fast path: shared read on the map; if the entry is fresh return it.
+        // This branch never takes the per-entry mutex.
+        let entry = {
+            let map = self.entries.read().await;
+            map.get(ns).cloned()
+        };
+        if let Some(slot) = entry.as_ref() {
+            let guard = slot.lock().await;
+            if let Some(cached) = &guard.value {
+                if cached.is_fresh() {
+                    return Ok(Arc::clone(&cached.quota));
+                }
+            }
+            // expired or empty — fall through to the slow path with the
+            // entry already in hand.
+        }
+
+        // Slow path: miss or stale. We need a per-entry slot to coordinate
+        // singleflight.
+        let slot = match entry {
+            Some(slot) => slot,
+            None => {
+                let mut map = self.entries.write().await;
+                Arc::clone(
+                    map.entry(ns.clone())
+                        .or_insert_with(|| Arc::new(Mutex::new(CacheEntry::empty()))),
+                )
+            }
+        };
+
+        // Lock the per-entry slot. If a loader is in flight, wait for it.
+        // Otherwise become the loader.
+        let (am_loader, notify, fresh_value) = {
+            let mut guard = slot.lock().await;
+            if let Some(cached) = &guard.value {
+                if cached.is_fresh() {
+                    return Ok(Arc::clone(&cached.quota));
+                }
+            }
+            if guard.loading {
+                (false, Arc::clone(&guard.notify), None)
+            } else {
+                guard.loading = true;
+                (true, Arc::clone(&guard.notify), None::<()>.map(|_| ()))
+            }
+        };
+
+        if !am_loader {
+            // Wait for the in-flight loader, then read the slot.
+            notify.notified().await;
+            let guard = slot.lock().await;
+            if let Some(cached) = &guard.value {
+                if cached.is_fresh() {
+                    return Ok(Arc::clone(&cached.quota));
+                }
+            }
+            // The loader failed or installed an already-stale entry; fall
+            // through to attempt the load ourselves. This keeps follower
+            // tasks from being permanently stuck on a transient error.
+            // Suppress the variable so it doesn't get optimized away.
+            let _ = fresh_value;
+        }
+
+        // We are the loader. Run the user-supplied closure.
+        let load_result = loader_fn().await;
+
+        // Re-acquire the entry mutex to install the value (or clear the
+        // loading flag on error) and signal followers.
+        {
+            let mut guard = slot.lock().await;
+            guard.loading = false;
+            match &load_result {
+                Ok(quota) => {
+                    let entry = CachedQuota {
+                        quota: Arc::new(quota.clone()),
+                        expires_at: std::time::Instant::now() + self.jittered_ttl(),
+                    };
+                    guard.value = Some(entry);
+                }
+                Err(_) => {
+                    // Leave previous (possibly stale) value in place but
+                    // don't pretend a fresh load happened. Followers wake
+                    // and retry.
+                }
+            }
+            guard.notify.notify_waiters();
+        }
+
+        match load_result {
+            Ok(quota) => Ok(Arc::new(quota)),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Compatibility convenience: looks up the rate-quota config for
+    /// `namespace`, opening a fresh transaction on the storage handle and
+    /// reading via `get_namespace_quota`. Most callers prefer `get_or_load`
+    /// when they already hold a transaction.
+    pub async fn get_rate_config(
+        &self,
+        namespace: &Namespace,
+        storage: &Arc<dyn DynStorage>,
+    ) -> Result<Arc<NamespaceQuota>, StorageError> {
+        let storage_for_loader = Arc::clone(storage);
+        let ns_for_loader = namespace.clone();
+        self.get_or_load(namespace, move || async move {
+            let mut tx = storage_for_loader.begin_dyn().await?;
+            let quota = tx.get_namespace_quota(&ns_for_loader).await?;
+            tx.commit_dyn().await?;
+            Ok(quota)
+        })
+        .await
+    }
+
+    /// Drop the cache entry for `ns`. Used by admin write paths
+    /// (`SetNamespaceQuota` / `SetNamespaceConfig` / Enable/Disable
+    /// namespace) to make subsequent reads observe the new state without
+    /// waiting out the TTL.
+    pub fn invalidate(&self, ns: &Namespace) {
+        // Synchronous best-effort: the RwLock supports `try_write` so the
+        // admin handler does not block on a long-running read. If a reader
+        // is mid-flight the next read will observe a stale entry until the
+        // TTL elapses — acceptable per `design.md` §1.1 carve-out.
+        if let Ok(mut map) = self.entries.try_write() {
+            map.remove(ns);
+        }
+    }
+
+    /// Async invalidate that always succeeds (waits for the writer lock).
+    /// Tests prefer this; admin handlers prefer the synchronous version.
+    pub async fn invalidate_async(&self, ns: &Namespace) {
+        let mut map = self.entries.write().await;
+        map.remove(ns);
+    }
+
+    /// Lookup an entry without populating. Returns `None` on miss or expiry.
+    pub async fn peek(&self, ns: &Namespace) -> Option<CachedQuota> {
+        let entry = {
+            let map = self.entries.read().await;
+            map.get(ns).cloned()
+        }?;
+        let guard = entry.lock().await;
+        guard.value.clone().filter(CachedQuota::is_fresh)
+    }
+
+    /// Bypass the singleflight loader and install a value directly. Tests
+    /// use this; admin paths prefer `invalidate`.
     pub async fn insert(&self, ns: Namespace, quota: Arc<NamespaceQuota>) {
         let entry = CachedQuota {
             quota,
-            expires_at: std::time::Instant::now() + self.ttl,
+            expires_at: std::time::Instant::now() + self.jittered_ttl(),
         };
-        let mut map = self.entries.write().await;
-        map.insert(ns, entry);
+        let slot = {
+            let mut map = self.entries.write().await;
+            Arc::clone(
+                map.entry(ns)
+                    .or_insert_with(|| Arc::new(Mutex::new(CacheEntry::empty()))),
+            )
+        };
+        let mut guard = slot.lock().await;
+        guard.value = Some(entry);
     }
 }
 

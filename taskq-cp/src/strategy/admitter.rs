@@ -188,11 +188,14 @@ impl Admitter for CoDelAdmitter {
 mod tests {
     use super::*;
 
+    use std::collections::HashMap;
+
     use taskq_storage::{
-        AuditEntry, CapacityDecision, CapacityKind, DedupRecord, HeartbeatAck, IdempotencyKey,
-        LeaseRef, LockedTask, Namespace, NamespaceQuota, NewDedupRecord, NewLease, NewTask,
-        PickCriteria, RateDecision, RateKind, StorageError, TaskId, TaskOutcome, TaskType,
-        Timestamp, WorkerId,
+        AuditEntry, CancelOutcome, CapacityDecision, CapacityKind, DeadWorkerRuntime, DedupRecord,
+        ExpiredRuntime, HeartbeatAck, IdempotencyKey, LeaseRef, LockedTask, Namespace,
+        NamespaceQuota, NewDedupRecord, NewLease, NewTask, PickCriteria, RateDecision, RateKind,
+        RuntimeRef, StorageError, Task, TaskId, TaskOutcome, TaskStatus, TaskType, Timestamp,
+        WorkerId, WorkerInfo,
     };
 
     use crate::state::{StorageTxDyn, StorageTxFuture, WakeSignalStream};
@@ -322,6 +325,72 @@ mod tests {
             _entry: AuditEntry,
         ) -> StorageTxFuture<'a, Result<(), StorageError>> {
             unreachable!("admin methods not exercised in admitter tests")
+        }
+
+        fn cancel_task<'a>(
+            &'a mut self,
+            _task_id: TaskId,
+        ) -> StorageTxFuture<'a, Result<CancelOutcome, StorageError>> {
+            unreachable!("Phase 5c admin methods not exercised in admitter tests")
+        }
+
+        fn get_task_by_id<'a>(
+            &'a mut self,
+            _task_id: TaskId,
+        ) -> StorageTxFuture<'a, Result<Option<Task>, StorageError>> {
+            unreachable!("Phase 5c admin methods not exercised in admitter tests")
+        }
+
+        fn list_expired_runtimes<'a>(
+            &'a mut self,
+            _before: Timestamp,
+            _n: usize,
+        ) -> StorageTxFuture<'a, Result<Vec<ExpiredRuntime>, StorageError>> {
+            unreachable!("Phase 5c reaper methods not exercised in admitter tests")
+        }
+
+        fn reclaim_runtime<'a>(
+            &'a mut self,
+            _runtime: &'a RuntimeRef,
+        ) -> StorageTxFuture<'a, Result<(), StorageError>> {
+            unreachable!("Phase 5c reaper methods not exercised in admitter tests")
+        }
+
+        fn list_dead_worker_runtimes<'a>(
+            &'a mut self,
+            _stale_before: Timestamp,
+            _n: usize,
+        ) -> StorageTxFuture<'a, Result<Vec<DeadWorkerRuntime>, StorageError>> {
+            unreachable!("Phase 5c reaper methods not exercised in admitter tests")
+        }
+
+        fn count_tasks_by_status<'a>(
+            &'a mut self,
+            _ns: &'a Namespace,
+        ) -> StorageTxFuture<'a, Result<HashMap<TaskStatus, u64>, StorageError>> {
+            unreachable!("Phase 5c admin methods not exercised in admitter tests")
+        }
+
+        fn list_workers<'a>(
+            &'a mut self,
+            _ns: &'a Namespace,
+            _include_dead: bool,
+        ) -> StorageTxFuture<'a, Result<Vec<WorkerInfo>, StorageError>> {
+            unreachable!("Phase 5c admin methods not exercised in admitter tests")
+        }
+
+        fn enable_namespace<'a>(
+            &'a mut self,
+            _ns: &'a Namespace,
+        ) -> StorageTxFuture<'a, Result<(), StorageError>> {
+            unreachable!("Phase 5c admin methods not exercised in admitter tests")
+        }
+
+        fn disable_namespace<'a>(
+            &'a mut self,
+            _ns: &'a Namespace,
+        ) -> StorageTxFuture<'a, Result<(), StorageError>> {
+            unreachable!("Phase 5c admin methods not exercised in admitter tests")
         }
 
         fn commit_dyn<'a>(self: Box<Self>) -> StorageTxFuture<'a, Result<(), StorageError>>

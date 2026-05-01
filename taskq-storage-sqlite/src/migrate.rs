@@ -23,11 +23,18 @@ pub struct Migration {
 }
 
 /// All migrations the SQLite backend ships, in order.
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "0001_initial.sql",
-    sql: include_str!("../migrations/0001_initial.sql"),
-}];
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "0001_initial.sql",
+        sql: include_str!("../migrations/0001_initial.sql"),
+    },
+    Migration {
+        version: 2,
+        name: "0002_phase5c_admin.sql",
+        sql: include_str!("../migrations/0002_phase5c_admin.sql"),
+    },
+];
 
 /// Apply every migration that has not yet been recorded.
 ///

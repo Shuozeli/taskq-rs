@@ -32,7 +32,7 @@ use taskq_cp::error::CpError;
 use taskq_cp::health::HealthState;
 use taskq_cp::state::{CpState, DynStorage};
 use taskq_cp::strategy::StrategyRegistry;
-use taskq_cp::{health, observability, server, shutdown};
+use taskq_cp::{health, observability, reapers, server, shutdown};
 
 /// Schema version this binary expects to find in `taskq_meta.schema_version`.
 ///
@@ -41,7 +41,7 @@ use taskq_cp::{health, observability, server, shutdown};
 /// apply. `design.md` §12.5: production CPs run `taskq-cp migrate` deliberately;
 /// `serve` refuses to start when the storage backend's recorded version does
 /// not match this constant unless `--auto-migrate` is passed.
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 
 /// Command-line interface for `taskq-cp`.
 ///
@@ -181,6 +181,12 @@ async fn run_serve(config: CpConfig, auto_migrate: bool) -> anyhow::Result<()> {
         let _ = signal_shutdown_tx.send(true);
     });
 
+    // Spawn the Phase 5c reapers. They each tick on their own cadence and
+    // exit on shutdown; the gRPC server is the runtime's blocking root, so
+    // the reapers' join handles are awaited below after the server returns.
+    let (reaper_a_handle, reaper_b_handle) =
+        reapers::spawn_reapers(Arc::clone(&cp_state), shutdown_rx.clone());
+
     // Run the gRPC server. Blocks until shutdown fires.
     let serve_result = server::serve(Arc::clone(&cp_state), shutdown_rx).await;
     if let Err(err) = &serve_result {
@@ -195,6 +201,12 @@ async fn run_serve(config: CpConfig, auto_migrate: bool) -> anyhow::Result<()> {
     }
     if let Err(err) = health_handle.await {
         tracing::warn!(error = %err, "health server task panicked");
+    }
+    if let Err(err) = reaper_a_handle.await {
+        tracing::warn!(error = %err, "reaper-a task panicked");
+    }
+    if let Err(err) = reaper_b_handle.await {
+        tracing::warn!(error = %err, "reaper-b task panicked");
     }
 
     observability_state.shutdown();

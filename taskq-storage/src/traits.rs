@@ -23,12 +23,15 @@
 
 use futures_core::Stream;
 
+use std::collections::HashMap;
+
 use crate::error::Result;
 use crate::ids::{IdempotencyKey, Namespace, TaskId, TaskType, Timestamp, WorkerId};
 use crate::types::{
-    AuditEntry, CapacityDecision, CapacityKind, DedupRecord, ExpiredRuntime, HeartbeatAck,
-    LeaseRef, LockedTask, NamespaceQuota, NewDedupRecord, NewLease, NewTask, PickCriteria,
-    RateDecision, RateKind, RuntimeRef, TaskOutcome, WakeSignal,
+    AuditEntry, CancelOutcome, CapacityDecision, CapacityKind, DeadWorkerRuntime, DedupRecord,
+    ExpiredRuntime, HeartbeatAck, LeaseRef, LockedTask, NamespaceQuota, NewDedupRecord, NewLease,
+    NewTask, PickCriteria, RateDecision, RateKind, RuntimeRef, Task, TaskOutcome, TaskStatus,
+    WakeSignal, WorkerInfo,
 };
 
 /// Connection-lifecycle trait. A `Storage` factory hands out `StorageTx`
@@ -356,6 +359,95 @@ pub trait StorageTx: Send {
     fn audit_log_append(
         &mut self,
         entry: AuditEntry,
+    ) -> impl std::future::Future<Output = Result<()>> + Send;
+
+    // ========================================================================
+    // Phase 5c admin / cancel / reaper-B
+    // ========================================================================
+
+    /// Used by §6.7 `CancelTask` / `PurgeTasks`: flip the task to
+    /// `CANCELLED` (terminal) and DELETE the matching `idempotency_keys`
+    /// row in the same SERIALIZABLE transaction. Idempotent — calling on a
+    /// task that is already terminal returns
+    /// [`CancelOutcome::AlreadyTerminal`] with the observed state and does
+    /// not mutate.
+    ///
+    /// Returns [`CancelOutcome::NotFound`] when no row matches `task_id`.
+    ///
+    /// SERIALIZABLE: yes.
+    fn cancel_task(
+        &mut self,
+        task_id: TaskId,
+    ) -> impl std::future::Future<Output = Result<CancelOutcome>> + Send;
+
+    /// Used by `GetTaskResult`, `BatchGetTaskResults`, `SubmitAndWait`,
+    /// and the per-task replay-validation flow in `replay_dead_letters`
+    /// (admin §6.7).
+    ///
+    /// Returns `Ok(None)` for an unknown `task_id`. The CP layer surfaces
+    /// that to callers as a wire-level "not found" reply.
+    ///
+    /// SERIALIZABLE: yes (rides whatever transaction the admin/RPC handler
+    /// opened; reads are inline).
+    fn get_task_by_id(
+        &mut self,
+        task_id: TaskId,
+    ) -> impl std::future::Future<Output = Result<Option<Task>>> + Send;
+
+    /// Used by §6.6 Reaper B: list runtime rows whose worker's last
+    /// `worker_heartbeats.last_heartbeat_at` is older than
+    /// `stale_before` and whose `declared_dead_at IS NULL`. Backends MUST
+    /// honor §8.2 #2 skip-locking semantics so concurrent reapers don't
+    /// double-process the same row.
+    ///
+    /// SERIALIZABLE: yes.
+    fn list_dead_worker_runtimes(
+        &mut self,
+        stale_before: Timestamp,
+        n: usize,
+    ) -> impl std::future::Future<Output = Result<Vec<DeadWorkerRuntime>>> + Send;
+
+    /// Used by admin `GetStats` (`design.md` §11.3): count tasks per
+    /// status for one namespace. The map keys are every `TaskStatus`
+    /// variant the namespace has at least one row for; absent variants
+    /// imply zero.
+    ///
+    /// SERIALIZABLE: yes (rides the admin transaction; reads are inline).
+    fn count_tasks_by_status(
+        &mut self,
+        namespace: &Namespace,
+    ) -> impl std::future::Future<Output = Result<HashMap<TaskStatus, u64>>> + Send;
+
+    /// Used by admin `ListWorkers`: return the per-worker snapshot for
+    /// `namespace`. When `include_dead` is `false` the result excludes
+    /// rows whose `declared_dead_at IS NOT NULL`.
+    ///
+    /// SERIALIZABLE: yes (rides the admin transaction; reads are inline).
+    fn list_workers(
+        &mut self,
+        namespace: &Namespace,
+        include_dead: bool,
+    ) -> impl std::future::Future<Output = Result<Vec<WorkerInfo>>> + Send;
+
+    /// Used by admin `EnableNamespace`: clear the `disabled` flag on the
+    /// namespace's `namespace_quota` row. No-op if the namespace is not
+    /// already disabled.
+    ///
+    /// SERIALIZABLE: yes.
+    fn enable_namespace(
+        &mut self,
+        namespace: &Namespace,
+    ) -> impl std::future::Future<Output = Result<()>> + Send;
+
+    /// Used by admin `DisableNamespace`: set the `disabled` flag on the
+    /// namespace's `namespace_quota` row. Subsequent `SubmitTask` calls
+    /// against the namespace surface `NAMESPACE_DISABLED`
+    /// (`design.md` §10.1).
+    ///
+    /// SERIALIZABLE: yes.
+    fn disable_namespace(
+        &mut self,
+        namespace: &Namespace,
     ) -> impl std::future::Future<Output = Result<()>> + Send;
 
     // ========================================================================

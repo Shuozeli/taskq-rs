@@ -13,6 +13,8 @@
 
 use std::sync::Arc;
 
+use std::collections::HashMap;
+
 use bytes::Bytes;
 use chrono::{DateTime, TimeZone, Utc};
 use deadpool_postgres::{Object as PgConn, Pool};
@@ -20,10 +22,10 @@ use futures_core::Stream;
 use taskq_storage::error::Result;
 use taskq_storage::ids::{IdempotencyKey, Namespace, TaskId, TaskType, Timestamp, WorkerId};
 use taskq_storage::types::{
-    AuditEntry, CapacityDecision, CapacityKind, DedupRecord, ExpiredRuntime, HeartbeatAck,
-    LeaseRef, LockedTask, NamespaceFilter, NamespaceQuota, NewDedupRecord, NewLease, NewTask,
-    PickCriteria, PickOrdering, RateDecision, RateKind, RuntimeRef, TaskOutcome, TaskTypeFilter,
-    WakeSignal,
+    AuditEntry, CancelOutcome, CapacityDecision, CapacityKind, DeadWorkerRuntime, DedupRecord,
+    ExpiredRuntime, HeartbeatAck, LeaseRef, LockedTask, NamespaceFilter, NamespaceQuota,
+    NewDedupRecord, NewLease, NewTask, PickCriteria, PickOrdering, RateDecision, RateKind,
+    RuntimeRef, Task, TaskOutcome, TaskStatus, TaskTypeFilter, WakeSignal, WorkerInfo,
 };
 use taskq_storage::{StorageError, StorageTx};
 use tokio::sync::mpsc;
@@ -831,6 +833,282 @@ impl<'a> StorageTx for PostgresTx<'a> {
                     &entry.result.as_str(),
                     &request_hash,
                 ],
+            )
+            .await
+            .map_err(map_db_error)?;
+        Ok(())
+    }
+
+    // ========================================================================
+    // Phase 5c admin / cancel / reaper-B
+    // ========================================================================
+
+    async fn cancel_task(&mut self, task_id: TaskId) -> Result<CancelOutcome> {
+        // §6.7: SELECT FOR UPDATE -> if non-terminal, flip to CANCELLED and
+        // delete the dedup row in the same transaction. Idempotent on
+        // already-terminal rows (returns AlreadyTerminal).
+        let task_id_uuid = task_id.into_uuid();
+        let row = self
+            .conn
+            .query_opt(
+                "SELECT status::text, namespace FROM tasks WHERE task_id = $1 FOR UPDATE",
+                &[&task_id_uuid],
+            )
+            .await
+            .map_err(map_db_error)?;
+
+        let Some(row) = row else {
+            return Ok(CancelOutcome::NotFound);
+        };
+        let status_str: String = row.get(0);
+        let namespace_str: String = row.get(1);
+        let Some(status) = TaskStatus::from_db_str(&status_str) else {
+            return Err(StorageError::ConstraintViolation(format!(
+                "tasks.status has unknown value: {status_str}"
+            )));
+        };
+
+        if status.is_terminal() {
+            return Ok(CancelOutcome::AlreadyTerminal { state: status });
+        }
+
+        // Non-terminal: flip to CANCELLED and delete the dedup row.
+        self.conn
+            .execute(
+                "UPDATE tasks SET status = $1::text::taskq_task_status WHERE task_id = $2",
+                &[&"CANCELLED", &task_id_uuid],
+            )
+            .await
+            .map_err(map_db_error)?;
+
+        // §6.7: physically delete the dedup row so the same key can be reused.
+        self.conn
+            .execute(
+                "DELETE FROM idempotency_keys WHERE namespace = $1 AND task_id = $2",
+                &[&namespace_str, &task_id_uuid],
+            )
+            .await
+            .map_err(map_db_error)?;
+
+        // Also delete any runtime row in case a worker had the lease (the
+        // §6.7 spec leaves it to admin paths to reclaim — keep the table
+        // consistent so a subsequent `CompleteTask` returns LEASE_EXPIRED).
+        self.conn
+            .execute(
+                "DELETE FROM task_runtime WHERE task_id = $1",
+                &[&task_id_uuid],
+            )
+            .await
+            .map_err(map_db_error)?;
+
+        Ok(CancelOutcome::TransitionedToCancelled)
+    }
+
+    async fn get_task_by_id(&mut self, task_id: TaskId) -> Result<Option<Task>> {
+        let task_id_uuid = task_id.into_uuid();
+        let row = self
+            .conn
+            .query_opt(
+                "SELECT task_id, namespace, task_type, status::text, priority, payload, \
+                        payload_hash, submitted_at, expires_at, attempt_number, max_retries, \
+                        retry_initial_ms, retry_max_ms, retry_coefficient, retry_after, \
+                        traceparent, tracestate, format_version, original_failure_count \
+                   FROM tasks WHERE task_id = $1",
+                &[&task_id_uuid],
+            )
+            .await
+            .map_err(map_db_error)?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let task_id: Uuid = row.get(0);
+        let namespace_str: String = row.get(1);
+        let task_type_str: String = row.get(2);
+        let status_str: String = row.get(3);
+        let priority: i32 = row.get(4);
+        let payload: Vec<u8> = row.get(5);
+        let payload_hash_bytes: Vec<u8> = row.get(6);
+        let submitted_at: DateTime<Utc> = row.get(7);
+        let expires_at: DateTime<Utc> = row.get(8);
+        let attempt_number: i32 = row.get(9);
+        let max_retries: i32 = row.get(10);
+        let retry_initial_ms: i64 = row.get(11);
+        let retry_max_ms: i64 = row.get(12);
+        let retry_coefficient: f32 = row.get(13);
+        let retry_after: Option<DateTime<Utc>> = row.get(14);
+        let traceparent: Vec<u8> = row.get(15);
+        let tracestate: Vec<u8> = row.get(16);
+        let format_version: i32 = row.get(17);
+        let original_failure_count: i32 = row.get(18);
+
+        let payload_hash: [u8; 32] = payload_hash_bytes.as_slice().try_into().map_err(|_| {
+            StorageError::ConstraintViolation("tasks.payload_hash != 32 bytes".to_owned())
+        })?;
+        let status = TaskStatus::from_db_str(&status_str).ok_or_else(|| {
+            StorageError::ConstraintViolation(format!("tasks.status unknown: {status_str}"))
+        })?;
+
+        Ok(Some(Task {
+            task_id: TaskId::from_uuid(task_id),
+            namespace: Namespace::new(namespace_str),
+            task_type: TaskType::new(task_type_str),
+            status,
+            priority,
+            payload: Bytes::from(payload),
+            payload_hash,
+            submitted_at: chrono_to_timestamp(submitted_at),
+            expires_at: chrono_to_timestamp(expires_at),
+            attempt_number: attempt_number as u32,
+            max_retries: max_retries as u32,
+            retry_initial_ms: retry_initial_ms as u64,
+            retry_max_ms: retry_max_ms as u64,
+            retry_coefficient,
+            retry_after: retry_after.map(chrono_to_timestamp),
+            traceparent: Bytes::from(traceparent),
+            tracestate: Bytes::from(tracestate),
+            format_version: format_version as u32,
+            original_failure_count: original_failure_count as u32,
+        }))
+    }
+
+    async fn list_dead_worker_runtimes(
+        &mut self,
+        stale_before: Timestamp,
+        n: usize,
+    ) -> Result<Vec<DeadWorkerRuntime>> {
+        // §6.6 Reaper B: JOIN runtime to heartbeats; pick only alive (not
+        // already-declared-dead) workers whose last heartbeat predates
+        // `stale_before`. SKIP LOCKED so concurrent reaper passes don't
+        // double-process.
+        let cutoff = timestamp_to_chrono(stale_before);
+        let limit = n as i64;
+        let rows = self
+            .conn
+            .query(
+                "SELECT r.task_id, r.attempt_number, r.worker_id, t.namespace, h.last_heartbeat_at \
+                   FROM task_runtime r \
+                   JOIN tasks t ON t.task_id = r.task_id \
+                   JOIN worker_heartbeats h ON h.worker_id = r.worker_id \
+                  WHERE h.last_heartbeat_at < $1 \
+                    AND h.declared_dead_at IS NULL \
+                  ORDER BY h.last_heartbeat_at ASC \
+                  LIMIT $2 \
+                    FOR UPDATE OF r SKIP LOCKED",
+                &[&cutoff, &limit],
+            )
+            .await
+            .map_err(map_db_error)?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let task_id: Uuid = row.get(0);
+            let attempt_number: i32 = row.get(1);
+            let worker_id: Uuid = row.get(2);
+            let namespace: String = row.get(3);
+            let last_heartbeat_at: DateTime<Utc> = row.get(4);
+            out.push(DeadWorkerRuntime {
+                task_id: TaskId::from_uuid(task_id),
+                attempt_number: attempt_number as u32,
+                worker_id: WorkerId::from_uuid(worker_id),
+                namespace: Namespace::new(namespace),
+                last_heartbeat_at: chrono_to_timestamp(last_heartbeat_at),
+            });
+        }
+        Ok(out)
+    }
+
+    async fn count_tasks_by_status(
+        &mut self,
+        namespace: &Namespace,
+    ) -> Result<HashMap<TaskStatus, u64>> {
+        let rows = self
+            .conn
+            .query(
+                "SELECT status::text, COUNT(*)::bigint \
+                   FROM tasks \
+                  WHERE namespace = $1 \
+                  GROUP BY status",
+                &[&namespace.as_str()],
+            )
+            .await
+            .map_err(map_db_error)?;
+        let mut out = HashMap::new();
+        for row in rows {
+            let status_str: String = row.get(0);
+            let count: i64 = row.get(1);
+            if let Some(status) = TaskStatus::from_db_str(&status_str) {
+                out.insert(status, count as u64);
+            }
+        }
+        Ok(out)
+    }
+
+    async fn list_workers(
+        &mut self,
+        namespace: &Namespace,
+        include_dead: bool,
+    ) -> Result<Vec<WorkerInfo>> {
+        // Aggregate inflight count per worker via LEFT JOIN to task_runtime.
+        let sql = if include_dead {
+            "SELECT h.worker_id, h.namespace, h.last_heartbeat_at, h.declared_dead_at, \
+                    COALESCE(rt.cnt, 0)::bigint \
+               FROM worker_heartbeats h \
+          LEFT JOIN ( \
+                SELECT worker_id, COUNT(*) AS cnt FROM task_runtime GROUP BY worker_id \
+              ) rt ON rt.worker_id = h.worker_id \
+              WHERE h.namespace = $1 \
+              ORDER BY h.last_heartbeat_at DESC"
+        } else {
+            "SELECT h.worker_id, h.namespace, h.last_heartbeat_at, h.declared_dead_at, \
+                    COALESCE(rt.cnt, 0)::bigint \
+               FROM worker_heartbeats h \
+          LEFT JOIN ( \
+                SELECT worker_id, COUNT(*) AS cnt FROM task_runtime GROUP BY worker_id \
+              ) rt ON rt.worker_id = h.worker_id \
+              WHERE h.namespace = $1 AND h.declared_dead_at IS NULL \
+              ORDER BY h.last_heartbeat_at DESC"
+        };
+        let rows = self
+            .conn
+            .query(sql, &[&namespace.as_str()])
+            .await
+            .map_err(map_db_error)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let worker_id: Uuid = row.get(0);
+            let namespace_str: String = row.get(1);
+            let last_heartbeat_at: DateTime<Utc> = row.get(2);
+            let declared_dead_at: Option<DateTime<Utc>> = row.get(3);
+            let inflight_count: i64 = row.get(4);
+            out.push(WorkerInfo {
+                worker_id: WorkerId::from_uuid(worker_id),
+                namespace: Namespace::new(namespace_str),
+                last_heartbeat_at: chrono_to_timestamp(last_heartbeat_at),
+                declared_dead_at: declared_dead_at.map(chrono_to_timestamp),
+                inflight_count: inflight_count as u32,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn enable_namespace(&mut self, namespace: &Namespace) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE namespace_quota SET disabled = FALSE WHERE namespace = $1",
+                &[&namespace.as_str()],
+            )
+            .await
+            .map_err(map_db_error)?;
+        Ok(())
+    }
+
+    async fn disable_namespace(&mut self, namespace: &Namespace) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE namespace_quota SET disabled = TRUE WHERE namespace = $1",
+                &[&namespace.as_str()],
             )
             .await
             .map_err(map_db_error)?;
