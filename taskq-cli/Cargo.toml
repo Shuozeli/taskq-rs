@@ -7,4 +7,52 @@ repository.workspace = true
 description = "taskq-rs operator CLI (migrate, namespace admin, quota, purge, replay)"
 publish = false
 
+[[bin]]
+name = "taskq-cli"
+path = "src/main.rs"
+
 [dependencies]
+# Wire types and the auto-generated `task_admin_client::TaskAdminClient`.
+taskq-proto = { path = "../taskq-proto" }
+
+# Same pure-grpc-rs revision the proto crate pins, so client transport types
+# (`Channel`, `Status`) line up across crate boundaries.
+grpc-core = { git = "https://github.com/Shuozeli/pure-grpc-rs.git", rev = "58c35d952a414a7229622c7d1306acf6597e8170", default-features = false }
+grpc-client = { git = "https://github.com/Shuozeli/pure-grpc-rs.git", rev = "58c35d952a414a7229622c7d1306acf6597e8170" }
+
+# Async runtime. Operator CLI: needs full features for signal handling and
+# blocking I/O on stdin during interactive confirmation prompts.
+tokio = { version = "1", features = ["full"] }
+
+# CLI parsing.
+clap = { version = "4", features = ["derive", "env"] }
+
+# JSON output rendering (`--format json`).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Cheap byte buffers; wire types use `Vec<u8>` but we hand them through `Bytes`
+# in a few helper paths.
+bytes = "1"
+
+# `http::Uri` for the connect entry point; matches the generated client.
+http = "1"
+
+# Idiomatic error type derivation for the unified `CliError`.
+thiserror = "1"
+
+# Logging / tracing — `tracing-subscriber` configures stderr logging when the
+# operator passes `RUST_LOG=...`. The CLI is not chatty by default.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# `main` returns `anyhow::Result<()>` so transport / connect / RPC errors
+# bubble out as a single non-zero exit + structured message.
+anyhow = "1"
+
+[dev-dependencies]
+# `assert_cmd` + `predicates` drive the subprocess-based integration tests in
+# `tests/cli.rs`. They invoke the built binary, capture stdout/stderr, and
+# assert on exit code + output substrings.
+assert_cmd = "2"
+predicates = "3"
