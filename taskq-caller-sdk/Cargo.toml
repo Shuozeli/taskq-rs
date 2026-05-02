@@ -8,3 +8,51 @@ description = "Caller-side Rust SDK for the taskq-rs gRPC contract"
 publish = false
 
 [dependencies]
+# Wire types and the auto-generated `task_queue_client::TaskQueueClient`.
+taskq-proto = { path = "../taskq-proto" }
+
+# Same pure-grpc-rs revision the proto crate pins, so client transport types
+# (`Channel`, `Status`) line up across crate boundaries. We need `grpc-core`
+# for `Status`/`Code`/`Request`, and `grpc-client` for the default
+# `Channel` transport that `TaskQueueClient::connect` returns.
+grpc-core = { git = "https://github.com/Shuozeli/pure-grpc-rs.git", rev = "58c35d952a414a7229622c7d1306acf6597e8170", default-features = false }
+grpc-client = { git = "https://github.com/Shuozeli/pure-grpc-rs.git", rev = "58c35d952a414a7229622c7d1306acf6597e8170" }
+
+# Async runtime. The SDK does not need `signal` / `process` (it is a library
+# loaded into a caller's tokio runtime) so we pull in the smaller feature set.
+tokio = { version = "1", features = ["rt", "macros", "time", "sync"] }
+
+# Cheap byte buffers for payloads.
+bytes = "1"
+
+# UUIDv7 for auto-generated idempotency keys (`design.md` §10.4).
+uuid = { version = "1", features = ["v7"] }
+
+# Payload hash. The CP hashes incoming bytes with blake3; the SDK computes
+# the same hash so callers see a deterministic identity in error metadata
+# (`problems/03-idempotency.md`).
+blake3 = "1"
+
+# `http::Uri` for the `connect` entry point (matches the generated client).
+http = "1"
+
+# Tracing + OTel context extraction for W3C `traceparent` propagation
+# (`design.md` §11.2). The pinned versions match `taskq-cp` so the OTel
+# subscriber the caller installs is API-compatible with the SDK.
+tracing = "0.1"
+tracing-opentelemetry = "0.25"
+opentelemetry = "0.24"
+
+# Random jitter for the retry-after backoff (`design.md` §10.4 mandates
+# ±20% jitter on top of the rejection's `retry_after` timestamp).
+rand = "0.8"
+
+# Idiomatic error type derivation; the public `ClientError` is a thin
+# `enum` with structured variants for transport vs. server rejections.
+thiserror = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+# Spin up an in-process gRPC server for the smoke tests.
+grpc-server = { git = "https://github.com/Shuozeli/pure-grpc-rs.git", rev = "58c35d952a414a7229622c7d1306acf6597e8170" }
+tracing-subscriber = "0.3"
