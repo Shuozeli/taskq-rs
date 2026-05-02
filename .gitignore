@@ -8,3 +8,5 @@ Cargo.lock
 *.swo
 .env
 .env.local
+.claude/worktrees/
+.claude/sessions/
