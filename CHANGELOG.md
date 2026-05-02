@@ -1,4 +1,4 @@
-<!-- agent-updated: 2026-05-02T00:00:00Z -->
+<!-- agent-updated: 2026-05-02T21:47:00Z -->
 
 # Changelog
 
@@ -8,6 +8,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [0.1.0] - 2026-05-02
+
+Initial public release. Pure-Rust distributed task queue over a
+FlatBuffers / `pure-grpc-rs` wire contract; Postgres backend for
+production, SQLite backend for embedded/dev. 208 workspace tests
+passing.
 
 ### Added
 
@@ -100,6 +107,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   enforcement (`is_namespace_disabled`); `MaxPending` default chain when
   strategy registry is empty; `Dispatcher::pick_ordering()` to centralise
   the lock call.
+- **Phase 10a** codelab walkthroughs (`codelabs/`): `01-build-a-worker-
+  in-50-lines.md` (handler + main one-screener), `02-migrating-a-
+  postgres-queue-service.md` (dual-write/dual-read/cutover/decommission
+  for hand-rolled `SELECT FOR UPDATE SKIP LOCKED` services), `03-
+  operating-taskq-rs.md` (SRE deploy + incident playbooks). ~1330 lines
+  total.
+- **Phase 10b** reference docs and starter Grafana dashboard:
+  `GLOSSARY.md` (taskq vocabulary), `OPERATIONS.md` (alerts off the
+  standard metric set, oncall playbooks, DLQ replay), `protocol/
+  EVOLUTION.md` (SemVer + wire-stability policy), `protocol/QUOTAS.md`
+  (capacity vs rate, cardinality caps), `dashboards/grafana-overview.
+  json` (8-panel dashboard parameterised on `${DS_PROMETHEUS}`).
 
 ### Changed
 

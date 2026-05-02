@@ -1,8 +1,10 @@
-<!-- agent-updated: 2026-04-30T03:35:00Z -->
+<!-- agent-updated: 2026-05-02T21:48:00Z -->
 
 # taskq-rs
 
 A pure-Rust distributed task queue with a standard gRPC contract. Schema is FlatBuffers (compiled with [`flatbuffers-rs`](https://github.com/Shuozeli/flatbuffers-rs)); transport is gRPC over [`pure-grpc-rs`](https://github.com/Shuozeli/pure-grpc-rs); idempotency keys are required and the contract is at-least-once with externally-consistent state transitions.
+
+**Status:** v0.1.0 (initial public release). 208 workspace tests passing. Postgres backend production-shape; SQLite backend embedded/dev only. Wire protocol is `taskq.v1` but no public stability commitment until v1.0.0 — see [`protocol/EVOLUTION.md`](./protocol/EVOLUTION.md).
 
 ## Goals
 
