@@ -46,6 +46,13 @@ pub trait Dispatcher: Send + Sync + 'static {
     /// handler owns the lifecycle.
     async fn pick_next(&self, ctx: &PullCtx, tx: &mut dyn StorageTxDyn) -> Option<TaskId>;
 
+    /// Project the dispatcher's intent onto the storage-trait's
+    /// `PickOrdering` enum. The CP's `try_dispatch` consumes this so the
+    /// hot path can call `pick_and_lock_pending` once with the right
+    /// ordering, without paying for a `pick_next` round-trip that would
+    /// re-issue the lock.
+    fn pick_ordering(&self) -> PickOrdering;
+
     /// Static name used by the strategy registry for runtime selection.
     fn name(&self) -> &'static str;
 }
@@ -91,6 +98,10 @@ impl Dispatcher for PriorityFifoDispatcher {
         }
     }
 
+    fn pick_ordering(&self) -> PickOrdering {
+        PickOrdering::PriorityFifo
+    }
+
     fn name(&self) -> &'static str {
         "PriorityFifo"
     }
@@ -120,6 +131,12 @@ impl Dispatcher for AgePromotedDispatcher {
         match tx.pick_and_lock_pending(criteria).await {
             Ok(Some(locked)) => Some(locked.task_id),
             Ok(None) | Err(_) => None,
+        }
+    }
+
+    fn pick_ordering(&self) -> PickOrdering {
+        PickOrdering::AgePromoted {
+            age_weight: self.age_weight,
         }
     }
 
@@ -153,6 +170,12 @@ impl Dispatcher for RandomNamespaceDispatcher {
         match tx.pick_and_lock_pending(criteria).await {
             Ok(Some(locked)) => Some(locked.task_id),
             Ok(None) | Err(_) => None,
+        }
+    }
+
+    fn pick_ordering(&self) -> PickOrdering {
+        PickOrdering::RandomNamespace {
+            sample_attempts: self.sample_attempts,
         }
     }
 
@@ -233,6 +256,21 @@ mod tests {
             _ns: &'a Namespace,
             _key: &'a IdempotencyKey,
         ) -> StorageTxFuture<'a, Result<Option<DedupRecord>, StorageError>> {
+            unreachable!("submit-path methods not exercised in dispatcher tests")
+        }
+
+        fn delete_idempotency_key<'a>(
+            &'a mut self,
+            _ns: &'a Namespace,
+            _key: &'a IdempotencyKey,
+        ) -> StorageTxFuture<'a, Result<usize, StorageError>> {
+            unreachable!("submit-path methods not exercised in dispatcher tests")
+        }
+
+        fn is_namespace_disabled<'a>(
+            &'a mut self,
+            _ns: &'a Namespace,
+        ) -> StorageTxFuture<'a, Result<bool, StorageError>> {
             unreachable!("submit-path methods not exercised in dispatcher tests")
         }
 

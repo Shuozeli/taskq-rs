@@ -232,9 +232,20 @@ async fn submit_task_impl(state: Arc<CpState>, req: SubmitTaskRequest) -> Submit
         async move {
             let mut tx = state.storage.begin_dyn().await?;
 
-            // Step 1: admit. We intentionally call the admitter even when
-            // no namespace strategy is configured; the default fallback is
-            // "Always" so unconfigured namespaces still admit.
+            // Step 1a: namespace disabled gate. `DisableNamespace` flips
+            // the persisted `disabled` flag; runtime enforcement happens
+            // here, before the admitter, so a disabled namespace short-
+            // circuits without consulting capacity quotas.
+            if tx.is_namespace_disabled(&namespace).await? {
+                let _ = tx.rollback_dyn().await;
+                return Ok(Err(StrategyRejectReason::NamespaceDisabled));
+            }
+
+            // Step 1b: admit. The strategy registry's `for_namespace`
+            // returns a default chain (`MaxPendingAdmitter` reading the
+            // namespace's `max_pending` quota when set, else `Always`)
+            // even for unconfigured namespaces, so this branch always has
+            // a strategy to consult.
             let strategy = state.strategy_registry.for_namespace(&namespace);
             let admit = if let Some(strategy) = strategy {
                 let ctx = SubmitCtx {
@@ -282,6 +293,15 @@ async fn submit_task_impl(state: Arc<CpState>, req: SubmitTaskRequest) -> Submit
                     existing_payload_hash: record.payload_hash,
                 }));
             }
+            // §6.1 step 2 lazy cleanup: `lookup_idempotency` ignores rows
+            // whose `expires_at <= NOW()`, but the SQLite backend's
+            // `idempotency_keys` PK is `(namespace, key)` and would block
+            // the impending insert. Drop any expired row before falling
+            // through to the insert path. Postgres tolerates the call too
+            // (its PK includes `expires_at` so lingering expired rows
+            // would otherwise rely on the partition-drop pruner).
+            tx.delete_idempotency_key(&namespace, &idempotency_key)
+                .await?;
 
             // Steps 3-5: insert task + dedup row.
             let task_id = TaskId::generate();

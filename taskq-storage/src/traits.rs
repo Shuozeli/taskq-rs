@@ -334,6 +334,38 @@ pub trait StorageTx: Send {
         n: usize,
     ) -> impl std::future::Future<Output = Result<usize>> + Send;
 
+    /// Used by §6.1 SubmitTask step 2 lazy cleanup: delete the
+    /// `idempotency_keys` row matching `(namespace, key)` regardless of its
+    /// `expires_at`. Returns the number of rows deleted (`0` when the row
+    /// is absent, `1` after a successful delete; any larger value indicates
+    /// a backend that allowed multiple rows for the pair, which is a
+    /// conformance bug).
+    ///
+    /// The CP layer calls this after `lookup_idempotency` returns `None`
+    /// when the row may still physically exist with `expires_at <= NOW`
+    /// (lookups already filter expired rows out). This makes the next
+    /// `insert_task` succeed under backends whose `idempotency_keys` PK
+    /// excludes `expires_at` (SQLite v1).
+    ///
+    /// SERIALIZABLE: yes (rides the same submit transaction as the lookup).
+    fn delete_idempotency_key(
+        &mut self,
+        namespace: &Namespace,
+        key: &IdempotencyKey,
+    ) -> impl std::future::Future<Output = Result<usize>> + Send;
+
+    /// Used by §6.1 SubmitTask step 1 (admit): read the `disabled` flag on
+    /// the namespace's `namespace_quota` row. Returns `false` when the
+    /// namespace has no row yet (treated as enabled, mirroring the
+    /// quota-inheritance default in `get_namespace_quota`).
+    ///
+    /// SERIALIZABLE: yes (rides the same submit transaction as the
+    /// admitter).
+    fn is_namespace_disabled(
+        &mut self,
+        namespace: &Namespace,
+    ) -> impl std::future::Future<Output = Result<bool>> + Send;
+
     // ========================================================================
     // Admin / reads
     // ========================================================================

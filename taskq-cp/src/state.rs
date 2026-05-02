@@ -113,6 +113,17 @@ pub trait StorageTxDyn: Send {
         key: &'a IdempotencyKey,
     ) -> StorageTxFuture<'a, Result<Option<DedupRecord>, StorageError>>;
 
+    fn delete_idempotency_key<'a>(
+        &'a mut self,
+        namespace: &'a Namespace,
+        key: &'a IdempotencyKey,
+    ) -> StorageTxFuture<'a, Result<usize, StorageError>>;
+
+    fn is_namespace_disabled<'a>(
+        &'a mut self,
+        namespace: &'a Namespace,
+    ) -> StorageTxFuture<'a, Result<bool, StorageError>>;
+
     fn insert_task<'a>(
         &'a mut self,
         task: NewTask,
@@ -347,6 +358,25 @@ where
             namespace,
             key,
         ))
+    }
+
+    fn delete_idempotency_key<'a>(
+        &'a mut self,
+        namespace: &'a Namespace,
+        key: &'a IdempotencyKey,
+    ) -> StorageTxFuture<'a, Result<usize, StorageError>> {
+        Box::pin(StorageTx::delete_idempotency_key(
+            &mut self.inner,
+            namespace,
+            key,
+        ))
+    }
+
+    fn is_namespace_disabled<'a>(
+        &'a mut self,
+        namespace: &'a Namespace,
+    ) -> StorageTxFuture<'a, Result<bool, StorageError>> {
+        Box::pin(StorageTx::is_namespace_disabled(&mut self.inner, namespace))
     }
 
     fn insert_task<'a>(

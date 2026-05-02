@@ -35,9 +35,30 @@ pub struct DegradedNamespace {
 
 /// Compile-time set of strategies linked into this binary, plus the
 /// per-namespace resolution computed at startup.
+///
+/// ## Implicit default chain
+///
+/// Namespaces without an explicit `(admitter, dispatcher)` row in the
+/// registry fall through to a built-in default
+/// `(MaxPendingAdmitter { limit: u64::MAX }, PriorityFifoDispatcher)`.
+/// The `MaxPendingAdmitter` issues a transactional
+/// `check_capacity_quota(MaxPending)` against the namespace's quota row at
+/// admit time, so the **persisted** `namespace_quota.max_pending` is
+/// authoritative. When the quota is unset, the backend returns
+/// `UnderLimit { limit: u64::MAX }` and the admitter accepts. When set,
+/// the admitter rejects with `MAX_PENDING_EXCEEDED` once the count tips
+/// past the persisted limit. The strategy's own `limit` field is a
+/// fallback only; never consulted in this default.
+///
+/// `design.md` §9.1 + `problems/06`: capacity quota reads are inline
+/// transactional, no cache. The implicit default exists so quota
+/// enforcement holds even when no operator-configured strategy row is
+/// present — capacity is part of the namespace contract, not an
+/// opt-in feature.
 pub struct StrategyRegistry {
     namespaces: HashMap<Namespace, NamespaceStrategy>,
     degraded: Vec<DegradedNamespace>,
+    default: NamespaceStrategy,
 }
 
 impl StrategyRegistry {
@@ -48,14 +69,23 @@ impl StrategyRegistry {
         Self {
             namespaces: HashMap::new(),
             degraded: Vec::new(),
+            default: default_strategy(),
         }
     }
 
-    /// Look up the strategy for one namespace. `None` for unconfigured
-    /// namespaces — the handler's job is to fall back to `system_default`
-    /// or reject (Phase 5b decides which).
+    /// Look up the strategy for one namespace. Returns the operator-
+    /// configured strategy when one is installed; otherwise returns the
+    /// built-in default chain so capacity quotas read inline from the
+    /// namespace's `namespace_quota.max_pending` are enforced even when
+    /// no explicit strategy is registered.
+    ///
+    /// Always `Some` — the implicit default is part of the contract.
+    /// `Option` is preserved for API stability so call sites keep their
+    /// existing `if let Some(strategy)` shape. A future refactor may
+    /// collapse the return type once all callers move off the
+    /// no-strategy fast path.
     pub fn for_namespace(&self, ns: &Namespace) -> Option<&NamespaceStrategy> {
-        self.namespaces.get(ns)
+        Some(self.namespaces.get(ns).unwrap_or(&self.default))
     }
 
     /// Insert a fully-resolved strategy choice for a namespace.
@@ -97,6 +127,22 @@ impl StrategyRegistry {
 impl Default for StrategyRegistry {
     fn default() -> Self {
         Self::empty()
+    }
+}
+
+/// Build the implicit default `(MaxPendingAdmitter, PriorityFifoDispatcher)`
+/// chain used by `StrategyRegistry::for_namespace` when no operator-
+/// configured strategy row exists for the namespace.
+///
+/// `MaxPendingAdmitter::admit` issues a transactional
+/// `check_capacity_quota(MaxPending)` and trusts the backend to read the
+/// namespace's persisted `max_pending`; the strategy's own `limit` field
+/// is a fallback, set to `u64::MAX` so the strategy never short-circuits
+/// without consulting storage.
+fn default_strategy() -> NamespaceStrategy {
+    NamespaceStrategy {
+        admitter: Arc::new(MaxPendingAdmitter { limit: u64::MAX }),
+        dispatcher: Arc::new(PriorityFifoDispatcher),
     }
 }
 

@@ -11,7 +11,6 @@
 //! - A second submit with the same key but a different payload returns
 //!   `IDEMPOTENCY_KEY_REUSE_WITH_DIFFERENT_PAYLOAD`.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -142,20 +141,13 @@ async fn cancelled_task_releases_key_for_fresh_submission() {
 #[tokio::test]
 async fn expired_dedup_record_allows_resubmission() {
     // Arrange: insert a task + dedup row with an already-elapsed dedup
-    // TTL. The audit/dedup pruner job sweeps expired rows on its next
-    // tick; we simulate that by deleting expired rows directly through
-    // the storage trait so the test does not depend on the pruner's
-    // (production-tuned) cadence.
-    //
-    // Phase 5 note: the submit-time lazy cleanup hook from `design.md`
-    // Sec 6.1 step 2 ("If present but expired: delete the row") is not
-    // yet wired in `submit_task_impl`. Once it is, this test can drop
-    // the explicit `delete_expired_dedup` call.
+    // TTL. Phase 9c wired §6.1 step 2 lazy cleanup into `submit_task`,
+    // so the resubmission below relies on that path — no manual
+    // `sweep_expired_dedup` call is needed.
     let harness = TestHarness::start_in_memory().await;
     harness.seed_namespace(NS).await;
 
     seed_expired_dedup(&harness, NS, "echo", "dedup-expired", b"old").await;
-    sweep_expired_dedup(&harness).await;
 
     let mut caller = harness.caller().await;
     let mut req = SubmitRequest::new(NS, "echo", Bytes::from_static(b"new"));
@@ -164,7 +156,8 @@ async fn expired_dedup_record_allows_resubmission() {
     // Act
     let outcome = caller.submit(req).await.expect("submit ok");
 
-    // Assert
+    // Assert: submit-time lazy cleanup deleted the expired row in the
+    // same transaction, allowing the new insert to proceed.
     match outcome {
         SubmitOutcome::Created { .. } => {}
         other => panic!("expected fresh Created after dedup TTL elapsed, got {other:?}"),
@@ -176,22 +169,6 @@ async fn expired_dedup_record_allows_resubmission() {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Delete every `idempotency_keys` row whose `expires_at` is in the past.
-/// Used by the expired-dedup test to simulate the lazy-cleanup hook the
-/// CP does not yet run inline at submit time.
-async fn sweep_expired_dedup(harness: &TestHarness) {
-    let conn = harness.open_sidecar_connection();
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64;
-    conn.execute(
-        "DELETE FROM idempotency_keys WHERE expires_at < ?1",
-        rusqlite::params![now_ms],
-    )
-    .expect("DELETE expired dedup");
-}
 
 async fn seed_expired_dedup(
     harness: &TestHarness,
@@ -236,11 +213,6 @@ async fn seed_expired_dedup(
     };
     tx.insert_task(task, dedup).await.expect("insert_task");
     tx.commit_dyn().await.expect("commit");
-
-    // The submit path's lazy-cleanup expects the dedup row's expires_at
-    // to be in the past. We confirm it via a sidecar read so the test is
-    // self-checking.
-    let _ = Arc::clone(&harness.state); // suppress unused-var on harness if no dependents follow.
 }
 
 async fn wait_for_terminal_status(

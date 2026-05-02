@@ -10,29 +10,30 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use grpc_client::Channel;
-use taskq_caller_sdk::{SubmitOutcome, SubmitRequest};
+use taskq_caller_sdk::{ClientError, SubmitOutcome, SubmitRequest};
 use taskq_integration_tests::{spawn_worker, TestHarness};
 use taskq_proto::task_admin_client::TaskAdminClient;
 use taskq_proto::{
     AdmitterKind, DisableNamespaceRequest, DispatcherKind, GetNamespaceQuotaRequest,
-    NamespaceQuota as WireQuota, PurgeTasksRequest, ReplayDeadLettersRequest, SemVer,
-    SetNamespaceQuotaRequest,
+    NamespaceQuota as WireQuota, PurgeTasksRequest, RejectReason as WireRejectReason,
+    ReplayDeadLettersRequest, SemVer, SetNamespaceQuotaRequest,
 };
 use taskq_worker_sdk::{ErrorClassRegistry, HandlerOutcome};
 
 const NS: &str = "test";
 
 #[tokio::test]
-async fn set_namespace_quota_persists_max_pending() {
+async fn set_namespace_quota_persists_and_enforces_max_pending() {
     // Arrange
     let harness = TestHarness::start_in_memory().await;
     harness.seed_namespace(NS).await;
     let mut admin = admin_client(&harness).await;
 
-    // Act: install a new quota with max_pending = 50.
+    // Act: install a new quota with max_pending = 2 so the third submit
+    // gets rejected at runtime.
     let mut quota = WireQuota::default();
     populate_minimal_quota(&mut quota, NS);
-    quota.max_pending = 50;
+    quota.max_pending = 2;
     let mut req = SetNamespaceQuotaRequest::default();
     req.client_version = Some(Box::new(sv()));
     req.quota = Some(Box::new(quota));
@@ -45,16 +46,35 @@ async fn set_namespace_quota_persists_max_pending() {
     get.client_version = Some(Box::new(sv()));
     get.namespace = Some(NS.into());
     let read_resp = admin.get_namespace_quota(get).await.unwrap().into_inner();
-
-    // Assert
     let read_quota = read_resp.quota.expect("quota present");
-    assert_eq!(read_quota.max_pending, 50);
+    assert_eq!(read_quota.max_pending, 2);
+
+    // No worker — the tasks stay in PENDING and pile up against the cap.
+    let mut caller = harness.caller().await;
+    let mut req1 = SubmitRequest::new(NS, "limited", Bytes::from_static(b"a"));
+    req1.idempotency_key = Some("max-pending-1".into());
+    let mut req2 = SubmitRequest::new(NS, "limited", Bytes::from_static(b"b"));
+    req2.idempotency_key = Some("max-pending-2".into());
+    let mut req3 = SubmitRequest::new(NS, "limited", Bytes::from_static(b"c"));
+    req3.idempotency_key = Some("max-pending-3".into());
+
+    // Assert: first two admit, the third fails with MAX_PENDING_EXCEEDED
+    // — runtime enforcement of the persisted quota.
+    caller.submit(req1).await.expect("first submit ok");
+    caller.submit(req2).await.expect("second submit ok");
+    let third = caller.submit(req3).await;
+    match third {
+        Err(ClientError::Rejected { reason, .. }) => {
+            assert_eq!(reason, WireRejectReason::MAX_PENDING_EXCEEDED);
+        }
+        other => panic!("expected MAX_PENDING_EXCEEDED rejection, got {other:?}"),
+    }
 
     harness.shutdown().await;
 }
 
 #[tokio::test]
-async fn disable_namespace_persists_disabled_flag() {
+async fn disable_namespace_persists_and_blocks_submits() {
     // Arrange
     let harness = TestHarness::start_in_memory().await;
     harness.seed_namespace(NS).await;
@@ -68,7 +88,7 @@ async fn disable_namespace_persists_disabled_flag() {
     let resp = admin.disable_namespace(req).await.unwrap().into_inner();
     assert!(resp.error.is_none(), "{:?}", resp.error);
 
-    // Assert: the `namespace_quota.disabled` column flipped to 1.
+    // The persisted flag flipped to 1.
     let conn = harness.open_sidecar_connection();
     let disabled: i64 = conn
         .query_row(
@@ -78,6 +98,20 @@ async fn disable_namespace_persists_disabled_flag() {
         )
         .expect("disabled column read");
     assert_eq!(disabled, 1);
+
+    // Assert: a fresh `SubmitTask` against the disabled namespace
+    // surfaces `NAMESPACE_DISABLED` — runtime gate enforces the persisted
+    // flag, not just the storage write.
+    let mut caller = harness.caller().await;
+    let mut submit_req = SubmitRequest::new(NS, "any", Bytes::from_static(b"x"));
+    submit_req.idempotency_key = Some("disabled-runtime-check".into());
+    let outcome = caller.submit(submit_req).await;
+    match outcome {
+        Err(ClientError::Rejected { reason, .. }) => {
+            assert_eq!(reason, WireRejectReason::NAMESPACE_DISABLED);
+        }
+        other => panic!("expected NAMESPACE_DISABLED rejection, got {other:?}"),
+    }
 
     harness.shutdown().await;
 }

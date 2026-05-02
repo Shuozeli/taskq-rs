@@ -254,6 +254,21 @@ mod tests {
             unreachable!("submit-path methods not exercised in admitter tests")
         }
 
+        fn delete_idempotency_key<'a>(
+            &'a mut self,
+            _ns: &'a Namespace,
+            _key: &'a IdempotencyKey,
+        ) -> StorageTxFuture<'a, Result<usize, StorageError>> {
+            unreachable!("submit-path methods not exercised in admitter tests")
+        }
+
+        fn is_namespace_disabled<'a>(
+            &'a mut self,
+            _ns: &'a Namespace,
+        ) -> StorageTxFuture<'a, Result<bool, StorageError>> {
+            unreachable!("submit-path methods not exercised in admitter tests")
+        }
+
         fn insert_task<'a>(
             &'a mut self,
             _task: NewTask,

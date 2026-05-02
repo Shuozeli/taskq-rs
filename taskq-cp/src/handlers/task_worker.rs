@@ -39,7 +39,6 @@ use taskq_storage::{
 
 use crate::handlers::retry::with_serializable_retry;
 use crate::state::{CpState, WakeOutcome};
-use crate::strategy::dispatcher::PullCtx;
 
 /// Worker-facing `TaskWorker` service handler.
 #[derive(Clone)]
@@ -518,69 +517,32 @@ async fn try_dispatch(
             let now = current_timestamp();
             let strategy = state.strategy_registry.for_namespace(&namespace);
 
-            // Default to PriorityFifo when no strategy is configured for
-            // the namespace; this matches the SQLite/Postgres backends'
-            // behaviour for the v1 reference deployment.
-            //
-            // The fallback (no-strategy) branch returns a `LockedTask`
-            // directly so we can build the dispatch response without a
-            // second `pick_and_lock_pending` call. The first pick already
-            // flipped the row to DISPATCHED; a second pick would not match
-            // because the row is no longer in `PENDING`/`WAITING_RETRY`.
-            // Phase 9b: this fix unblocks integration tests that run with
-            // an empty `StrategyRegistry`.
-            let picked_via_strategy: Option<taskq_storage::TaskId> =
-                if let Some(strategy) = strategy {
-                    let ctx = PullCtx {
-                        namespace_filter: vec![namespace.clone()],
-                        task_types: task_types.clone(),
-                        now,
-                    };
-                    strategy.dispatcher.pick_next(&ctx, &mut *tx).await
-                } else {
-                    None
-                };
-            let direct_locked: Option<taskq_storage::LockedTask> = if strategy.is_none() {
-                use taskq_storage::{NamespaceFilter, PickCriteria, PickOrdering, TaskTypeFilter};
-                let criteria = PickCriteria {
-                    namespace_filter: NamespaceFilter::Single(namespace.clone()),
-                    task_types_filter: TaskTypeFilter::AnyOf(task_types.clone()),
-                    ordering: PickOrdering::PriorityFifo,
-                    now,
-                };
-                tx.pick_and_lock_pending(criteria).await?
-            } else {
-                None
-            };
+            // Resolve the `PickOrdering` from the per-namespace
+            // dispatcher. `for_namespace` always returns `Some` since
+            // Phase 9c — the registry's implicit default is
+            // `(MaxPendingAdmitter, PriorityFifoDispatcher)` — so we
+            // always have an ordering to honour.
+            let ordering = strategy
+                .map(|s| s.dispatcher.pick_ordering())
+                .unwrap_or(taskq_storage::PickOrdering::PriorityFifo);
 
-            // Fast path: no-strategy fallback already produced the
-            // `LockedTask`. Otherwise we must re-pick (the strategy trait
-            // only returns the TaskId today; phase-5d may collapse this).
-            let locked = if let Some(l) = direct_locked {
-                l
-            } else {
-                let task_id = match picked_via_strategy {
-                    Some(id) => id,
-                    None => {
-                        let _ = tx.rollback_dyn().await;
-                        return Ok(None);
-                    }
-                };
-                use taskq_storage::{NamespaceFilter, PickCriteria, PickOrdering, TaskTypeFilter};
-                let criteria = PickCriteria {
-                    namespace_filter: NamespaceFilter::Single(namespace.clone()),
-                    task_types_filter: TaskTypeFilter::AnyOf(task_types.clone()),
-                    ordering: PickOrdering::PriorityFifo,
-                    now,
-                };
-                match tx.pick_and_lock_pending(criteria).await? {
-                    Some(l) if l.task_id == task_id => l,
-                    _ => {
-                        // Another waiter beat us to the row in this dispatch
-                        // race — return None and let the caller re-wait.
-                        let _ = tx.rollback_dyn().await;
-                        return Ok(None);
-                    }
+            // Single `pick_and_lock_pending` call — the dispatcher's
+            // chosen ordering selects the row and the same transaction
+            // locks it. Calling `pick_next` again would re-issue
+            // `pick_and_lock_pending` and miss the now-DISPATCHED row,
+            // so we centralise the lock here.
+            use taskq_storage::{NamespaceFilter, PickCriteria, TaskTypeFilter};
+            let criteria = PickCriteria {
+                namespace_filter: NamespaceFilter::Single(namespace.clone()),
+                task_types_filter: TaskTypeFilter::AnyOf(task_types.clone()),
+                ordering,
+                now,
+            };
+            let locked = match tx.pick_and_lock_pending(criteria).await? {
+                Some(l) => l,
+                None => {
+                    let _ = tx.rollback_dyn().await;
+                    return Ok(None);
                 }
             };
 
@@ -966,49 +928,40 @@ async fn report_failure_impl(
     };
     let metrics = state.metrics.clone();
 
-    // Phase 5b: §6.5 mapping needs the task's `attempt_number`,
-    // `max_retries`, `expires_at`, and resolved `RetryConfig` to compute
-    // `retry_after`. Without a `get_task_by_id` storage method we cannot
-    // read those fields, so we surface the simpler classification: a
-    // non-retryable failure goes straight to FAILED_NONRETRYABLE; a
-    // retryable failure goes to WAITING_RETRY with `retry_after = now +
-    // initial_backoff(1s)` as a conservative seed. The per-task retry
-    // config is preserved on the task row at submit time and Phase 5c will
-    // read it through.
-    let outcome = if retryable {
-        let retry_after = Timestamp::from_unix_millis(
-            now.as_unix_millis() + 1_000, // conservative 1s initial seed
-        );
-        TaskOutcome::WaitingRetry {
-            error_class: error_class.clone(),
-            error_message: error_message.clone(),
-            error_details: error_details.clone(),
-            retry_after,
-            recorded_at: now,
-        }
-    } else {
-        TaskOutcome::FailedNonretryable {
-            error_class: error_class.clone(),
-            error_message: error_message.clone(),
-            error_details: error_details.clone(),
-            recorded_at: now,
-        }
-    };
-
     let result = with_serializable_retry(&metrics, "report_failure", || {
         let state = Arc::clone(&state);
         let lease_ref = lease_ref.clone();
-        let outcome = outcome.clone();
+        let error_class = error_class.clone();
+        let error_message = error_message.clone();
+        let error_details = error_details.clone();
         async move {
             let mut tx = state.storage.begin_dyn().await?;
-            let task_meta = match tx.get_task_by_id(task_id).await {
-                Ok(Some(t)) => Some((t.namespace.clone(), t.task_type.clone())),
-                _ => None,
-            };
+            // §6.5 mapping requires the task's per-task retry config plus
+            // `expires_at` and `max_retries`. Read once, classify, then
+            // hand the resulting `TaskOutcome` to `complete_task`. The
+            // read participates in the same SERIALIZABLE transaction as
+            // the state transition.
+            let task = tx.get_task_by_id(task_id).await?;
+            let task_meta = task
+                .as_ref()
+                .map(|t| (t.namespace.clone(), t.task_type.clone()));
+            let mapping = classify_failure(
+                task.as_ref(),
+                retryable,
+                req.attempt_number,
+                now,
+                &error_class,
+                &error_message,
+                &error_details,
+            );
+            let outcome = mapping.outcome.clone();
             match tx.complete_task(&lease_ref, outcome).await {
                 Ok(()) => {
                     tx.commit_dyn().await?;
-                    Ok(ReportFlow::Settled { task_meta })
+                    Ok(ReportFlow::Settled {
+                        task_meta,
+                        terminal: mapping.terminal,
+                    })
                 }
                 Err(StorageError::NotFound) => {
                     let _ = tx.rollback_dyn().await;
@@ -1024,29 +977,33 @@ async fn report_failure_impl(
     .await;
 
     match result {
-        Ok(ReportFlow::Settled { task_meta }) => {
-            let final_status = if retryable {
-                TerminalState::WAITING_RETRY
-            } else {
-                TerminalState::FAILED_NONRETRYABLE
-            };
+        Ok(ReportFlow::Settled {
+            task_meta,
+            terminal,
+        }) => {
             // §11.3 emit-site discipline: outcome label distinguishes the
-            // two terminal/retry paths so dashboards segment cleanly.
-            let outcome_label = if retryable {
-                "retryable_fail"
-            } else {
-                "nonretryable_fail"
+            // four classifications (waiting-retry vs. each terminal kind).
+            let outcome_label = match terminal {
+                TerminalClassification::WaitingRetry { .. } => "retryable_fail",
+                TerminalClassification::FailedNonretryable => "nonretryable_fail",
+                TerminalClassification::FailedExhausted => "retries_exhausted",
+                TerminalClassification::Expired => "expired",
             };
             metrics
                 .complete_total
                 .add(1, &lifecycle_labels(task_meta.as_ref(), outcome_label));
             // `taskq_terminal_total` only fires on a true terminal — retry
             // is not terminal.
-            if !retryable {
-                metrics.terminal_total.add(
-                    1,
-                    &terminal_labels(task_meta.as_ref(), "FAILED_NONRETRYABLE"),
-                );
+            let terminal_label = match terminal {
+                TerminalClassification::WaitingRetry { .. } => None,
+                TerminalClassification::FailedNonretryable => Some("FAILED_NONRETRYABLE"),
+                TerminalClassification::FailedExhausted => Some("FAILED_EXHAUSTED"),
+                TerminalClassification::Expired => Some("EXPIRED"),
+            };
+            if let Some(state_label) = terminal_label {
+                metrics
+                    .terminal_total
+                    .add(1, &terminal_labels(task_meta.as_ref(), state_label));
             }
             // `taskq_error_class_total{namespace, task_type, error_class}`.
             if !error_class.is_empty() {
@@ -1063,7 +1020,7 @@ async fn report_failure_impl(
                     ],
                 );
             }
-            if retryable {
+            if matches!(terminal, TerminalClassification::WaitingRetry { .. }) {
                 let (ns, tt) = match task_meta.as_ref() {
                     Some((n, t)) => (n.as_str().to_owned(), t.as_str().to_owned()),
                     None => ("unknown".to_owned(), "unknown".to_owned()),
@@ -1076,13 +1033,17 @@ async fn report_failure_impl(
                     ],
                 );
             }
+            let final_status = match terminal {
+                TerminalClassification::WaitingRetry { .. } => TerminalState::WAITING_RETRY,
+                TerminalClassification::FailedNonretryable => TerminalState::FAILED_NONRETRYABLE,
+                TerminalClassification::FailedExhausted => TerminalState::FAILED_EXHAUSTED,
+                TerminalClassification::Expired => TerminalState::EXPIRED,
+            };
             let mut resp = ReportFailureResponse::default();
             resp.task_id = Some(task_id_str);
             resp.final_status = final_status;
-            if retryable {
-                resp.retry_after = Some(Box::new(timestamp_proto(Timestamp::from_unix_millis(
-                    now.as_unix_millis() + 1_000,
-                ))));
+            if let TerminalClassification::WaitingRetry { retry_after } = terminal {
+                resp.retry_after = Some(Box::new(timestamp_proto(retry_after)));
             }
             resp.server_version = Some(Box::new(server_semver()));
             Ok(resp)
@@ -1112,10 +1073,151 @@ async fn report_failure_impl(
 enum ReportFlow {
     Settled {
         task_meta: Option<(Namespace, TaskType)>,
+        terminal: TerminalClassification,
     },
     LeaseExpired {
         task_meta: Option<(Namespace, TaskType)>,
     },
+}
+
+/// One-row classification result of `classify_failure`. Records the §6.5
+/// terminal-state hit and carries the `TaskOutcome` to hand to
+/// `complete_task`. `terminal` and `outcome` are kept in lockstep — caller
+/// uses the former for metric/wire labels and the latter for the storage
+/// transition.
+#[derive(Clone)]
+struct FailureMapping {
+    terminal: TerminalClassification,
+    outcome: TaskOutcome,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalClassification {
+    WaitingRetry { retry_after: Timestamp },
+    FailedNonretryable,
+    FailedExhausted,
+    Expired,
+}
+
+/// Apply the `design.md` §6.5 mapping table for a `ReportFailure` against
+/// the persisted task row. When `task` is `None` (the row was deleted
+/// between `AcquireTask` and `ReportFailure` — extremely unlikely under
+/// SERIALIZABLE) we treat the failure as terminal nonretryable, since we
+/// have nothing to budget against.
+fn classify_failure(
+    task: Option<&taskq_storage::Task>,
+    retryable: bool,
+    attempt_number: u32,
+    now: Timestamp,
+    error_class: &str,
+    error_message: &str,
+    error_details: &Bytes,
+) -> FailureMapping {
+    if !retryable {
+        return FailureMapping {
+            terminal: TerminalClassification::FailedNonretryable,
+            outcome: TaskOutcome::FailedNonretryable {
+                error_class: error_class.to_owned(),
+                error_message: error_message.to_owned(),
+                error_details: error_details.clone(),
+                recorded_at: now,
+            },
+        };
+    }
+    let Some(task) = task else {
+        // Defensive fallback: classify as nonretryable so we don't leave
+        // the task in a quiet WAITING_RETRY without retry_after evidence.
+        return FailureMapping {
+            terminal: TerminalClassification::FailedNonretryable,
+            outcome: TaskOutcome::FailedNonretryable {
+                error_class: error_class.to_owned(),
+                error_message: error_message.to_owned(),
+                error_details: error_details.clone(),
+                recorded_at: now,
+            },
+        };
+    };
+    if attempt_number >= task.max_retries {
+        return FailureMapping {
+            terminal: TerminalClassification::FailedExhausted,
+            outcome: TaskOutcome::FailedExhausted {
+                error_class: error_class.to_owned(),
+                error_message: error_message.to_owned(),
+                error_details: error_details.clone(),
+                recorded_at: now,
+            },
+        };
+    }
+    let retry_after = compute_retry_after(
+        now,
+        attempt_number,
+        task.retry_initial_ms,
+        task.retry_max_ms,
+        task.retry_coefficient,
+    );
+    if retry_after.as_unix_millis() > task.expires_at.as_unix_millis() {
+        return FailureMapping {
+            terminal: TerminalClassification::Expired,
+            outcome: TaskOutcome::Expired {
+                error_class: error_class.to_owned(),
+                error_message: error_message.to_owned(),
+                error_details: error_details.clone(),
+                recorded_at: now,
+            },
+        };
+    }
+    FailureMapping {
+        terminal: TerminalClassification::WaitingRetry { retry_after },
+        outcome: TaskOutcome::WaitingRetry {
+            error_class: error_class.to_owned(),
+            error_message: error_message.to_owned(),
+            error_details: error_details.clone(),
+            retry_after,
+            recorded_at: now,
+        },
+    }
+}
+
+/// `design.md` §6.5 backoff math:
+///
+/// ```text
+/// delay = min(initial_ms * coefficient^attempt, max_ms)
+/// retry_after = now + rand(delay/2, delay*3/2)
+/// ```
+///
+/// `coefficient ^ attempt` saturates to `max_ms` so a runaway exponent
+/// can't blow past `u64::MAX`. The full-jitter window
+/// `[delay/2, delay*3/2]` is sampled uniformly so the §6.5 contract holds
+/// even at attempt=0.
+fn compute_retry_after(
+    now: Timestamp,
+    attempt_number: u32,
+    initial_ms: u64,
+    max_ms: u64,
+    coefficient: f32,
+) -> Timestamp {
+    use rand::Rng;
+
+    let initial = initial_ms.max(1) as f64;
+    let coeff = if coefficient.is_finite() && coefficient > 0.0 {
+        coefficient as f64
+    } else {
+        2.0
+    };
+    let factor = coeff.powi(attempt_number as i32);
+    let raw = initial * factor;
+    let max = max_ms.max(initial as u64) as f64;
+    let delay = if raw.is_finite() {
+        raw.min(max).max(1.0)
+    } else {
+        max
+    };
+    let half = (delay / 2.0).max(1.0);
+    let three_halves = (delay * 1.5).max(half + 1.0);
+    let mut rng = rand::thread_rng();
+    let jittered = rng.gen_range(half..three_halves);
+    let delay_ms = jittered.round() as i64;
+    Timestamp::from_unix_millis(now.as_unix_millis().saturating_add(delay_ms))
 }
 
 // ---------------------------------------------------------------------------

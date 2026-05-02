@@ -785,6 +785,47 @@ impl<'a> StorageTx for PostgresTx<'a> {
         Ok(dropped)
     }
 
+    async fn delete_idempotency_key(
+        &mut self,
+        namespace: &Namespace,
+        key: &IdempotencyKey,
+    ) -> Result<usize> {
+        // §6.1 step 2 lazy cleanup: drop every dedup row matching
+        // `(namespace, key)`. The Postgres PK is `(namespace, key,
+        // expires_at)` so multiple rows could exist if the cleanup job
+        // fell behind — the `DELETE` removes them all, including any
+        // already-expired row that `lookup_idempotency` filtered out.
+        let deleted = self
+            .conn
+            .execute(
+                "DELETE FROM idempotency_keys WHERE namespace = $1 AND key = $2",
+                &[&namespace.as_str(), &key.as_str()],
+            )
+            .await
+            .map_err(map_db_error)?;
+        Ok(deleted as usize)
+    }
+
+    async fn is_namespace_disabled(&mut self, namespace: &Namespace) -> Result<bool> {
+        // §6.1 step 1 admit-time gate: read the `disabled` flag inline. A
+        // missing row counts as "not disabled" — `system_default`
+        // inheritance is handled by `get_namespace_quota`, but the
+        // disabled flag is per-row.
+        let row = self
+            .conn
+            .query_opt(
+                "SELECT disabled FROM namespace_quota WHERE namespace = $1",
+                &[&namespace.as_str()],
+            )
+            .await
+            .map_err(map_db_error)?;
+        let disabled: bool = match row {
+            Some(r) => r.get(0),
+            None => false,
+        };
+        Ok(disabled)
+    }
+
     // ========================================================================
     // Admin / reads
     // ========================================================================

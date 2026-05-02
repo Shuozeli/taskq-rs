@@ -713,6 +713,41 @@ impl StorageTx for SqliteTx {
         Ok(deleted)
     }
 
+    async fn delete_idempotency_key(
+        &mut self,
+        namespace: &Namespace,
+        key: &IdempotencyKey,
+    ) -> StorageResult<usize> {
+        // §6.1 step 2 lazy cleanup: drop the dedup row regardless of its
+        // `expires_at`. SQLite's `idempotency_keys` PK is `(namespace,
+        // key)` so at most one row exists for the pair.
+        let deleted = self
+            .conn()
+            .execute(
+                "DELETE FROM idempotency_keys WHERE namespace = ?1 AND key = ?2",
+                params![namespace.as_str(), key.as_str()],
+            )
+            .map_err(map_sql_error)?;
+        Ok(deleted)
+    }
+
+    async fn is_namespace_disabled(&mut self, namespace: &Namespace) -> StorageResult<bool> {
+        // §6.1 step 1 admit-time gate: read the `disabled` flag inline. A
+        // missing row counts as "not disabled" — the namespace either has
+        // no quota row yet or inherits from `system_default`, neither of
+        // which carries the disabled flag through the merge path.
+        let row: Option<i64> = self
+            .conn()
+            .query_row(
+                "SELECT disabled FROM namespace_quota WHERE namespace = ?1",
+                params![namespace.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(map_sql_error)?;
+        Ok(row.unwrap_or(0) != 0)
+    }
+
     // ------------------------------------------------------------------------
     // Admin / reads
     // ------------------------------------------------------------------------
