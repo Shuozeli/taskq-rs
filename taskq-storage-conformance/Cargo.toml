@@ -12,4 +12,10 @@ publish = false
 taskq-storage = { path = "../taskq-storage" }
 # Async test runtime. `rt` + `macros` for `#[tokio::test]`; `test-util` lets
 # tests pause/advance time without sleeping when the suite needs it.
-tokio = { version = "1", features = ["rt", "macros", "test-util"] }
+tokio = { version = "1", features = ["rt", "macros", "sync", "time", "test-util"] }
+# Future combinators (timeout, etc.) used inside the conformance bodies.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# Stream consumption for the subscribe_pending ordering test.
+futures-core = "0.3"
+# Opaque payload bytes carried across the trait boundary.
+bytes = "1"

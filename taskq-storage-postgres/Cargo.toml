@@ -37,3 +37,4 @@ thiserror = "1"
 [dev-dependencies]
 # Smoke tests use `tokio::test`.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+taskq-storage-conformance = { path = "../taskq-storage-conformance" }
