@@ -8,3 +8,40 @@ description = "Worker-side Rust SDK for the taskq-rs gRPC contract"
 publish = false
 
 [dependencies]
+# Generated wire types and the typed gRPC client (`task_worker_client::TaskWorkerClient`).
+taskq-proto = { path = "../taskq-proto" }
+
+# pure-grpc-rs runtime crates. The client speaks `Status`/`Code` in errors and
+# uses `grpc_client::Channel` under the hood (already pulled in by taskq-proto's
+# generated `<service>_client::TaskWorkerClient::connect`). We pin to the same
+# revision so types unify across the workspace.
+grpc-core = { git = "https://github.com/Shuozeli/pure-grpc-rs.git", rev = "58c35d952a414a7229622c7d1306acf6597e8170", default-features = false }
+grpc-client = { git = "https://github.com/Shuozeli/pure-grpc-rs.git", rev = "58c35d952a414a7229622c7d1306acf6597e8170" }
+
+# Async runtime + signal handling for SIGTERM/SIGINT in `run_until_shutdown`.
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+
+# Cheap byte buffers for `payload`/`result_payload`/`details`.
+bytes = "1"
+
+# Endpoint URI parsing.
+http = "1"
+
+# Structured logs and trace propagation. `tracing-opentelemetry` is in scope
+# even though the SDK only emits `tracing::info!`/`warn!` events for now;
+# user-supplied tracing-subscribers wired through the OTel pipeline pick the
+# events up via the global subscriber.
+tracing = "0.1"
+opentelemetry = "0.24"
+tracing-opentelemetry = "0.25"
+
+# Typed errors at every public boundary.
+thiserror = "1"
+
+# Stream trait surface used by the long-poll acquire loop's wake/cancel race.
+futures-core = "0.3"
+futures = "0.3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
