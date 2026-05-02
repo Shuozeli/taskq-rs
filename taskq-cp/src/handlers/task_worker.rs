@@ -521,14 +521,26 @@ async fn try_dispatch(
             // Default to PriorityFifo when no strategy is configured for
             // the namespace; this matches the SQLite/Postgres backends'
             // behaviour for the v1 reference deployment.
-            let picked = if let Some(strategy) = strategy {
-                let ctx = PullCtx {
-                    namespace_filter: vec![namespace.clone()],
-                    task_types: task_types.clone(),
-                    now,
+            //
+            // The fallback (no-strategy) branch returns a `LockedTask`
+            // directly so we can build the dispatch response without a
+            // second `pick_and_lock_pending` call. The first pick already
+            // flipped the row to DISPATCHED; a second pick would not match
+            // because the row is no longer in `PENDING`/`WAITING_RETRY`.
+            // Phase 9b: this fix unblocks integration tests that run with
+            // an empty `StrategyRegistry`.
+            let picked_via_strategy: Option<taskq_storage::TaskId> =
+                if let Some(strategy) = strategy {
+                    let ctx = PullCtx {
+                        namespace_filter: vec![namespace.clone()],
+                        task_types: task_types.clone(),
+                        now,
+                    };
+                    strategy.dispatcher.pick_next(&ctx, &mut *tx).await
+                } else {
+                    None
                 };
-                strategy.dispatcher.pick_next(&ctx, &mut *tx).await
-            } else {
+            let direct_locked: Option<taskq_storage::LockedTask> = if strategy.is_none() {
                 use taskq_storage::{NamespaceFilter, PickCriteria, PickOrdering, TaskTypeFilter};
                 let criteria = PickCriteria {
                     namespace_filter: NamespaceFilter::Single(namespace.clone()),
@@ -536,31 +548,24 @@ async fn try_dispatch(
                     ordering: PickOrdering::PriorityFifo,
                     now,
                 };
-                tx.pick_and_lock_pending(criteria)
-                    .await?
-                    .map(|locked| locked.task_id)
+                tx.pick_and_lock_pending(criteria).await?
+            } else {
+                None
             };
 
-            let task_id = match picked {
-                Some(id) => id,
-                None => {
-                    let _ = tx.rollback_dyn().await;
-                    return Ok(None);
-                }
-            };
-
-            // The strategy returned a TaskId only; we need the locked-row
-            // payload. Phase 5b's strategy traits drop the `LockedTask` after
-            // returning; for the dispatch-record + lease-write step we
-            // re-pick (idempotent in the same transaction since the row is
-            // now locked). When the strategy already locked, the second
-            // call returns the same row immediately.
-            //
-            // TODO(phase-5d): widen the dispatcher trait to return the full
-            // LockedTask so we don't pay a second pick. v1's strategies all
-            // forward the LockedTask anyway; the trait collapse just hasn't
-            // landed.
-            let locked = {
+            // Fast path: no-strategy fallback already produced the
+            // `LockedTask`. Otherwise we must re-pick (the strategy trait
+            // only returns the TaskId today; phase-5d may collapse this).
+            let locked = if let Some(l) = direct_locked {
+                l
+            } else {
+                let task_id = match picked_via_strategy {
+                    Some(id) => id,
+                    None => {
+                        let _ = tx.rollback_dyn().await;
+                        return Ok(None);
+                    }
+                };
                 use taskq_storage::{NamespaceFilter, PickCriteria, PickOrdering, TaskTypeFilter};
                 let criteria = PickCriteria {
                     namespace_filter: NamespaceFilter::Single(namespace.clone()),

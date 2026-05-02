@@ -1,0 +1,50 @@
+[package]
+name = "taskq-integration-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "End-to-end integration tests that boot the taskq-rs CP in-process and exercise it through the caller and worker SDKs"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# CP under test plus the SDKs the harness composes.
+taskq-cp = { path = "../taskq-cp" }
+taskq-caller-sdk = { path = "../taskq-caller-sdk" }
+taskq-worker-sdk = { path = "../taskq-worker-sdk" }
+taskq-storage = { path = "../taskq-storage" }
+taskq-storage-sqlite = { path = "../taskq-storage-sqlite" }
+taskq-proto = { path = "../taskq-proto" }
+
+# pure-grpc-rs runtime types pinned to the same revision the CP/SDKs use so
+# `Channel`, `Status`, generated client structs unify across crate
+# boundaries.
+grpc-core = { git = "https://github.com/Shuozeli/pure-grpc-rs.git", rev = "58c35d952a414a7229622c7d1306acf6597e8170", default-features = false }
+grpc-client = { git = "https://github.com/Shuozeli/pure-grpc-rs.git", rev = "58c35d952a414a7229622c7d1306acf6597e8170" }
+
+# Async runtime; tests need full features (signal, time, sync, macros).
+tokio = { version = "1", features = ["full", "test-util"] }
+
+# Cheap byte buffers shared with the SDKs.
+bytes = "1"
+
+# Temp-dir helper for the on-disk SQLite path the harness owns.
+tempfile = "3"
+
+# Endpoint URI parsing.
+http = "1"
+
+# Sidecar SQLite reader for the audit-log helper. Pinned to the version the
+# storage crate already uses so cargo unifies the libsqlite3 build.
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Tracing helpers (subscriber init in tests is best-effort; harness itself
+# does not configure tracing).
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Direct UUID parsing in reaper tests (worker_id round-trip).
+uuid = { version = "1", features = ["v4", "v7"] }

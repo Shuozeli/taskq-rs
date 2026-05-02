@@ -129,8 +129,11 @@ async fn run_reaper_b(state: Arc<CpState>, mut shutdown: ShutdownReceiver) {
 /// row's persisted `traceparent` is non-empty, the event includes it so
 /// log-aggregation tooling can correlate the reclaim back to the original
 /// task's trace (`design.md` §11.2).
+///
+/// Phase 9b helper: `pub` so integration tests can drive a deterministic
+/// tick instead of waiting on the 5s polling cadence.
 #[tracing::instrument(name = "taskq.reaper_a", skip_all)]
-async fn reaper_a_tick(state: Arc<CpState>) -> Result<(), StorageError> {
+pub async fn reaper_a_tick(state: Arc<CpState>) -> Result<(), StorageError> {
     let now = current_timestamp();
     let metrics = state.metrics.clone();
 
@@ -214,8 +217,11 @@ async fn reclaim_one_a(
 /// `CpConfig::lease_window_seconds`; rows whose worker's last heartbeat
 /// predates `now - lease_window` are reclaimed and the worker is stamped
 /// `declared_dead_at = NOW()`.
+///
+/// Phase 9b helper: `pub` so integration tests can drive a deterministic
+/// tick instead of waiting on the 10s polling cadence.
 #[tracing::instrument(name = "taskq.reaper_b", skip_all)]
-async fn reaper_b_tick(state: Arc<CpState>) -> Result<(), StorageError> {
+pub async fn reaper_b_tick(state: Arc<CpState>) -> Result<(), StorageError> {
     let now = current_timestamp();
     let lease_window = Duration::from_secs(u64::from(state.config.lease_window_seconds));
     let stale_before = Timestamp::from_unix_millis(

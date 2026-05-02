@@ -45,6 +45,58 @@ pub const CLIENT_VERSION_HEADER: &str = "x-taskq-client-version";
 /// with a pluggable validator.
 pub const AUTH_HEADER: &str = "authorization";
 
+/// Phase 9b helper: build the same `Router` that [`serve`] uses but bind to
+/// an OS-assigned port (`127.0.0.1:0`), spawn the server task, and return
+/// the bound `SocketAddr` plus the `JoinHandle`. Integration tests use this
+/// to stand up a CP that listens on a random port without going through the
+/// `CpConfig::bind_addr` path (which would force the test to know the port
+/// in advance).
+///
+/// The caller owns the returned `JoinHandle`; aborting it tears the server
+/// down.
+pub async fn serve_in_process(
+    state: Arc<CpState>,
+    shutdown: ShutdownReceiver,
+) -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>)> {
+    let task_queue = TaskQueueHandler::new(Arc::clone(&state));
+    let task_worker = TaskWorkerHandler::new(Arc::clone(&state));
+    let task_admin = TaskAdminHandler::new(Arc::clone(&state));
+
+    let router = Router::new()
+        .add_service("taskq.v1.TaskQueue", TaskQueueServer::new(task_queue))
+        .add_service("taskq.v1.TaskWorker", TaskWorkerServer::new(task_worker))
+        .add_service("taskq.v1.TaskAdmin", TaskAdminServer::new(task_admin));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(|err| CpError::transport(err.to_string()))?;
+    let addr = listener
+        .local_addr()
+        .map_err(|err| CpError::transport(err.to_string()))?;
+
+    let handle = tokio::spawn(async move {
+        // The pure-grpc-rs server's public surface that takes a pre-bound
+        // listener (`serve_with_listener`) does not accept a shutdown
+        // signal, so we race the listener-bound serve future against the
+        // shutdown receiver and drop it on shutdown. Dropping cancels the
+        // accept loop, which is the same effect `serve_with_shutdown`
+        // achieves with its internal `tokio::select!`.
+        let serve_fut = Server::builder().serve_with_listener(listener, router);
+        tokio::select! {
+            res = serve_fut => {
+                if let Err(err) = res {
+                    tracing::warn!(error = %err, "in-process gRPC server exited with error");
+                }
+            }
+            _ = wait_for_shutdown(shutdown) => {
+                tracing::info!("in-process gRPC server shutting down");
+            }
+        }
+    });
+
+    Ok((addr, handle))
+}
+
 /// Build and serve the gRPC router. Returns when the shutdown signal
 /// fires.
 ///

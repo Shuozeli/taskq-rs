@@ -49,7 +49,7 @@ pub use crate::config::{CpConfig, OtelExporterConfig, StorageBackendConfig};
 pub use crate::error::{CpError, Result};
 pub use crate::handlers::{TaskAdminHandler, TaskQueueHandler, TaskWorkerHandler};
 pub use crate::observability::{init as init_observability, MetricsHandle, ObservabilityState};
-pub use crate::server::serve;
+pub use crate::server::{serve, serve_in_process};
 pub use crate::shutdown::{
     channel as shutdown_channel, wait_for_signal, ShutdownReceiver, ShutdownSender,
 };
