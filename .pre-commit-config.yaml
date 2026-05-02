@@ -23,3 +23,10 @@ repos:
         language: system
         types: [rust]
         pass_filenames: false
+
+      - id: cargo-test-compile
+        name: cargo test --no-run
+        entry: cargo test --workspace --no-run
+        language: system
+        types: [rust]
+        pass_filenames: false

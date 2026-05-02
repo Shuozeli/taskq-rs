@@ -14,7 +14,7 @@ jobs:
     name: Format
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           submodules: recursive
 
@@ -29,7 +29,7 @@ jobs:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           submodules: recursive
 
@@ -43,10 +43,10 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
-    name: Test (compile)
+    name: Test (workspace)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           submodules: recursive
 
@@ -54,14 +54,46 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Compile tests
-        run: cargo test --workspace --no-run
+      - name: Run tests
+        run: cargo test --workspace --no-fail-fast
+
+  postgres:
+    name: Postgres conformance
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TASKQ_PG_TEST_URL_BASE: "host=localhost port=5432 user=postgres password=postgres dbname=postgres"
+      TASKQ_PG_TEST_URL: "host=localhost port=5432 user=postgres password=postgres dbname=taskq_test_phase3"
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run Postgres backend tests (smoke + conformance)
+        run: cargo test -p taskq-storage-postgres --no-fail-fast -- --include-ignored
 
   build:
     name: Build (release)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           submodules: recursive
 
