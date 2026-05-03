@@ -1,0 +1,25 @@
+# Default CP config used by docker/compose.*.yml.
+#
+# Tests override `bind_addr` / `health_addr` per replica via env vars
+# (`TASKQ_BIND_ADDR`, `TASKQ_HEALTH_ADDR`). The Postgres URL points at
+# the `postgres` service name on the compose network.
+
+bind_addr = "0.0.0.0:50051"
+health_addr = "0.0.0.0:9090"
+
+[storage_backend]
+kind = "postgres"
+url = "host=postgres port=5432 user=postgres password=postgres dbname=taskq"
+pool_size = 8
+
+[otel_exporter]
+kind = "disabled"
+
+# Tighter than production so reaper / long-poll scenarios fit inside a
+# CI-budget run.
+quota_cache_ttl_seconds          = 1
+long_poll_default_timeout_seconds = 5
+long_poll_max_seconds             = 10
+belt_and_suspenders_seconds       = 1
+waiter_limit_per_replica          = 256
+lease_window_seconds              = 2

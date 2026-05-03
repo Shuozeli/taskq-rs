@@ -28,6 +28,9 @@ pub fn map_db_error(err: tokio_postgres::Error) -> StorageError {
             _ => {}
         }
     }
+    // Surface the underlying SQLSTATE + message so operators can debug
+    // backend errors without enabling tokio_postgres trace logging.
+    tracing::warn!(error = %err, sqlstate = ?err.code(), "postgres backend error");
     StorageError::backend(err)
 }
 

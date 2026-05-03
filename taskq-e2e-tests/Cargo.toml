@@ -1,0 +1,31 @@
+[package]
+name = "taskq-e2e-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "End-to-end Docker-Compose tests that exercise built taskq-cp + taskq-cli binaries against a real Postgres container, using the caller and worker SDKs over real gRPC."
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+taskq-caller-sdk = { path = "../taskq-caller-sdk" }
+taskq-worker-sdk = { path = "../taskq-worker-sdk" }
+taskq-proto = { path = "../taskq-proto" }
+taskq-storage = { path = "../taskq-storage" }
+
+grpc-core = { git = "https://github.com/Shuozeli/pure-grpc-rs.git", rev = "58c35d952a414a7229622c7d1306acf6597e8170", default-features = false }
+grpc-client = { git = "https://github.com/Shuozeli/pure-grpc-rs.git", rev = "58c35d952a414a7229622c7d1306acf6597e8170" }
+
+tokio = { version = "1", features = ["full"] }
+tokio-postgres = { version = "0.7", features = ["with-uuid-1"] }
+bytes = "1"
+http = "1"
+anyhow = "1"
+thiserror = "1"
+async-trait = "0.1"
+uuid = { version = "1", features = ["v4", "v7"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

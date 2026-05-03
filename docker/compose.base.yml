@@ -1,0 +1,41 @@
+# Base compose: 1 Postgres + 1 taskq-cp.
+#
+# Used by the happy-path / single-replica E2E tests. The CP runs with
+# `--auto-migrate` so the schema is created on first boot.
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: taskq
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d taskq"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+    ports:
+      - "${TASKQ_E2E_PG_PORT:-55432}:5432"
+
+  cp:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.cp
+    image: taskq-rs/cp:e2e
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      RUST_LOG: "${RUST_LOG:-info,taskq_cp=debug,taskq_storage_postgres=debug}"
+    volumes:
+      - ./cp-config.toml:/etc/taskq/cp.toml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9090/readyz || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+    ports:
+      - "${TASKQ_E2E_CP_PORT:-50051}:50051"
+      - "${TASKQ_E2E_HEALTH_PORT:-9090}:9090"

@@ -852,12 +852,17 @@ impl<'a> StorageTx for PostgresTx<'a> {
         // §11.4: append-only insert in same transaction.
         //
         // `request_summary` arrives as opaque bytes per the trait contract.
-        // We pass them as a UTF-8 string with `::jsonb` so Postgres rejects
-        // non-JSON input via SQLSTATE 22P02 (mapped to `BackendError`).
+        // Parse to `serde_json::Value` so tokio_postgres serializes it as
+        // jsonb directly (the column type) — passing `&str` with a `$5::jsonb`
+        // SQL cast doesn't work because the prepared-statement type
+        // inference reads the cast target and rejects `&str` for jsonb.
         let timestamp = timestamp_to_chrono(entry.timestamp);
-        let summary_str = std::str::from_utf8(entry.request_summary.as_ref()).map_err(|e| {
-            StorageError::ConstraintViolation(format!("audit_log.request_summary not UTF-8: {e}"))
-        })?;
+        let summary_value: serde_json::Value =
+            serde_json::from_slice(entry.request_summary.as_ref()).map_err(|e| {
+                StorageError::ConstraintViolation(format!(
+                    "audit_log.request_summary is not valid JSON: {e}"
+                ))
+            })?;
         let request_hash = entry.request_hash.to_vec();
         let namespace_str = entry.namespace.as_ref().map(|n| n.as_str().to_owned());
 
@@ -865,13 +870,13 @@ impl<'a> StorageTx for PostgresTx<'a> {
             .execute(
                 "INSERT INTO audit_log (\
                     timestamp, actor, rpc, namespace, request_summary, result, request_hash) \
-                 VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)",
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
                 &[
                     &timestamp,
                     &entry.actor.as_str(),
                     &entry.rpc.as_str(),
                     &namespace_str,
-                    &summary_str,
+                    &summary_value,
                     &entry.result.as_str(),
                     &request_hash,
                 ],

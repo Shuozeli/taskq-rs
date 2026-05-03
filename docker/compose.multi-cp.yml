@@ -1,0 +1,64 @@
+# Multi-CP compose: 1 Postgres + 2 taskq-cp replicas behind separate
+# host ports. Both replicas share the same Postgres so LISTEN/NOTIFY
+# fan-out can be exercised across processes (replica B's submit must
+# wake replica A's long-poll waiter via NOTIFY).
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: taskq
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d taskq"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+    ports:
+      - "${TASKQ_E2E_PG_PORT:-55432}:5432"
+
+  cp-a:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.cp
+    image: taskq-rs/cp:e2e
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./cp-config.toml:/etc/taskq/cp.toml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9090/readyz || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+    ports:
+      - "${TASKQ_E2E_CPA_PORT:-50051}:50051"
+      - "${TASKQ_E2E_HEALTHA_PORT:-9090}:9090"
+
+  cp-b:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.cp
+    image: taskq-rs/cp:e2e
+    # Wait for cp-a to finish migrations before starting cp-b. Without
+    # this, both replicas race to apply --auto-migrate against the
+    # same DB and one of them loses with a constraint violation.
+    depends_on:
+      postgres:
+        condition: service_healthy
+      cp-a:
+        condition: service_healthy
+    volumes:
+      - ./cp-config.toml:/etc/taskq/cp.toml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9090/readyz || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+    ports:
+      - "${TASKQ_E2E_CPB_PORT:-50052}:50051"
+      - "${TASKQ_E2E_HEALTHB_PORT:-9091}:9090"

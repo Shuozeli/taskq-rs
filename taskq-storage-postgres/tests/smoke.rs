@@ -360,3 +360,113 @@ async fn smoke_duplicate_idempotency_key_with_different_payload_returns_constrai
 
     drop_schema(&storage, &schema).await;
 }
+
+#[tokio::test]
+#[ignore = "requires reachable Postgres at docker.yuacx.com:5432"]
+async fn smoke_upsert_namespace_quota_round_trip() {
+    use taskq_storage::types::NamespaceQuotaUpsert;
+
+    // Arrange
+    let Some(storage) = try_connect().await else {
+        return;
+    };
+    let schema = isolate_schema(&storage, "quota").await;
+    set_search_path(&storage, &schema).await;
+    migrate(storage.pool()).await.expect("run migrations");
+
+    let ns = Namespace::new("quota-smoke");
+    let upsert = NamespaceQuotaUpsert {
+        max_pending: Some(100_000),
+        max_inflight: Some(10_000),
+        max_workers: Some(1_000),
+        max_waiters_per_replica: Some(1_000),
+        max_submit_rpm: Some(100_000),
+        max_dispatch_rpm: Some(100_000),
+        max_replay_per_second: Some(100),
+        max_retries_ceiling: 25,
+        max_idempotency_ttl_seconds: 7_776_000,
+        max_payload_bytes: 10_485_760,
+        max_details_bytes: 65_536,
+        min_heartbeat_interval_seconds: 5,
+        lazy_extension_threshold_seconds: 30,
+        max_error_classes: 64,
+        max_task_types: 32,
+        trace_sampling_ratio: 0.1,
+        log_level_override: Some("info".to_owned()),
+        audit_log_retention_days: 90,
+        metrics_export_enabled: true,
+    };
+
+    // Act
+    let mut tx = storage.begin().await.expect("begin");
+    let result = tx.upsert_namespace_quota(&ns, upsert).await;
+    if result.is_ok() {
+        tx.commit().await.expect("commit");
+    } else {
+        let _ = tx.rollback().await;
+    }
+
+    // Assert
+    assert!(result.is_ok(), "upsert failed: {result:?}");
+
+    drop_schema(&storage, &schema).await;
+}
+
+#[tokio::test]
+#[ignore = "requires reachable Postgres"]
+async fn smoke_upsert_then_audit_then_commit_mimics_handler() {
+    use taskq_storage::types::{AuditEntry, NamespaceQuotaUpsert};
+
+    // Arrange
+    let Some(storage) = try_connect().await else {
+        return;
+    };
+    let schema = isolate_schema(&storage, "audit").await;
+    set_search_path(&storage, &schema).await;
+    migrate(storage.pool()).await.expect("run migrations");
+
+    let ns = Namespace::new("audit-smoke");
+    let upsert = NamespaceQuotaUpsert {
+        max_pending: Some(100_000),
+        max_inflight: Some(10_000),
+        max_workers: Some(1_000),
+        max_waiters_per_replica: Some(1_000),
+        max_submit_rpm: Some(100_000),
+        max_dispatch_rpm: Some(100_000),
+        max_replay_per_second: Some(100),
+        max_retries_ceiling: 25,
+        max_idempotency_ttl_seconds: 7_776_000,
+        max_payload_bytes: 10_485_760,
+        max_details_bytes: 65_536,
+        min_heartbeat_interval_seconds: 5,
+        lazy_extension_threshold_seconds: 30,
+        max_error_classes: 64,
+        max_task_types: 32,
+        trace_sampling_ratio: 0.1,
+        log_level_override: Some("info".to_owned()),
+        audit_log_retention_days: 90,
+        metrics_export_enabled: true,
+    };
+
+    // Act: upsert THEN audit-log-append in same tx, like the handler.
+    let mut tx = storage.begin().await.expect("begin");
+    let upsert_res = tx.upsert_namespace_quota(&ns, upsert).await;
+    let audit_entry = AuditEntry {
+        timestamp: now_ms(),
+        actor: "anonymous".to_owned(),
+        rpc: "SetNamespaceQuota".to_owned(),
+        namespace: Some(ns.clone()),
+        request_summary: Bytes::from_static(b"{}"),
+        result: "success".to_owned(),
+        request_hash: [0xAB; 32],
+    };
+    let audit_res = tx.audit_log_append(audit_entry).await;
+    let commit_res = tx.commit().await;
+
+    // Assert
+    assert!(upsert_res.is_ok(), "upsert failed: {upsert_res:?}");
+    assert!(audit_res.is_ok(), "audit failed: {audit_res:?}");
+    assert!(commit_res.is_ok(), "commit failed: {commit_res:?}");
+
+    drop_schema(&storage, &schema).await;
+}

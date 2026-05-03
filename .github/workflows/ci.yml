@@ -103,3 +103,32 @@ jobs:
 
       - name: Build release
         run: cargo build --workspace --release
+
+  e2e:
+    name: E2E (docker compose)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Build the cp + cli release binaries first; the Dockerfile
+      # invokes `cargo build --release -p taskq-cp -p taskq-cli`
+      # itself, but doing it here primes the rust-cache so subsequent
+      # CI runs are fast. The image build still re-builds inside the
+      # container (Linux glibc != possibly-different host).
+      - name: Prebuild release binaries
+        run: cargo build --release -p taskq-cp -p taskq-cli
+
+      - name: Build CP docker image
+        run: docker build -f docker/Dockerfile.cp -t taskq-rs/cp:e2e .
+
+      # Run sequentially -- each test owns its compose project but
+      # they share the docker daemon and would race for free ports
+      # otherwise.
+      - name: Run E2E tests
+        run: cargo test -p taskq-e2e-tests --no-fail-fast -- --include-ignored --test-threads=1

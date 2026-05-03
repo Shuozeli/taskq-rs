@@ -26,14 +26,15 @@ use grpc_core::{Request, Response, Status};
 use opentelemetry::KeyValue;
 use taskq_proto::task_queue_server::TaskQueue;
 use taskq_proto::{
-    BatchGetTaskResultsRequest, BatchGetTaskResultsResponse, CancelTaskRequest, CancelTaskResponse,
-    GetTaskResultRequest, GetTaskResultResponse, RejectReason as WireRejectReason, Rejection,
-    SemVer, SubmitAndWaitRequest, SubmitAndWaitResponse, SubmitTaskRequest, SubmitTaskResponse,
-    TerminalState,
+    BatchGetTaskResultsRequest, BatchGetTaskResultsResponse, BatchTaskResult, CancelTaskRequest,
+    CancelTaskResponse, GetTaskResultRequest, GetTaskResultResponse,
+    RejectReason as WireRejectReason, Rejection, RetryConfig as WireRetryConfig, SemVer,
+    SubmitAndWaitRequest, SubmitAndWaitResponse, SubmitTaskRequest, SubmitTaskResponse, Task,
+    TerminalState, Timestamp as WireTimestamp,
 };
 use taskq_storage::{
-    IdempotencyKey, Namespace, NewDedupRecord, NewTask, RateDecision, RateKind, TaskId, TaskType,
-    Timestamp,
+    IdempotencyKey, Namespace, NewDedupRecord, NewTask, RateDecision, RateKind,
+    Task as StorageTask, TaskId, TaskStatus, TaskType, Timestamp,
 };
 
 use crate::handlers::cancel::{cancel_internal, CancelOutcome};
@@ -74,39 +75,35 @@ impl TaskQueue for TaskQueueHandler {
 
     fn get_task_result(
         &self,
-        _request: Request<GetTaskResultRequest>,
+        request: Request<GetTaskResultRequest>,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<Output = Result<Response<GetTaskResultResponse>, Status>>
                 + Send,
         >,
     > {
-        // Phase 5b: the storage trait does not yet expose `get_task_by_id`;
-        // surface UNIMPLEMENTED so callers get a clear error rather than a
-        // silent empty response. The handler shape is final; only the
-        // body flips when storage grows the method (Phase 5c task list).
+        let state = Arc::clone(&self.state);
         Box::pin(async move {
-            Err(Status::unimplemented(
-                "GetTaskResult requires StorageTx::get_task_by_id (Phase 5c)",
-            ))
+            let req = request.into_inner();
+            get_task_result_impl(state, req).await.map(Response::new)
         })
     }
 
     fn batch_get_task_results(
         &self,
-        _request: Request<BatchGetTaskResultsRequest>,
+        request: Request<BatchGetTaskResultsRequest>,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<Output = Result<Response<BatchGetTaskResultsResponse>, Status>>
                 + Send,
         >,
     > {
-        // See `get_task_result` for the rationale; the underlying read path
-        // is missing on the storage trait.
+        let state = Arc::clone(&self.state);
         Box::pin(async move {
-            Err(Status::unimplemented(
-                "BatchGetTaskResults requires StorageTx::get_task_by_id (Phase 5c)",
-            ))
+            let req = request.into_inner();
+            batch_get_task_results_impl(state, req)
+                .await
+                .map(Response::new)
         })
     }
 
@@ -493,6 +490,205 @@ enum SubmitTaskHit {
         existing_task_id: String,
         existing_payload_hash: [u8; 32],
     },
+}
+
+// ---------------------------------------------------------------------------
+// GetTaskResult / BatchGetTaskResults
+// ---------------------------------------------------------------------------
+
+/// `GetTaskResult` per `design.md` §6. Returns the task row plus its
+/// terminal-state status. v0.1.0 does not yet read result_payload /
+/// outcome / failure from `task_runtime` — those fields stay default —
+/// so callers should rely on `task.status` to detect terminal states.
+#[tracing::instrument(
+    name = "taskq.get_task_result",
+    skip_all,
+    fields(task_id = req.task_id.as_deref().unwrap_or("")),
+)]
+async fn get_task_result_impl(
+    state: Arc<CpState>,
+    req: GetTaskResultRequest,
+) -> Result<GetTaskResultResponse, Status> {
+    let task_id = match req.task_id.as_deref() {
+        Some(t) if !t.is_empty() => match uuid::Uuid::parse_str(t) {
+            Ok(u) => TaskId::from_uuid(u),
+            Err(_) => {
+                return Ok(reject_get_task_result(
+                    WireRejectReason::INVALID_PAYLOAD,
+                    "task_id is not a valid UUID",
+                ));
+            }
+        },
+        _ => {
+            return Ok(reject_get_task_result(
+                WireRejectReason::INVALID_PAYLOAD,
+                "task_id is required",
+            ));
+        }
+    };
+    let metrics = state.metrics.clone();
+
+    let task_opt = with_serializable_retry(&metrics, "get_task_result", || {
+        let state = Arc::clone(&state);
+        async move {
+            let mut tx = state.storage.begin_dyn().await?;
+            let task = tx.get_task_by_id(task_id).await?;
+            tx.commit_dyn().await?;
+            Ok(task)
+        }
+    })
+    .await
+    .map_err(|err| Status::internal(format!("get_task_result: {err}")))?;
+
+    let mut resp = GetTaskResultResponse::default();
+    resp.server_version = Some(Box::new(server_semver()));
+    match task_opt {
+        Some(task) => {
+            resp.task = Some(Box::new(storage_task_to_wire(&task)));
+        }
+        None => {
+            // No dedicated `TASK_NOT_FOUND` reason in v1 enum; surface
+            // via gRPC NotFound so SDK callers can `match` on Status.
+            return Err(Status::not_found("get_task_result: task_id not found"));
+        }
+    }
+    Ok(resp)
+}
+
+/// `BatchGetTaskResults` per `design.md` §6. Per-id semantics: missing
+/// ids surface as a per-result `error` rather than failing the whole
+/// batch. Bounded by the request — no server-side cap in v0.1.0; the
+/// caller SDK is the natural rate limiter.
+#[tracing::instrument(
+    name = "taskq.batch_get_task_results",
+    skip_all,
+    fields(count = req.task_ids.as_ref().map(|v| v.len()).unwrap_or(0)),
+)]
+async fn batch_get_task_results_impl(
+    state: Arc<CpState>,
+    req: BatchGetTaskResultsRequest,
+) -> Result<BatchGetTaskResultsResponse, Status> {
+    let task_ids = req.task_ids.unwrap_or_default();
+    let metrics = state.metrics.clone();
+
+    let mut results = Vec::with_capacity(task_ids.len());
+    for raw in task_ids {
+        let mut row = BatchTaskResult::default();
+        row.task_id = Some(raw.clone());
+        if raw.is_empty() {
+            row.error = Some(Box::new(rejection(
+                WireRejectReason::INVALID_PAYLOAD,
+                "task_id is empty",
+            )));
+            results.push(row);
+            continue;
+        }
+        let task_id = match uuid::Uuid::parse_str(&raw) {
+            Ok(u) => TaskId::from_uuid(u),
+            Err(_) => {
+                row.error = Some(Box::new(rejection(
+                    WireRejectReason::INVALID_PAYLOAD,
+                    "task_id is not a valid UUID",
+                )));
+                results.push(row);
+                continue;
+            }
+        };
+        let lookup = with_serializable_retry(&metrics, "batch_get_task_results", || {
+            let state = Arc::clone(&state);
+            async move {
+                let mut tx = state.storage.begin_dyn().await?;
+                let task = tx.get_task_by_id(task_id).await?;
+                tx.commit_dyn().await?;
+                Ok(task)
+            }
+        })
+        .await;
+        match lookup {
+            Ok(Some(task)) => {
+                row.task = Some(Box::new(storage_task_to_wire(&task)));
+            }
+            Ok(None) => {
+                // Per-id miss: leave both `task` and `error` unset so
+                // callers can detect "not found" by absence. v1 has no
+                // TASK_NOT_FOUND reject reason.
+            }
+            Err(err) => {
+                row.error = Some(Box::new(rejection(
+                    WireRejectReason::SYSTEM_OVERLOAD,
+                    &format!("storage error: {err}"),
+                )));
+            }
+        }
+        results.push(row);
+    }
+
+    let mut resp = BatchGetTaskResultsResponse::default();
+    resp.results = Some(results);
+    resp.server_version = Some(Box::new(server_semver()));
+    Ok(resp)
+}
+
+fn storage_task_to_wire(task: &StorageTask) -> Task {
+    let mut wire = Task::default();
+    wire.task_id = Some(task.task_id.to_string());
+    wire.namespace = Some(task.namespace.as_str().to_owned());
+    wire.task_type = Some(task.task_type.as_str().to_owned());
+    wire.status = task_status_to_wire(task.status);
+    wire.priority = task.priority;
+    wire.payload = Some(task.payload.to_vec());
+    wire.payload_hash = Some(task.payload_hash.to_vec());
+    wire.submitted_at = Some(Box::new(timestamp_to_wire(task.submitted_at)));
+    wire.expires_at = Some(Box::new(timestamp_to_wire(task.expires_at)));
+    wire.attempt_number = task.attempt_number;
+    wire.max_retries = task.max_retries;
+    let mut rc = WireRetryConfig::default();
+    rc.initial_ms = task.retry_initial_ms;
+    rc.max_ms = task.retry_max_ms;
+    rc.coefficient = task.retry_coefficient;
+    rc.max_retries = task.max_retries;
+    wire.retry_config = Some(Box::new(rc));
+    if let Some(ts) = task.retry_after {
+        wire.retry_after = Some(Box::new(timestamp_to_wire(ts)));
+    }
+    wire.traceparent = Some(task.traceparent.to_vec());
+    wire.tracestate = Some(task.tracestate.to_vec());
+    wire.format_version = task.format_version;
+    wire.original_failure_count = task.original_failure_count;
+    wire
+}
+
+fn task_status_to_wire(status: TaskStatus) -> TerminalState {
+    match status {
+        TaskStatus::Pending => TerminalState::PENDING,
+        TaskStatus::Dispatched => TerminalState::DISPATCHED,
+        TaskStatus::WaitingRetry => TerminalState::WAITING_RETRY,
+        TaskStatus::Completed => TerminalState::COMPLETED,
+        TaskStatus::Cancelled => TerminalState::CANCELLED,
+        TaskStatus::FailedNonretryable => TerminalState::FAILED_NONRETRYABLE,
+        TaskStatus::FailedExhausted => TerminalState::FAILED_EXHAUSTED,
+        TaskStatus::Expired => TerminalState::EXPIRED,
+    }
+}
+
+fn timestamp_to_wire(ts: Timestamp) -> WireTimestamp {
+    let mut t = WireTimestamp::default();
+    t.unix_millis = ts.as_unix_millis();
+    t
+}
+
+fn reject_get_task_result(reason: WireRejectReason, hint: &str) -> GetTaskResultResponse {
+    let mut resp = GetTaskResultResponse::default();
+    resp.server_version = Some(Box::new(server_semver()));
+    resp.error = Some(Box::new(rejection(reason, hint)));
+    resp
+}
+
+fn rejection(reason: WireRejectReason, hint: &str) -> Rejection {
+    let mut r = Rejection::default();
+    r.reason = reason;
+    r.hint = Some(hint.to_owned());
+    r
 }
 
 // ---------------------------------------------------------------------------
