@@ -1446,6 +1446,165 @@ mod tests {
         assert!(resp.eps_ms > 0);
     }
 
+    // -----------------------------------------------------------------
+    // Validation paths -- each handler rejects malformed wire requests
+    // before touching storage. Cheap to test, high coverage value
+    // since the validation chain exercises ~10 lines of plumbing per
+    // handler.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn heartbeat_rejects_empty_namespace() {
+        // Arrange
+        let state = build_state().await;
+        let mut req = HeartbeatRequest::default();
+        req.worker_id = Some("019df005-0000-0000-0000-000000000001".to_owned());
+
+        // Act
+        let err = heartbeat_impl(state, req).await.unwrap_err();
+
+        // Assert
+        assert_eq!(err.code(), grpc_core::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_rejects_empty_worker_id() {
+        // Arrange
+        let state = build_state().await;
+        let mut req = HeartbeatRequest::default();
+        req.namespace = Some("ns".to_owned());
+
+        // Act
+        let err = heartbeat_impl(state, req).await.unwrap_err();
+
+        // Assert
+        assert_eq!(err.code(), grpc_core::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_rejects_malformed_worker_id() {
+        // Arrange: not a valid UUID.
+        let state = build_state().await;
+        let mut req = HeartbeatRequest::default();
+        req.namespace = Some("ns".to_owned());
+        req.worker_id = Some("not-a-uuid".to_owned());
+
+        // Act
+        let err = heartbeat_impl(state, req).await.unwrap_err();
+
+        // Assert
+        assert_eq!(err.code(), grpc_core::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_with_no_held_leases_succeeds_after_register() {
+        // Arrange: register a worker first so heartbeat has a row to
+        // upsert against; then issue a heartbeat carrying no leases.
+        let state = build_state().await;
+        let registered = register_impl(
+            Arc::clone(&state),
+            build_register_request("ns", vec!["t1".to_owned()]),
+        )
+        .await
+        .expect("register");
+        let worker_id = registered.worker_id.expect("worker_id");
+        let mut req = HeartbeatRequest::default();
+        req.namespace = Some("ns".to_owned());
+        req.worker_id = Some(worker_id);
+        // held_leases left as None.
+
+        // Act
+        let resp = heartbeat_impl(state, req).await.expect("heartbeat");
+
+        // Assert: ack present, no extended_leases.
+        assert!(resp.error.is_none(), "response: {resp:?}");
+        assert!(resp
+            .extended_leases
+            .as_ref()
+            .map(|v| v.is_empty())
+            .unwrap_or(true));
+    }
+
+    #[tokio::test]
+    async fn complete_task_rejects_empty_task_id() {
+        // Arrange
+        let state = build_state().await;
+        let mut req = CompleteTaskRequest::default();
+        req.worker_id = Some("019df005-0000-0000-0000-000000000001".to_owned());
+
+        // Act
+        let err = complete_task_impl(state, req).await.unwrap_err();
+
+        // Assert
+        assert_eq!(err.code(), grpc_core::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn complete_task_rejects_empty_worker_id() {
+        // Arrange
+        let state = build_state().await;
+        let mut req = CompleteTaskRequest::default();
+        req.task_id = Some(taskq_storage::TaskId::generate().to_string());
+
+        // Act
+        let err = complete_task_impl(state, req).await.unwrap_err();
+
+        // Assert
+        assert_eq!(err.code(), grpc_core::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn report_failure_rejects_empty_task_id() {
+        // Arrange
+        let state = build_state().await;
+        let mut req = ReportFailureRequest::default();
+        req.worker_id = Some("019df005-0000-0000-0000-000000000001".to_owned());
+
+        // Act
+        let err = report_failure_impl(state, req).await.unwrap_err();
+
+        // Assert
+        assert_eq!(err.code(), grpc_core::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn deregister_rejects_empty_worker_id() {
+        // Arrange
+        let state = build_state().await;
+        let req = DeregisterWorkerRequest::default();
+
+        // Act
+        let err = deregister_impl(state, req).await.unwrap_err();
+
+        // Assert
+        assert_eq!(err.code(), grpc_core::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn deregister_is_idempotent_for_unregistered_worker_id() {
+        // Arrange: well-formed UUID that was never registered.
+        let state = build_state().await;
+        let mut req = DeregisterWorkerRequest::default();
+        req.worker_id = Some(taskq_storage::WorkerId::generate().to_string());
+
+        // Act
+        let resp = deregister_impl(state, req).await.expect("deregister");
+
+        // Assert: idempotent. The backend's `mark_worker_dead` is an
+        // UPDATE-where (no row -> 0 rows affected, no error), so the
+        // handler returns success with no error envelope. SDKs that
+        // call deregister twice during shutdown observe the same shape
+        // both times. The `WORKER_DEREGISTERED` rejection branch in
+        // deregister_impl is dead under SQLite/Postgres backends; it
+        // is reserved for backends whose mark_worker_dead can return
+        // NotFound.
+        assert!(
+            resp.error.is_none(),
+            "deregister should be idempotent: {resp:?}"
+        );
+        assert!(resp.server_version.is_some());
+    }
+
     #[tokio::test]
     async fn acquire_task_returns_no_task_when_queue_empty() {
         // Arrange

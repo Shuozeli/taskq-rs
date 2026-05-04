@@ -327,6 +327,63 @@ mod tests {
     }
 
     #[test]
+    fn for_namespace_returns_default_strategy_when_no_explicit_entry() {
+        // Arrange: empty registry. Per `default_strategy`, the
+        // implicit fallback is (MaxPendingAdmitter limit=u64::MAX,
+        // PriorityFifoDispatcher) so capacity quotas still get
+        // enforced via the backend's transactional read even when no
+        // operator-configured row exists.
+        let registry = StrategyRegistry::empty();
+
+        // Act
+        let strategy = registry
+            .for_namespace(&Namespace::new("never-configured"))
+            .expect("default chain must always resolve");
+
+        // Assert
+        assert_eq!(strategy.admitter.name(), "MaxPending");
+        assert_eq!(strategy.dispatcher.name(), "PriorityFifo");
+    }
+
+    #[test]
+    fn for_namespace_returns_inserted_strategy_over_default() {
+        // Arrange: install an explicit chain.
+        let mut registry = StrategyRegistry::empty();
+        let ns = Namespace::new("explicit");
+        let custom = NamespaceStrategy {
+            admitter: unwrap_admitter(build_admitter("Always", &AdmitterParams::default())),
+            dispatcher: unwrap_dispatcher(build_dispatcher(
+                "AgePromoted",
+                &DispatcherParams {
+                    age_weight: Some(1.5),
+                    sample_attempts: Some(8),
+                },
+            )),
+        };
+        registry.insert(ns.clone(), custom);
+
+        // Act
+        let strategy = registry
+            .for_namespace(&ns)
+            .expect("inserted chain must resolve");
+
+        // Assert
+        assert_eq!(strategy.admitter.name(), "Always");
+        assert_eq!(strategy.dispatcher.name(), "AgePromoted");
+    }
+
+    #[test]
+    fn loaded_namespaces_excludes_implicit_default() {
+        // Arrange: empty registry has the implicit default but no
+        // explicit entries.
+        let registry = StrategyRegistry::empty();
+
+        // Act / Assert
+        assert!(registry.loaded_namespaces().is_empty());
+        assert_eq!(registry.healthy_count(), 0);
+    }
+
+    #[test]
     fn registry_tracks_degraded_namespaces() {
         // Arrange
         let mut registry = StrategyRegistry::empty();

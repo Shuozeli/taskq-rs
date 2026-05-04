@@ -618,6 +618,69 @@ mod tests {
         assert_eq!(decision, Admit::Accept);
     }
 
+    #[tokio::test]
+    async fn codel_admits_when_age_equals_target_exactly() {
+        // Arrange: per the impl, the comparison is `age_ms >
+        // target_latency_ms` (strict). The boundary belongs to admit.
+        let admitter = CoDelAdmitter {
+            target_latency_ms: 5_000,
+        };
+        let ctx = submit_ctx();
+        let mut tx = FakeTx {
+            oldest_age_response: Some(Some(5_000)),
+            ..FakeTx::default()
+        };
+
+        // Act
+        let decision = admitter.admit(&ctx, &mut tx as &mut dyn StorageTxDyn).await;
+
+        // Assert
+        assert_eq!(decision, Admit::Accept);
+    }
+
+    #[tokio::test]
+    async fn max_pending_with_unlimited_limit_admits_when_backend_under() {
+        // Arrange: u64::MAX is the registry-default fallback. The
+        // backend is the source of truth; if the backend says
+        // UnderLimit, the admitter must trust it and accept.
+        let admitter = MaxPendingAdmitter { limit: u64::MAX };
+        let ctx = submit_ctx();
+        let mut tx = FakeTx {
+            capacity_response: Some(CapacityDecision::UnderLimit {
+                current: 1_000_000,
+                limit: u64::MAX,
+            }),
+            ..FakeTx::default()
+        };
+
+        // Act
+        let decision = admitter.admit(&ctx, &mut tx as &mut dyn StorageTxDyn).await;
+
+        // Assert
+        assert_eq!(decision, Admit::Accept);
+    }
+
+    #[tokio::test]
+    async fn max_pending_rejects_when_backend_reports_zero_limit() {
+        // Arrange: operator set max_pending=0 (effectively "freeze
+        // submits"). Backend reports OverLimit for any submit.
+        let admitter = MaxPendingAdmitter { limit: 0 };
+        let ctx = submit_ctx();
+        let mut tx = FakeTx {
+            capacity_response: Some(CapacityDecision::OverLimit {
+                current: 0,
+                limit: 0,
+            }),
+            ..FakeTx::default()
+        };
+
+        // Act
+        let decision = admitter.admit(&ctx, &mut tx as &mut dyn StorageTxDyn).await;
+
+        // Assert
+        assert_eq!(decision, Admit::Reject(RejectReason::MaxPendingExceeded));
+    }
+
     #[test]
     fn admitter_names_are_unique() {
         // Arrange / Act / Assert

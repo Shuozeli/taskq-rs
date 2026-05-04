@@ -199,6 +199,93 @@ mod tests {
     }
 
     #[test]
+    fn render_table_emits_only_header_and_separator_when_rows_empty() {
+        // Arrange: tabular outputs (e.g. `list-workers` against an
+        // empty namespace) MUST still render the header so operators
+        // can confirm the right command ran. Empty rows means just
+        // header + separator.
+        let headers = ["worker_id", "namespace"];
+        let rows: Vec<Vec<String>> = Vec::new();
+        let mut buf: Vec<u8> = Vec::new();
+
+        // Act
+        render_table(&headers, &rows, &mut buf).unwrap();
+
+        // Assert
+        let s = String::from_utf8(buf).unwrap();
+        let lines: Vec<&str> = s.lines().collect();
+        assert_eq!(lines.len(), 2, "expected header + separator only: {s:?}");
+        assert!(lines[0].contains("worker_id"));
+        assert!(lines[1].contains("---"));
+    }
+
+    #[test]
+    fn render_table_with_empty_headers_is_a_noop() {
+        // Arrange
+        let headers: [&str; 0] = [];
+        let rows = vec![vec!["foo".to_owned()]];
+        let mut buf: Vec<u8> = Vec::new();
+
+        // Act
+        render_table(&headers, &rows, &mut buf).unwrap();
+
+        // Assert
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn render_kv_with_empty_rows_emits_nothing() {
+        // Arrange
+        let rows: Vec<(&str, String)> = Vec::new();
+        let mut buf: Vec<u8> = Vec::new();
+
+        // Act
+        render_kv(&rows, &mut buf).unwrap();
+
+        // Assert
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn render_status_appends_newline() {
+        // Arrange
+        let mut buf: Vec<u8> = Vec::new();
+
+        // Act
+        render_status(
+            "namespace create succeeded on namespace \"alpha\"",
+            &mut buf,
+        )
+        .unwrap();
+
+        // Assert
+        let s = String::from_utf8(buf).unwrap();
+        assert!(
+            s.ends_with('\n'),
+            "render_status must terminate the line: {s:?}"
+        );
+    }
+
+    #[test]
+    fn render_json_terminates_with_newline() {
+        // Arrange
+        let row = Row {
+            name: "alpha".into(),
+            count: 7,
+        };
+        let mut buf: Vec<u8> = Vec::new();
+
+        // Act
+        render(&row, OutputFormat::Json, &mut buf).unwrap();
+
+        // Assert: callers that pipe to `jq` rely on a trailing newline
+        // so the stream is valid newline-delimited JSON if multiple
+        // commands chain together.
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.ends_with('\n'), "json output must terminate with newline");
+    }
+
+    #[test]
     fn render_kv_pads_keys_to_max_width() {
         // Arrange
         let rows = vec![("short", "1".to_owned()), ("longer-key", "2".to_owned())];

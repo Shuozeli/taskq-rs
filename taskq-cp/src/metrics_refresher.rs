@@ -272,6 +272,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refresh_once_with_registered_namespace_calls_refresh_namespace() {
+        // Arrange: build state with a registered namespace so
+        // `refresh_once` actually iterates and calls
+        // `refresh_namespace` (the previous test exercised the
+        // empty-registry no-op path).
+        use crate::strategy::{
+            build_admitter, build_dispatcher, AdmitterParams, DispatcherParams, NamespaceStrategy,
+        };
+        let storage = taskq_storage_sqlite::SqliteStorage::open_in_memory()
+            .await
+            .expect("SqliteStorage::open_in_memory");
+        let storage_arc: Arc<dyn DynStorage> = Arc::new(storage);
+        let mut registry = StrategyRegistry::empty();
+        let ns = Namespace::new("system_default");
+        registry.insert(
+            ns,
+            NamespaceStrategy {
+                admitter: build_admitter("Always", &AdmitterParams::default()).unwrap(),
+                dispatcher: build_dispatcher("PriorityFifo", &DispatcherParams::default()).unwrap(),
+            },
+        );
+        let config = Arc::new(CpConfig {
+            bind_addr: "127.0.0.1:50051".parse::<SocketAddr>().unwrap(),
+            health_addr: "127.0.0.1:9090".parse::<SocketAddr>().unwrap(),
+            storage_backend: StorageBackendConfig::Sqlite {
+                path: ":memory:".to_owned(),
+            },
+            otel_exporter: OtelExporterConfig::Disabled,
+            quota_cache_ttl_seconds: 5,
+            long_poll_default_timeout_seconds: 30,
+            long_poll_max_seconds: 60,
+            belt_and_suspenders_seconds: 10,
+            waiter_limit_per_replica: 100,
+            lease_window_seconds: 30,
+        });
+        let (_tx, rx) = channel();
+        let state = Arc::new(CpState::new(
+            storage_arc,
+            Arc::new(registry),
+            MetricsHandle::noop(),
+            rx,
+            config,
+        ));
+        let mut tracker = NamespaceGaugeTracker::default();
+
+        // Act: empty namespace; refresh_namespace runs through every
+        // SQL read (count_tasks_by_status, list_workers,
+        // get_namespace_quota) and the quota_usage_ratio branch since
+        // system_default has neither max_pending nor max_inflight set
+        // (both NULL).
+        let result = refresh_once(&state, &mut tracker).await;
+
+        // Assert: pass without error; tracker recorded zero pending /
+        // inflight / workers for the namespace (system_default has no
+        // tasks).
+        assert!(result.is_ok());
+        let ns_key = Namespace::new("system_default");
+        assert_eq!(tracker.pending.get(&ns_key), Some(&0));
+        assert_eq!(tracker.inflight.get(&ns_key), Some(&0));
+        assert_eq!(tracker.workers.get(&ns_key), Some(&0));
+    }
+
+    #[tokio::test]
     async fn tracker_emits_delta_to_avoid_double_counting() {
         // Arrange
         let state = build_state().await;

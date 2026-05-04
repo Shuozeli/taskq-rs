@@ -86,3 +86,87 @@ impl From<grpc_core::Status> for CliError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exit_code_connect_is_two() {
+        let err = CliError::Connect {
+            endpoint: "x".into(),
+            message: "y".into(),
+        };
+        assert_eq!(err.exit_code(), 2);
+    }
+
+    #[test]
+    fn exit_code_transport_is_three() {
+        let err = CliError::Transport {
+            endpoint: "x".into(),
+            code: "Unavailable".into(),
+            message: "y".into(),
+        };
+        assert_eq!(err.exit_code(), 3);
+    }
+
+    #[test]
+    fn exit_code_rejected_is_four() {
+        let err = CliError::Rejected {
+            reason: RejectReason::SYSTEM_OVERLOAD,
+            retry_after_ms: 0,
+            retryable: false,
+            hint: "drop".into(),
+        };
+        assert_eq!(err.exit_code(), 4);
+    }
+
+    #[test]
+    fn exit_code_invalid_argument_is_sixty_four() {
+        // Sixty-four mirrors EX_USAGE from sysexits(3) for CLI usage
+        // errors -- shell scripts wrapping the CLI rely on this code
+        // to detect "the user typed something wrong" vs server-side
+        // failures.
+        let err = CliError::InvalidArgument("missing flag".into());
+        assert_eq!(err.exit_code(), 64);
+    }
+
+    #[test]
+    fn exit_code_aborted_is_one_thirty() {
+        // 130 == 128 + SIGINT. Treats operator decline as
+        // ctrl-C-equivalent so wrapper scripts don't retry.
+        let err = CliError::Aborted;
+        assert_eq!(err.exit_code(), 130);
+    }
+
+    #[test]
+    fn exit_code_internal_is_seventy() {
+        // 70 == EX_SOFTWARE from sysexits(3). Reserved for
+        // wire-protocol violations the CLI cannot recover from.
+        let err = CliError::Internal("server returned no fields".into());
+        assert_eq!(err.exit_code(), 70);
+    }
+
+    #[test]
+    fn from_status_drops_endpoint_so_lift_transport_can_supply_it() {
+        // Arrange: a raw `grpc_core::Status` only knows code + message.
+        // The endpoint lives on the call site (which is what passes
+        // it via `lift_transport`). `From<Status>` must leave the
+        // endpoint empty so a later `lift_transport` can populate it.
+        let s = grpc_core::Status::unavailable("connection lost");
+
+        // Act
+        let err: CliError = s.into();
+
+        // Assert
+        match err {
+            CliError::Transport {
+                endpoint, message, ..
+            } => {
+                assert_eq!(endpoint, "");
+                assert_eq!(message, "connection lost");
+            }
+            other => panic!("expected Transport, got {other:?}"),
+        }
+    }
+}

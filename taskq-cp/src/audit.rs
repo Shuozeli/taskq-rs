@@ -202,4 +202,83 @@ mod tests {
         assert!(parsed["original_size"].as_u64().unwrap() > MAX_SUMMARY_BYTES as u64);
         assert!(parsed["summary"].is_string());
     }
+
+    #[test]
+    fn encode_summary_at_exactly_max_size_passes_through_without_truncation() {
+        // Arrange: build a body whose serde_json::to_vec output is
+        // exactly MAX_SUMMARY_BYTES. The branch is `<=` so the
+        // boundary is pass-through.
+        // serde_json::to_vec({"k": "<padding>"}) == 9 bytes overhead
+        // ({"k":"" plus the closing "}). We size `padding` to fill
+        // exactly MAX_SUMMARY_BYTES.
+        let overhead = serde_json::to_vec(&serde_json::json!({"k": ""}))
+            .unwrap()
+            .len();
+        let pad_len = MAX_SUMMARY_BYTES - overhead;
+        let pad = "a".repeat(pad_len);
+        let body = serde_json::json!({"k": pad});
+        assert_eq!(serde_json::to_vec(&body).unwrap().len(), MAX_SUMMARY_BYTES);
+
+        // Act
+        let bytes = encode_summary(body.clone());
+
+        // Assert: original body (no truncation marker).
+        assert_eq!(bytes.len(), MAX_SUMMARY_BYTES);
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed, body);
+        assert!(parsed.get("truncated").is_none());
+    }
+
+    #[test]
+    fn encode_summary_truncated_output_fits_within_doubling_budget() {
+        // Arrange: an oversize body. The truncated wrapper itself
+        // adds JSON-envelope bytes, so the output should be larger
+        // than MAX_SUMMARY_BYTES BUT bounded -- not "as long as the
+        // input." The truncation handler caps `summary` at
+        // ~MAX_SUMMARY_BYTES of UTF-8 chars, so the wrapped output
+        // should sit comfortably under 2 * MAX_SUMMARY_BYTES.
+        let huge = "x".repeat(MAX_SUMMARY_BYTES * 10);
+        let body = serde_json::json!({"big": huge});
+
+        // Act
+        let bytes = encode_summary(body);
+
+        // Assert
+        assert!(
+            bytes.len() < 2 * MAX_SUMMARY_BYTES,
+            "truncated wrapper grew unboundedly: {} bytes",
+            bytes.len()
+        );
+        // And it's still valid JSON.
+        let _: serde_json::Value = serde_json::from_slice(&bytes).expect("truncated JSON valid");
+    }
+
+    #[test]
+    fn encode_summary_handles_multibyte_utf8_at_truncation_boundary() {
+        // Arrange: pad with a multi-byte codepoint (3-byte CJK
+        // character) so the naive byte cap would land mid-codepoint.
+        // The impl walks back to a char boundary via
+        // `is_char_boundary`. If that walk-back is broken, the
+        // resulting string is invalid UTF-8 and serde_json::to_vec
+        // panics on the wrapped object.
+        let cjk = "\u{4e2d}"; // 3 bytes
+        let body = serde_json::json!({
+            "big": cjk.repeat(MAX_SUMMARY_BYTES) // ~12 KB of CJK
+        });
+
+        // Act
+        let bytes = encode_summary(body);
+
+        // Assert: must be valid JSON and UTF-8.
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("valid JSON");
+        assert_eq!(parsed["truncated"], serde_json::Value::Bool(true));
+        let summary = parsed["summary"].as_str().expect("summary is string");
+        // No half-codepoints: every char in `summary` must be valid
+        // UTF-8 (already guaranteed by &str), and the byte length
+        // must match the char-walk back to a boundary.
+        assert!(
+            summary.bytes().all(|b| b != 0xFF),
+            "summary contains invalid byte"
+        );
+    }
 }

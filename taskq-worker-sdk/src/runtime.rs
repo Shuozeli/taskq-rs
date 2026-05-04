@@ -841,6 +841,7 @@ async fn deregister_best_effort(state: &Arc<Mutex<SessionState>>) -> Result<(), 
 // Drain join + helpers
 // ---------------------------------------------------------------------------
 
+#[derive(Debug)]
 enum DrainOutcome {
     Drained,
     Timeout,
@@ -1034,5 +1035,92 @@ mod tests {
 
         // Assert
         assert_eq!(next, ACQUIRE_BACKOFF_MIN * 2);
+    }
+
+    // -----------------------------------------------------------------
+    // join_acquire_loops drain semantics
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn join_acquire_loops_drained_when_handles_finish_before_deadline() {
+        // Arrange: a handle that returns immediately.
+        let inflight = Arc::new(InFlight::default());
+        let handle = tokio::spawn(async {});
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+
+        // Act
+        let outcome = join_acquire_loops(vec![handle], deadline, Arc::clone(&inflight)).await;
+
+        // Assert
+        assert!(matches!(outcome, DrainOutcome::Drained));
+    }
+
+    #[tokio::test]
+    async fn join_acquire_loops_timeout_when_inflight_nonempty_past_deadline() {
+        // Arrange: handle hangs forever; inflight has one held lease so
+        // the timeout must surface as `Timeout` (operator must
+        // investigate).
+        let inflight = Arc::new(InFlight::default());
+        inflight
+            .insert(HeldLease {
+                task_id: "stuck".to_owned(),
+                attempt_number: 1,
+            })
+            .await;
+        let handle = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+
+        // Act
+        let outcome = join_acquire_loops(vec![handle], deadline, Arc::clone(&inflight)).await;
+
+        // Assert
+        assert!(matches!(outcome, DrainOutcome::Timeout));
+    }
+
+    #[tokio::test]
+    async fn join_acquire_loops_drained_when_handle_hangs_but_inflight_empty() {
+        // Arrange: handle hangs but no in-flight handlers exist. The
+        // hanging task is treated as effectively drained — its work
+        // queue is empty even though the future itself didn't return.
+        let inflight = Arc::new(InFlight::default());
+        let handle = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+
+        // Act
+        let outcome = join_acquire_loops(vec![handle], deadline, Arc::clone(&inflight)).await;
+
+        // Assert
+        assert!(matches!(outcome, DrainOutcome::Drained));
+    }
+
+    #[tokio::test]
+    async fn join_acquire_loops_join_error_when_handle_panics() {
+        // Arrange: a handle that panics. Tokio surfaces this as a
+        // JoinError; the drain must propagate it (so RunError::Acquire
+        // -Loop carries the panic message rather than silently
+        // returning Drained).
+        let inflight = Arc::new(InFlight::default());
+        let handle = tokio::spawn(async {
+            panic!("simulated handler-side panic");
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+
+        // Act
+        let outcome = join_acquire_loops(vec![handle], deadline, Arc::clone(&inflight)).await;
+
+        // Assert
+        match outcome {
+            DrainOutcome::JoinError(msg) => {
+                assert!(
+                    msg.to_lowercase().contains("panic"),
+                    "expected panic-related JoinError message, got {msg:?}"
+                );
+            }
+            other => panic!("expected JoinError, got {other:?}"),
+        }
     }
 }

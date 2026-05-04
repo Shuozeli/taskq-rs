@@ -1086,4 +1086,161 @@ mod tests {
         let err = resp.error.expect("response should be a rejection");
         assert_eq!(err.reason, WireRejectReason::INVALID_PAYLOAD);
     }
+
+    #[tokio::test]
+    async fn submit_task_rejects_empty_task_type() {
+        // Arrange
+        let state = build_state().await;
+        let mut req = SubmitTaskRequest::default();
+        req.namespace = Some("ns".to_owned());
+        req.idempotency_key = Some("k".to_owned());
+        req.payload = Some(b"x".to_vec());
+
+        // Act
+        let resp = submit_task_impl(state, req).await;
+
+        // Assert
+        let err = resp.error.expect("rejection");
+        assert_eq!(err.reason, WireRejectReason::INVALID_PAYLOAD);
+    }
+
+    #[tokio::test]
+    async fn submit_task_rejects_empty_idempotency_key() {
+        // Arrange
+        let state = build_state().await;
+        let mut req = SubmitTaskRequest::default();
+        req.namespace = Some("ns".to_owned());
+        req.task_type = Some("t".to_owned());
+        req.payload = Some(b"x".to_vec());
+
+        // Act
+        let resp = submit_task_impl(state, req).await;
+
+        // Assert
+        let err = resp.error.expect("rejection");
+        assert_eq!(err.reason, WireRejectReason::INVALID_PAYLOAD);
+    }
+
+    #[tokio::test]
+    async fn cancel_task_rejects_empty_task_id() {
+        // Arrange
+        let state = build_state().await;
+        let req = CancelTaskRequest::default();
+
+        // Act
+        let err = cancel_task_impl(state, req).await.unwrap_err();
+
+        // Assert: cancel_task_impl surfaces missing-task_id via gRPC
+        // Status (not the wire `error` envelope), so SDKs see
+        // INVALID_ARGUMENT consistently with the rest of the
+        // wire-validation chain in task_queue.
+        assert_eq!(err.code(), grpc_core::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn cancel_task_rejects_malformed_task_id() {
+        // Arrange
+        let state = build_state().await;
+        let mut req = CancelTaskRequest::default();
+        req.task_id = Some("not-a-uuid".to_owned());
+
+        // Act
+        let err = cancel_task_impl(state, req).await.unwrap_err();
+
+        // Assert
+        assert_eq!(err.code(), grpc_core::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn get_task_result_rejects_empty_task_id() {
+        // Arrange
+        let state = build_state().await;
+        let req = GetTaskResultRequest::default();
+
+        // Act
+        let resp = get_task_result_impl(state, req).await.expect("response");
+
+        // Assert
+        let err = resp.error.expect("rejection");
+        assert_eq!(err.reason, WireRejectReason::INVALID_PAYLOAD);
+    }
+
+    #[tokio::test]
+    async fn get_task_result_rejects_malformed_task_id() {
+        // Arrange
+        let state = build_state().await;
+        let mut req = GetTaskResultRequest::default();
+        req.task_id = Some("not-a-uuid".to_owned());
+
+        // Act
+        let resp = get_task_result_impl(state, req).await.expect("response");
+
+        // Assert
+        let err = resp.error.expect("rejection");
+        assert_eq!(err.reason, WireRejectReason::INVALID_PAYLOAD);
+    }
+
+    #[tokio::test]
+    async fn get_task_result_returns_not_found_for_unknown_task_id() {
+        // Arrange: well-formed but never-inserted task_id.
+        let state = build_state().await;
+        let mut req = GetTaskResultRequest::default();
+        req.task_id = Some(taskq_storage::TaskId::generate().to_string());
+
+        // Act
+        let err = get_task_result_impl(state, req).await.unwrap_err();
+
+        // Assert
+        assert_eq!(err.code(), grpc_core::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn batch_get_task_results_returns_empty_results_for_empty_input() {
+        // Arrange
+        let state = build_state().await;
+        let req = BatchGetTaskResultsRequest::default();
+
+        // Act
+        let resp = batch_get_task_results_impl(state, req)
+            .await
+            .expect("response");
+
+        // Assert
+        assert!(resp.results.unwrap_or_default().is_empty());
+        assert!(resp.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn batch_get_task_results_marks_invalid_task_ids_per_row() {
+        // Arrange
+        let state = build_state().await;
+        let mut req = BatchGetTaskResultsRequest::default();
+        req.task_ids = Some(vec![
+            "".to_owned(),
+            "not-a-uuid".to_owned(),
+            taskq_storage::TaskId::generate().to_string(),
+        ]);
+
+        // Act
+        let resp = batch_get_task_results_impl(state, req)
+            .await
+            .expect("response");
+
+        // Assert: each row carries either a task or a per-row error;
+        // the batch as a whole succeeds. Empty + malformed rows
+        // become INVALID_PAYLOAD; the missing-but-well-formed row has
+        // both task and error unset.
+        let results = resp.results.expect("results");
+        assert_eq!(results.len(), 3);
+        assert!(results[0].error.is_some(), "empty id -> error");
+        assert_eq!(
+            results[0].error.as_ref().unwrap().reason,
+            WireRejectReason::INVALID_PAYLOAD
+        );
+        assert!(results[1].error.is_some(), "malformed id -> error");
+        assert!(
+            results[2].task.is_none() && results[2].error.is_none(),
+            "missing-but-well-formed id -> both unset"
+        );
+    }
 }

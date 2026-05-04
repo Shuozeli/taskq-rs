@@ -407,6 +407,149 @@ mod tests {
         assert_eq!(task.attempt_number, 1);
     }
 
+    /// Same shape as `reaper_b_marks_dead_worker_and_reclaims` but
+    /// returns the seed handles so concurrency / idempotency tests can
+    /// reuse the setup. Pulled out of the original test (kept inline
+    /// there to match its narrative) so we don't duplicate the row
+    /// shape.
+    async fn seed_dead_worker_runtime(
+        state: &CpState,
+        ns: &str,
+        idem_key: &str,
+    ) -> (TaskId, WorkerId) {
+        let now = current_timestamp();
+        let task_id = TaskId::generate();
+        let worker_id = WorkerId::generate();
+
+        let mut tx = state.storage.begin_dyn().await.unwrap();
+        let task = NewTask {
+            task_id,
+            namespace: Namespace::new(ns),
+            task_type: TaskType::new("type"),
+            priority: 0,
+            payload: Bytes::from_static(b"{}"),
+            payload_hash: [0u8; 32],
+            submitted_at: now,
+            expires_at: Timestamp::from_unix_millis(now.as_unix_millis() + 86_400_000),
+            max_retries: 3,
+            retry_initial_ms: 1_000,
+            retry_max_ms: 10_000,
+            retry_coefficient: 2.0,
+            traceparent: Bytes::new(),
+            tracestate: Bytes::new(),
+            format_version: 1,
+        };
+        let dedup = NewDedupRecord {
+            namespace: Namespace::new(ns),
+            key: IdempotencyKey::new(idem_key),
+            payload_hash: [0u8; 32],
+            expires_at: Timestamp::from_unix_millis(now.as_unix_millis() + 86_400_000),
+        };
+        tx.insert_task(task, dedup).await.unwrap();
+        let lease = NewLease {
+            task_id,
+            attempt_number: 0,
+            worker_id,
+            acquired_at: now,
+            timeout_at: Timestamp::from_unix_millis(now.as_unix_millis() + 60_000),
+        };
+        tx.record_acquisition(lease).await.unwrap();
+        let stale = Timestamp::from_unix_millis(now.as_unix_millis() - 600_000);
+        tx.record_worker_heartbeat(&worker_id, &Namespace::new(ns), stale)
+            .await
+            .unwrap();
+        tx.commit_dyn().await.unwrap();
+        (task_id, worker_id)
+    }
+
+    #[tokio::test]
+    async fn reaper_b_repeat_tick_is_idempotent() {
+        // Arrange: dead worker + held lease.
+        let state = build_state().await;
+        let (task_id, worker_id) = seed_dead_worker_runtime(&state, "ns", "rb-idem").await;
+
+        // Act: two ticks back-to-back. The second sees a worker that's
+        // already declared_dead and a runtime row that's already
+        // reclaimed -- it must not error out, and it must not
+        // re-bump the task's attempt counter.
+        reaper_b_tick(Arc::clone(&state)).await.unwrap();
+        reaper_b_tick(Arc::clone(&state)).await.unwrap();
+
+        // Assert: attempt incremented exactly once.
+        let mut tx = state.storage.begin_dyn().await.unwrap();
+        let task = tx.get_task_by_id(task_id).await.unwrap().expect("task row");
+        let workers = tx.list_workers(&Namespace::new("ns"), true).await.unwrap();
+        let _ = tx.commit_dyn().await;
+        assert_eq!(task.status, taskq_storage::TaskStatus::Pending);
+        assert_eq!(
+            task.attempt_number, 1,
+            "second tick must not double-bump attempt"
+        );
+        let worker = workers
+            .into_iter()
+            .find(|w| w.worker_id == worker_id)
+            .expect("worker row");
+        assert!(
+            worker.declared_dead_at.is_some(),
+            "worker must remain declared_dead"
+        );
+    }
+
+    #[tokio::test]
+    async fn reaper_b_concurrent_ticks_only_reclaim_once() {
+        // Arrange: dead worker + held lease.
+        let state = build_state().await;
+        let (task_id, worker_id) = seed_dead_worker_runtime(&state, "ns", "rb-concurrent").await;
+
+        // Act: two reaper-B ticks racing against the same row. SKIP
+        // LOCKED + the per-row tombstone (`declared_dead_at`) must
+        // serialize them so only one observation of the dead worker
+        // produces a reclaim.
+        let s1 = Arc::clone(&state);
+        let s2 = Arc::clone(&state);
+        let (r1, r2) = tokio::join!(
+            tokio::spawn(async move { reaper_b_tick(s1).await }),
+            tokio::spawn(async move { reaper_b_tick(s2).await }),
+        );
+        r1.unwrap().expect("tick 1");
+        r2.unwrap().expect("tick 2");
+
+        // Assert: same outcome as the sequential case.
+        let mut tx = state.storage.begin_dyn().await.unwrap();
+        let task = tx.get_task_by_id(task_id).await.unwrap().expect("task row");
+        let workers = tx.list_workers(&Namespace::new("ns"), true).await.unwrap();
+        let _ = tx.commit_dyn().await;
+        assert_eq!(task.status, taskq_storage::TaskStatus::Pending);
+        assert_eq!(
+            task.attempt_number, 1,
+            "concurrent ticks must not double-bump attempt"
+        );
+        let worker = workers
+            .into_iter()
+            .find(|w| w.worker_id == worker_id)
+            .expect("worker row");
+        assert!(worker.declared_dead_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn reaper_a_repeat_tick_after_reclaim_is_a_noop() {
+        // Arrange: expired runtime, reaped once.
+        let state = build_state().await;
+        let (task_id, _) = seed_expired_runtime(&state, "ns", "type").await;
+        reaper_a_tick(Arc::clone(&state)).await.unwrap();
+
+        // Act: second tick has nothing to do -- the runtime row is
+        // gone. Must not error.
+        reaper_a_tick(Arc::clone(&state)).await.unwrap();
+
+        // Assert: task still in PENDING with attempt = 1.
+        let mut tx = state.storage.begin_dyn().await.unwrap();
+        let task = tx.get_task_by_id(task_id).await.unwrap().expect("task row");
+        let _ = tx.commit_dyn().await;
+        assert_eq!(task.status, taskq_storage::TaskStatus::Pending);
+        assert_eq!(task.attempt_number, 1);
+    }
+
     #[tokio::test]
     async fn reaper_b_marks_dead_worker_and_reclaims() {
         // Arrange: insert a runtime row with a recent (not-yet-expired)
