@@ -8,6 +8,13 @@ repos:
       - id: check-added-large-files
       - id: check-merge-conflict
 
+  # Spell-check across source, docs, and comments. Mirrors the `typos`
+  # CI job so contributors catch issues before pushing.
+  - repo: https://github.com/crate-ci/typos
+    rev: v1.27.0
+    hooks:
+      - id: typos
+
   - repo: local
     hooks:
       - id: cargo-fmt

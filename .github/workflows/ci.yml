@@ -6,6 +6,12 @@ on:
   pull_request:
     branches: [main]
 
+# Cancel in-flight runs on the same ref when a new push lands. Avoids
+# wasting compute on stale commits during rapid `--force` cycles.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -13,6 +19,7 @@ jobs:
   fmt:
     name: Format
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v5
         with:
@@ -28,6 +35,7 @@ jobs:
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
         with:
@@ -45,6 +53,7 @@ jobs:
   test:
     name: Test (workspace)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
         with:
@@ -60,6 +69,7 @@ jobs:
   postgres:
     name: Postgres conformance
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     services:
       postgres:
         image: postgres:16
@@ -86,12 +96,19 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Run Postgres backend tests (smoke + conformance)
-        run: cargo test -p taskq-storage-postgres --no-fail-fast -- --include-ignored
+      # smoke.rs uses `ALTER DATABASE ... SET search_path` for
+      # schema isolation, which races on `pg_db_role_setting`'s
+      # unique constraint when two tests run in parallel. admin.rs
+      # uses per-connection `options=-c search_path=...` instead.
+      # Until smoke.rs is migrated to that pattern, serialize this
+      # job's tests.
+      - name: Run Postgres backend tests (smoke + conformance + admin)
+        run: cargo test -p taskq-storage-postgres --no-fail-fast -- --include-ignored --test-threads=1
 
   build:
     name: Build (release)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
         with:
@@ -107,6 +124,7 @@ jobs:
   e2e:
     name: E2E (docker compose)
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v5
         with:
@@ -116,19 +134,73 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # Build the cp + cli release binaries first; the Dockerfile
-      # invokes `cargo build --release -p taskq-cp -p taskq-cli`
-      # itself, but doing it here primes the rust-cache so subsequent
-      # CI runs are fast. The image build still re-builds inside the
-      # container (Linux glibc != possibly-different host).
       - name: Prebuild release binaries
         run: cargo build --release -p taskq-cp -p taskq-cli
 
       - name: Build CP docker image
         run: docker build -f docker/Dockerfile.cp -t taskq-rs/cp:e2e .
 
-      # Run sequentially -- each test owns its compose project but
-      # they share the docker daemon and would race for free ports
-      # otherwise.
       - name: Run E2E tests
         run: cargo test -p taskq-e2e-tests --no-fail-fast -- --include-ignored --test-threads=1
+
+  doc:
+    name: Doc build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Build all rustdoc to catch syntax errors and missing items.
+      # Strict intra-doc-link checking is NOT enforced here — the
+      # current source has ~20 pre-existing broken-link / public-to-
+      # private warnings that are out of scope for this CI setup.
+      # Tracked separately; flip to `-D rustdoc::broken-intra-doc-links`
+      # once those land.
+      - name: cargo doc
+        run: cargo doc --workspace --no-deps --document-private-items
+
+  audit:
+    name: Cargo audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Don't block merges on advisory DB hiccups -- the action runs
+    # but the job is allowed to fail (visible in the run summary,
+    # doesn't gate the PR). Local cargo-audit 0.21.2 errors on
+    # CVSS:4.0 entries in the advisory DB; the rustsec action ships
+    # its own pinned cargo-audit and may avoid the issue, but we
+    # don't want one bad advisory to red-X the pipeline.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # rustsec/audit-check requires Cargo.lock. The workspace
+      # gitignores Cargo.lock (library-style; binaries are taskq-cp /
+      # taskq-cli only). Generate one on the fly so the action can
+      # walk the dep graph.
+      - name: Generate Cargo.lock
+        run: cargo generate-lockfile
+
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  typos:
+    name: Typos
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - uses: crate-ci/typos@v1.27.0

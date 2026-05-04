@@ -1,0 +1,32 @@
+# Typos config — see https://github.com/crate-ci/typos for the full
+# schema. Keep allowlist items narrow: each entry is a real word the
+# checker would otherwise flag.
+
+[default.extend-words]
+# Postgres index type — short for Block Range Index.
+BRIN = "BRIN"
+brin = "brin"
+# False-positive substrings of `INSERTs` / `UPDATEs` (typos splits at
+# upper→lower transitions, so the all-caps prefix becomes a word
+# token).
+INSER = "INSER"
+UPDAT = "UPDAT"
+# `mis-classifies`, `mis-prefixed`, etc. — common English prefix.
+mis = "mis"
+# Hex digit pairs in commit SHAs that happen to spell English-like
+# bigrams (`c53ba09`, etc.).
+ba = "ba"
+# `crate` field names commonly truncate to non-words.
+typ = "typ"
+
+[files]
+# Skip generated / vendored content. `target/` is excluded by default
+# but we list it for clarity.
+extend-exclude = [
+    "target/**",
+    "Cargo.lock",
+    "**/*.min.js",
+    # FlatBuffers-generated grpc stubs live in OUT_DIR; tarpaulin
+    # reports also live under target.
+    "**/build.rs",
+]
