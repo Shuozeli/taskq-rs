@@ -593,6 +593,31 @@ fn populate_result_fields(resp: &mut GetTaskResultResponse, row: TaskResultRow) 
     }
 }
 
+/// `BatchTaskResult` mirrors `GetTaskResultResponse`'s
+/// outcome/result_payload/failure fields per row but doesn't share
+/// the same struct, so the population logic is duplicated. Kept
+/// parallel with [`populate_result_fields`] for the single-result
+/// case.
+fn populate_batch_result_fields(row: &mut BatchTaskResult, result_row: TaskResultRow) {
+    row.outcome = wire_outcome(result_row.outcome);
+    if let Some(payload) = result_row.result_payload {
+        row.result_payload = Some(payload.to_vec());
+    }
+    if matches!(
+        result_row.outcome,
+        TaskOutcomeKind::RetryableFail
+            | TaskOutcomeKind::NonretryableFail
+            | TaskOutcomeKind::Expired
+    ) {
+        let mut failure = WireFailure::default();
+        failure.error_class = result_row.error_class;
+        failure.message = result_row.error_message;
+        failure.details = result_row.error_details.map(|d| d.to_vec());
+        failure.retryable = matches!(result_row.outcome, TaskOutcomeKind::RetryableFail);
+        row.failure = Some(Box::new(failure));
+    }
+}
+
 fn wire_outcome(kind: TaskOutcomeKind) -> WireTaskOutcome {
     match kind {
         TaskOutcomeKind::Success => WireTaskOutcome::SUCCESS,
@@ -647,16 +672,24 @@ async fn batch_get_task_results_impl(
             async move {
                 let mut tx = state.storage.begin_dyn().await?;
                 let task = tx.get_task_by_id(task_id).await?;
+                let result = if task.is_some() {
+                    tx.get_latest_task_result(task_id).await?
+                } else {
+                    None
+                };
                 tx.commit_dyn().await?;
-                Ok(task)
+                Ok((task, result))
             }
         })
         .await;
         match lookup {
-            Ok(Some(task)) => {
+            Ok((Some(task), result_opt)) => {
                 row.task = Some(Box::new(storage_task_to_wire(&task)));
+                if let Some(result_row) = result_opt {
+                    populate_batch_result_fields(&mut row, result_row);
+                }
             }
-            Ok(None) => {
+            Ok((None, _)) => {
                 // Per-id miss: leave both `task` and `error` unset so
                 // callers can detect "not found" by absence. v1 has no
                 // TASK_NOT_FOUND reject reason.
