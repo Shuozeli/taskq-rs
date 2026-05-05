@@ -11,8 +11,8 @@
 //! `SqliteStorage::open_in_memory()`, so per-test isolation is automatic.
 
 use taskq_storage_conformance::{
-    bounded_dedup_cleanup, conditional_insert, external_consistency, range_scans, run_all,
-    skip_locking, subscribe_ordering, Options,
+    bounded_dedup_cleanup, conditional_insert, external_consistency, range_scans,
+    retry_progression, run_all, skip_locking, subscribe_ordering, Options,
 };
 use taskq_storage_sqlite::SqliteStorage;
 
@@ -108,6 +108,12 @@ async fn subscribe_ordering_subscribe_pending_observes_post_subscription_commit(
 // permitted to over-deliver wakes per `design.md` §8.2 #5; the contract is
 // "at least one wake on a matching commit", not "exactly one". The Postgres
 // suite (commit-driven NOTIFY) runs this strictly.
+
+#[tokio::test]
+async fn retry_progression_worker_driven_retry_bumps_attempt_and_writes_per_attempt_row() {
+    let s = fresh_storage().await;
+    retry_progression::worker_driven_retry_bumps_attempt_and_writes_per_attempt_row(&s).await;
+}
 
 #[tokio::test]
 async fn bounded_dedup_cleanup_vacuously_satisfied_for_unpartitioned_backend() {

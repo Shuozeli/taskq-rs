@@ -443,17 +443,44 @@ impl StorageTx for SqliteTx {
             .map_err(map_sql_error)?;
 
         // Update tasks.status (and retry_after on WAITING_RETRY).
+        //
+        // On WAITING_RETRY we ALSO bump `attempt_number` so the next
+        // dispatch reads the new value. Without this bump, the next
+        // dispatch reuses the same attempt_number, and the follow-up
+        // `INSERT INTO task_results (task_id, attempt_number, ...)`
+        // hits the PRIMARY KEY (task_id, attempt_number) constraint —
+        // a violation that propagates as a transient error to the
+        // worker and only recovers via Reaper A reclaiming the
+        // orphaned lease (one full `lease_window_seconds` later).
         let retry_after_ms = row.retry_after.map(ts_to_millis);
-        self.conn()
-            .execute(
-                "UPDATE tasks SET status = ?1, retry_after = ?2 WHERE task_id = ?3",
-                params![
-                    row.task_status,
-                    retry_after_ms,
-                    task_id_to_text(&lease.task_id)
-                ],
-            )
-            .map_err(map_sql_error)?;
+        let bump_attempt = row.task_status == "WAITING_RETRY";
+        if bump_attempt {
+            self.conn()
+                .execute(
+                    "UPDATE tasks \
+                        SET status = ?1, \
+                            retry_after = ?2, \
+                            attempt_number = attempt_number + 1 \
+                      WHERE task_id = ?3",
+                    params![
+                        row.task_status,
+                        retry_after_ms,
+                        task_id_to_text(&lease.task_id)
+                    ],
+                )
+                .map_err(map_sql_error)?;
+        } else {
+            self.conn()
+                .execute(
+                    "UPDATE tasks SET status = ?1, retry_after = ?2 WHERE task_id = ?3",
+                    params![
+                        row.task_status,
+                        retry_after_ms,
+                        task_id_to_text(&lease.task_id)
+                    ],
+                )
+                .map_err(map_sql_error)?;
+        }
 
         // Delete the runtime row regardless of outcome — the lease is over.
         self.conn()

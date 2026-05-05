@@ -36,8 +36,8 @@
 use std::sync::Arc;
 
 use taskq_storage_conformance::{
-    bounded_dedup_cleanup, conditional_insert, external_consistency, range_scans, skip_locking,
-    subscribe_ordering,
+    bounded_dedup_cleanup, conditional_insert, external_consistency, range_scans,
+    retry_progression, skip_locking, subscribe_ordering,
 };
 use taskq_storage_postgres::{migrate, PostgresConfig, PostgresStorage};
 use uuid::Uuid;
@@ -251,6 +251,18 @@ async fn subscribe_ordering_subscribe_pending_does_not_observe_pre_subscription_
         return;
     };
     subscribe_ordering::subscribe_pending_does_not_observe_pre_subscription_commit(&*storage).await;
+    drop(storage);
+    drop_db(&dbname).await;
+}
+
+#[tokio::test]
+#[ignore = "requires reachable Postgres at docker.yuacx.com:5432"]
+async fn retry_progression_worker_driven_retry_bumps_attempt_and_writes_per_attempt_row() {
+    let Some((storage, dbname)) = fresh().await else {
+        return;
+    };
+    retry_progression::worker_driven_retry_bumps_attempt_and_writes_per_attempt_row(&*storage)
+        .await;
     drop(storage);
     drop_db(&dbname).await;
 }

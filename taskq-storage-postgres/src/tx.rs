@@ -287,12 +287,18 @@ impl<'a> StorageTx for PostgresTx<'a> {
         let order_sql = pick_ordering_sql(criteria.ordering);
 
         // Build the WHERE clause. Use $1 = task_types, $2 = now, $3 = namespaces.
+        //
+        // We pick BOTH 'PENDING' and 'WAITING_RETRY' tasks here. WAITING_RETRY
+        // rows whose `retry_after` has elapsed are eligible for re-dispatch —
+        // there is no separate timer that promotes WAITING_RETRY back to
+        // PENDING. The SQLite backend's filter is identical (kept in sync
+        // intentionally per the storage-trait conformance contract).
         let mut sql = String::from(
             "SELECT task_id, namespace, task_type, attempt_number, priority, \
                     payload, submitted_at, expires_at, max_retries, retry_initial_ms, \
                     retry_max_ms, retry_coefficient, traceparent, tracestate \
                FROM tasks \
-              WHERE status = 'PENDING' \
+              WHERE status IN ('PENDING', 'WAITING_RETRY') \
                 AND task_type = ANY($1::text[]) \
                 AND (retry_after IS NULL OR retry_after <= $2) ",
         );
@@ -425,15 +431,38 @@ impl<'a> StorageTx for PostgresTx<'a> {
             .map_err(map_db_error)?;
 
         // Update task status (and retry_after when WAITING_RETRY).
-        self.conn
-            .execute(
-                "UPDATE tasks \
-                    SET status = $1::text::taskq_task_status, retry_after = $2 \
-                  WHERE task_id = $3",
-                &[&next_status, &retry_after_chrono, &task_id],
-            )
-            .await
-            .map_err(map_db_error)?;
+        //
+        // On WAITING_RETRY we ALSO bump `attempt_number` so the next
+        // dispatch reads the new value. Without this bump, the next
+        // dispatch reuses the same attempt_number, and the follow-up
+        // INSERT INTO task_results (task_id, attempt_number, ...)
+        // hits the PRIMARY KEY (task_id, attempt_number) constraint —
+        // a violation that propagates as a transient error to the
+        // worker and only recovers via Reaper A reclaiming the
+        // orphaned lease (one full `lease_window_seconds` later).
+        if next_status == STATUS_WAITING_RETRY {
+            self.conn
+                .execute(
+                    "UPDATE tasks \
+                        SET status = $1::text::taskq_task_status, \
+                            retry_after = $2, \
+                            attempt_number = attempt_number + 1 \
+                      WHERE task_id = $3",
+                    &[&next_status, &retry_after_chrono, &task_id],
+                )
+                .await
+                .map_err(map_db_error)?;
+        } else {
+            self.conn
+                .execute(
+                    "UPDATE tasks \
+                        SET status = $1::text::taskq_task_status, retry_after = $2 \
+                      WHERE task_id = $3",
+                    &[&next_status, &retry_after_chrono, &task_id],
+                )
+                .await
+                .map_err(map_db_error)?;
+        }
 
         // Delete runtime row.
         self.conn

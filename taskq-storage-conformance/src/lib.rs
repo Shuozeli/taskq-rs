@@ -52,6 +52,7 @@ pub mod conditional_insert;
 pub mod external_consistency;
 pub mod helpers;
 pub mod range_scans;
+pub mod retry_progression;
 pub mod skip_locking;
 pub mod subscribe_ordering;
 
@@ -137,6 +138,13 @@ where
         let s = setup().await;
         subscribe_ordering::subscribe_pending_does_not_observe_pre_subscription_commit(&s).await;
     }
+
+    // Worker-driven retry progression (cross-backend correctness invariant
+    // separate from §8.2 #1–#6). Asserts WAITING_RETRY → re-dispatch and
+    // attempt_number bump. Both currently-supported backends MUST satisfy
+    // this; there is no opt-out flag.
+    let s = setup().await;
+    retry_progression::worker_driven_retry_bumps_attempt_and_writes_per_attempt_row(&s).await;
 
     // Bounded dedup cleanup (§8.2 #6).
     if options.vacuously_satisfied_bounded_cleanup {
