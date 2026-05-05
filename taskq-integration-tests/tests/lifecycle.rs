@@ -4,19 +4,20 @@
 //! via the SDK, exercises one path from `design.md` Sec 6, and asserts on
 //! the observable outcome (terminal state, attempt counter, audit log).
 //!
-//! Reads happen against the harness's sidecar SQLite reader because the
-//! CP's `GetTaskResult` handler is still a Phase 5b stub (`Status::
-//! unimplemented`); polling the on-disk row gives us the same end-to-end
-//! signal without depending on the unfinished read RPC.
+//! Reads happen via either the harness's sidecar SQLite reader (status
+//! polling, where wire latency would be a distraction) or via the caller
+//! SDK's `get_result` (when we want to assert that the wire-level
+//! `task_results` projection round-trips through `taskq-cp`'s
+//! `GetTaskResult` handler).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use taskq_caller_sdk::{CancelOutcome, SubmitOutcome, SubmitRequest, TaskId};
+use taskq_caller_sdk::{CancelOutcome, SubmitOutcome, SubmitRequest, TaskId, TaskOutcome};
 use taskq_integration_tests::{spawn_worker, TestHarness};
-use taskq_worker_sdk::HandlerOutcome;
+use taskq_worker_sdk::{ErrorClassRegistry, HandlerOutcome};
 
 const NS: &str = "test";
 
@@ -219,14 +220,124 @@ async fn cancel_after_complete_returns_already_terminal() {
     harness.shutdown().await;
 }
 
+#[tokio::test]
+async fn read_side_surfaces_success_with_payload() {
+    // Arrange: a worker that echoes the payload as Success.
+    let harness = TestHarness::start_in_memory().await;
+    harness.seed_namespace(NS).await;
+
+    let worker = harness
+        .worker_for(NS, vec!["echo"], move |task| async move {
+            HandlerOutcome::Success(task.payload)
+        })
+        .await
+        .expect("worker_for");
+    let (worker_stop, worker_handle) = spawn_worker(worker);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut caller = harness.caller().await;
+
+    // Act: submit, wait for the task to land terminal, then read via the
+    // wire path (not the sidecar reader) so we exercise the
+    // `task_results` projection through `taskq-cp::handlers::get_task_result_impl`.
+    let submit = caller
+        .submit(SubmitRequest::new(NS, "echo", Bytes::from_static(b"hello")))
+        .await
+        .expect("submit");
+    let task_id = match submit {
+        SubmitOutcome::Created { task_id, .. } => task_id,
+        other => panic!("expected Created, got {other:?}"),
+    };
+    let _ = wait_for_terminal_status(&harness, &task_id, Duration::from_secs(10)).await;
+    let state = caller.get_result(&task_id).await.expect("get_result");
+
+    // Assert: the read-side surfaces the worker-reported outcome and
+    // round-trips the payload bytes byte-for-byte.
+    use taskq_caller_sdk::TerminalState;
+    assert_eq!(state.status, TerminalState::COMPLETED);
+    assert_eq!(state.outcome, Some(TaskOutcome::Success));
+    assert_eq!(
+        state.result_payload.as_deref(),
+        Some(b"hello".as_slice()),
+        "result_payload must round-trip through task_results table"
+    );
+    assert!(
+        state.failure.is_none(),
+        "Success outcome must not carry a failure record"
+    );
+
+    let _ = worker_stop.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(5), worker_handle).await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn read_side_surfaces_nonretryable_failure_with_class_message_details() {
+    // Arrange: a worker that returns NonRetryableFailure with the full
+    // class+message+details triple so we can assert all three fields
+    // round-trip through the `task_results` projection.
+    let harness = TestHarness::start_in_memory().await;
+    harness.seed_namespace(NS).await;
+
+    let worker = harness
+        .worker_for(NS, vec!["broken"], move |_task| async move {
+            let registry = ErrorClassRegistry::new(["permanent"]);
+            HandlerOutcome::NonRetryableFailure {
+                error_class: registry.error_class("permanent").unwrap(),
+                message: "card declined".into(),
+                details: Some(Bytes::from_static(b"detail-payload")),
+            }
+        })
+        .await
+        .expect("worker_for");
+    let (worker_stop, worker_handle) = spawn_worker(worker);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut caller = harness.caller().await;
+
+    // Act
+    let submit = caller
+        .submit(SubmitRequest::new(NS, "broken", Bytes::from_static(b"x")))
+        .await
+        .expect("submit");
+    let task_id = match submit {
+        SubmitOutcome::Created { task_id, .. } => task_id,
+        other => panic!("expected Created, got {other:?}"),
+    };
+    let status = wait_for_terminal_status(&harness, &task_id, Duration::from_secs(10)).await;
+    assert_eq!(status, "FAILED_NONRETRYABLE");
+    let state = caller.get_result(&task_id).await.expect("get_result");
+
+    // Assert: the wire path projects the worker-reported failure record
+    // with class, message, details, and `retryable=false` all intact.
+    use taskq_caller_sdk::TerminalState;
+    assert_eq!(state.status, TerminalState::FAILED_NONRETRYABLE);
+    assert_eq!(state.outcome, Some(TaskOutcome::NonretryableFail));
+    assert!(
+        state.result_payload.is_none(),
+        "failure outcomes must not carry a result_payload"
+    );
+    let failure = state.failure.expect("failure record present");
+    assert_eq!(failure.error_class, "permanent");
+    assert_eq!(failure.message, "card declined");
+    assert_eq!(failure.details.as_ref(), b"detail-payload");
+    assert!(!failure.retryable);
+
+    let _ = worker_stop.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(5), worker_handle).await;
+    harness.shutdown().await;
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 /// Poll the harness's SQLite directly until `task_id` reaches a terminal
-/// state or `deadline` elapses. The CP's `get_task_result` handler is still
-/// a Phase 5b stub (`Status::unimplemented`), so integration tests inspect
-/// task rows via the sidecar reader rather than the wire.
+/// state or `deadline` elapses. We read the row directly (rather than
+/// going through the CP's `GetTaskResult` RPC) because terminal-status
+/// polling doesn't need the wire round-trip; tests that *do* care about
+/// the wire projection (e.g. `read_side_surfaces_*`) call
+/// `caller.get_result` instead.
 async fn wait_for_terminal_status(
     harness: &TestHarness,
     task_id: &TaskId,
