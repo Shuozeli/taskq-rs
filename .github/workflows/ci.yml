@@ -169,13 +169,6 @@ jobs:
     name: Cargo audit
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # Don't block merges on advisory DB hiccups -- the action runs
-    # but the job is allowed to fail (visible in the run summary,
-    # doesn't gate the PR). Local cargo-audit 0.21.2 errors on
-    # CVSS:4.0 entries in the advisory DB; the rustsec action ships
-    # its own pinned cargo-audit and may avoid the issue, but we
-    # don't want one bad advisory to red-X the pipeline.
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v5
         with:
@@ -190,9 +183,14 @@ jobs:
       - name: Generate Cargo.lock
         run: cargo generate-lockfile
 
+      # New advisories fail this job loudly. The ignore list mirrors
+      # `audit.toml` at the workspace root (the action doesn't auto-
+      # read that file, but `audit.toml` carries the rationale for
+      # humans). Keep both in sync if either changes.
       - uses: rustsec/audit-check@v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          ignore: RUSTSEC-2024-0437
 
   typos:
     name: Typos
