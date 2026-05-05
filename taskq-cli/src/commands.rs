@@ -28,7 +28,7 @@ use taskq_proto::{
 use crate::cli::{
     Cli, ListWorkersArgs, NamespaceCmd, PurgeArgs, ReplayArgs, SetQuotaArgs, StatsArgs,
 };
-use crate::connect::connect_admin;
+use crate::connect::{auth_request, connect_admin};
 use crate::error::CliError;
 use crate::output::{render, render_kv, render_status, render_table, OutputFormat, Renderable};
 
@@ -270,7 +270,7 @@ async fn cmd_namespace_create(
         req.audit_note = Some(note);
     }
     let resp = client
-        .set_namespace_quota(req)
+        .set_namespace_quota(auth_request(token, req))
         .await
         .map_err(|s| lift_transport(endpoint, s))?
         .into_inner();
@@ -350,7 +350,7 @@ async fn cmd_namespace_list(
     let mut req = GetStatsRequest::default();
     req.namespace = Some(namespace.to_owned());
     let resp = client
-        .get_stats(req)
+        .get_stats(auth_request(token, req))
         .await
         .map_err(|s| lift_transport(endpoint, s))?
         .into_inner();
@@ -393,7 +393,7 @@ async fn cmd_namespace_enable(
         req.audit_note = Some(note);
     }
     let resp = client
-        .enable_namespace(req)
+        .enable_namespace(auth_request(token, req))
         .await
         .map_err(|s| lift_transport(endpoint, s))?
         .into_inner();
@@ -433,7 +433,7 @@ async fn cmd_namespace_disable(
         req.audit_note = Some(note);
     }
     let resp = client
-        .disable_namespace(req)
+        .disable_namespace(auth_request(token, req))
         .await
         .map_err(|s| lift_transport(endpoint, s))?
         .into_inner();
@@ -528,7 +528,7 @@ async fn cmd_set_quota(
         req.audit_note = Some(note);
     }
     let resp = client
-        .set_namespace_quota(req)
+        .set_namespace_quota(auth_request(token, req))
         .await
         .map_err(|s| lift_transport(endpoint, s))?
         .into_inner();
@@ -619,7 +619,7 @@ async fn cmd_purge(
     let composed_note = compose_audit_note(args.audit_note.clone(), &args.status);
     req.audit_note = composed_note;
     let resp = client
-        .purge_tasks(req)
+        .purge_tasks(auth_request(token, req))
         .await
         .map_err(|s| lift_transport(endpoint, s))?
         .into_inner();
@@ -749,7 +749,7 @@ async fn cmd_replay(
         req.audit_note = Some(note);
     }
     let resp = client
-        .replay_dead_letters(req)
+        .replay_dead_letters(auth_request(token, req))
         .await
         .map_err(|s| lift_transport(endpoint, s))?
         .into_inner();
@@ -840,7 +840,7 @@ async fn cmd_stats(
     let mut req = GetStatsRequest::default();
     req.namespace = Some(args.namespace.clone());
     let resp = client
-        .get_stats(req)
+        .get_stats(auth_request(token, req))
         .await
         .map_err(|s| lift_transport(endpoint, s))?
         .into_inner();
@@ -939,7 +939,7 @@ async fn cmd_list_workers(
         req.page_token = Some("include_dead".to_owned());
     }
     let resp = client
-        .list_workers(req)
+        .list_workers(auth_request(token, req))
         .await
         .map_err(|s| lift_transport(endpoint, s))?
         .into_inner();
