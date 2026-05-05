@@ -328,6 +328,46 @@ async fn read_side_surfaces_nonretryable_failure_with_class_message_details() {
     harness.shutdown().await;
 }
 
+#[tokio::test]
+async fn read_side_surfaces_cancelled_outcome_without_task_results_row() {
+    // Arrange: no worker. Submit, then cancel before any worker
+    // touches it. `cancel_task` doesn't write a `task_results` row —
+    // there's no per-attempt failure detail to capture — so the
+    // read-side has to derive `outcome=Cancelled` from the task's
+    // status. Without that fallback, callers see
+    // `state.outcome == None` for a CANCELLED task, which is
+    // indistinguishable from "no terminal outcome yet".
+    let harness = TestHarness::start_in_memory().await;
+    harness.seed_namespace(NS).await;
+    let mut caller = harness.caller().await;
+
+    // Act
+    let submit = caller
+        .submit(SubmitRequest::new(NS, "noop", Bytes::from_static(b"x")))
+        .await
+        .expect("submit");
+    let task_id = match submit {
+        SubmitOutcome::Created { task_id, .. } => task_id,
+        other => panic!("expected Created, got {other:?}"),
+    };
+    let cancel = caller.cancel(&task_id).await.expect("cancel");
+    assert!(matches!(cancel, CancelOutcome::Cancelled { .. }));
+    let state = caller.get_result(&task_id).await.expect("get_result");
+
+    // Assert
+    use taskq_caller_sdk::TerminalState;
+    assert_eq!(state.status, TerminalState::CANCELLED);
+    assert_eq!(
+        state.outcome,
+        Some(TaskOutcome::Cancelled),
+        "CANCELLED task must report outcome=Cancelled even without a task_results row"
+    );
+    assert!(state.result_payload.is_none());
+    assert!(state.failure.is_none());
+
+    harness.shutdown().await;
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------

@@ -575,6 +575,7 @@ async fn get_task_result_impl(
     resp.server_version = Some(Box::new(server_semver()));
     match task_opt {
         Some(task) => {
+            resp.outcome = derive_default_outcome(task.status);
             resp.task = Some(Box::new(storage_task_to_wire(&task)));
             if let Some(row) = result_opt {
                 populate_result_fields(&mut resp, row);
@@ -589,10 +590,34 @@ async fn get_task_result_impl(
     Ok(resp)
 }
 
+/// Default `outcome` derived purely from the task's status, used when
+/// no `task_results` row exists. The wire `TaskOutcome` enum lacks an
+/// `UNSPECIFIED` variant (its default is numeric 0 = `SUCCESS`), so
+/// without this fallback a CANCELLED or EXPIRED task would be
+/// indistinguishable from a successful one on the wire. `cancel_task`
+/// and the EXPIRED reaper transitions don't write a `task_results`
+/// row — there's no per-attempt failure detail to capture — so the
+/// status itself is the authoritative source for those outcomes.
+///
+/// For non-terminal statuses we surface `SUCCESS` (the wire default)
+/// because the v1 schema cannot represent "outcome unset"; callers
+/// are expected to gate on `state.status` before inspecting `outcome`
+/// and the SDK docs reflect that contract.
+fn derive_default_outcome(status: TaskStatus) -> WireTaskOutcome {
+    match status {
+        TaskStatus::Cancelled => WireTaskOutcome::CANCELLED,
+        TaskStatus::Expired => WireTaskOutcome::EXPIRED,
+        _ => WireTaskOutcome::SUCCESS,
+    }
+}
+
 /// Map a stored `TaskResultRow` onto the wire response's `outcome` /
 /// `result_payload` / `failure` fields. `Success` populates
 /// `result_payload`; the failure variants populate `failure` with
-/// the captured error class / message / details.
+/// the captured error class / message / details. When no
+/// `task_results` row exists, callers should pre-populate `outcome`
+/// from [`derive_default_outcome`] before invoking this helper —
+/// `populate_result_fields` is the worker-reported-row branch only.
 fn populate_result_fields(resp: &mut GetTaskResultResponse, row: TaskResultRow) {
     resp.outcome = wire_outcome(row.outcome);
     if let Some(payload) = row.result_payload {
@@ -704,6 +729,7 @@ async fn batch_get_task_results_impl(
         .await;
         match lookup {
             Ok((Some(task), result_opt)) => {
+                row.outcome = derive_default_outcome(task.status);
                 row.task = Some(Box::new(storage_task_to_wire(&task)));
                 if let Some(result_row) = result_opt {
                     populate_batch_result_fields(&mut row, result_row);
@@ -1404,5 +1430,47 @@ mod tests {
             results[2].task.is_none() && results[2].error.is_none(),
             "missing-but-well-formed id -> both unset"
         );
+    }
+
+    #[test]
+    fn derive_default_outcome_maps_cancelled_and_expired_from_status() {
+        // Arrange / Act / Assert: the read-side fallback for tasks
+        // that don't get a `task_results` row. The wire enum's
+        // numeric default is `SUCCESS`, so any non-mapped status
+        // would otherwise leak as a misleading "Success" outcome.
+        assert_eq!(
+            derive_default_outcome(TaskStatus::Cancelled),
+            WireTaskOutcome::CANCELLED
+        );
+        assert_eq!(
+            derive_default_outcome(TaskStatus::Expired),
+            WireTaskOutcome::EXPIRED
+        );
+    }
+
+    #[test]
+    fn derive_default_outcome_falls_through_to_success_for_other_statuses() {
+        // Arrange / Act / Assert: non-Cancelled/non-Expired statuses
+        // surface the wire default. Callers are expected to gate on
+        // `state.status` before inspecting `outcome`; the v1 schema
+        // can't represent "outcome unset". This is a regression-net
+        // for the Cancelled/Expired branches above so a future
+        // contributor doesn't accidentally turn the match into a
+        // catch-all.
+        for status in [
+            TaskStatus::Pending,
+            TaskStatus::Dispatched,
+            TaskStatus::Completed,
+            TaskStatus::FailedNonretryable,
+            TaskStatus::FailedExhausted,
+            TaskStatus::WaitingRetry,
+        ] {
+            assert_eq!(
+                derive_default_outcome(status),
+                WireTaskOutcome::SUCCESS,
+                "{:?} should fall through to SUCCESS until task_results overrides",
+                status
+            );
+        }
     }
 }
