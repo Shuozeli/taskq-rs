@@ -456,6 +456,82 @@ async fn batch_get_results_surfaces_mixed_outcomes_across_ids() {
     harness.shutdown().await;
 }
 
+#[tokio::test]
+async fn read_side_surfaces_failed_exhausted_with_retryable_failure_record() {
+    // Arrange: a worker that always reports RetryableFailure with the
+    // full class+message+details triple. With max_retries=1 the CP
+    // classifies attempt 0 as WAITING_RETRY, then attempt 1 as
+    // FailedExhausted (§6.5). The task lands in `FAILED_EXHAUSTED`
+    // with a `task_results` row whose outcome is `RetryableFail`
+    // (the LAST failure was retryable; the BUDGET was exhausted) and
+    // whose `failure.retryable=true`.
+    //
+    // This exercises three paths none of the prior read-side tests
+    // touched:
+    //   1. The wire enum's `RETRYABLE_FAIL` variant.
+    //   2. `failure.retryable=true` round-tripping through the
+    //      caller SDK as `Failure { retryable: true, .. }`.
+    //   3. The TerminalState::FAILED_EXHAUSTED branch in
+    //      `task_status_to_wire`.
+    let harness = TestHarness::start_in_memory().await;
+    harness.seed_namespace(NS).await;
+
+    let worker = harness
+        .worker_for(NS, vec!["flake"], move |_task| async move {
+            let registry = ErrorClassRegistry::new(["transient"]);
+            HandlerOutcome::RetryableFailure {
+                error_class: registry.error_class("transient").unwrap(),
+                message: "upstream timeout".into(),
+                details: Some(Bytes::from_static(b"trace=503")),
+            }
+        })
+        .await
+        .expect("worker_for");
+    let (worker_stop, worker_handle) = spawn_worker(worker);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut caller = harness.caller().await;
+
+    // Act: submit with max_retries=1 + a tight retry_initial_ms so
+    // exhaustion lands in well under the wait_for budget.
+    use taskq_caller_sdk::RetryConfigOverride;
+    let mut req = SubmitRequest::new(NS, "flake", Bytes::from_static(b"x"));
+    req.max_retries = Some(1);
+    req.retry_config = Some(RetryConfigOverride {
+        initial_ms: 10,
+        max_ms: 50,
+        coefficient: 2.0,
+        max_retries: 1,
+    });
+    let submit = caller.submit(req).await.expect("submit");
+    let task_id = match submit {
+        SubmitOutcome::Created { task_id, .. } => task_id,
+        other => panic!("expected Created, got {other:?}"),
+    };
+    let status = wait_for_terminal_status(&harness, &task_id, Duration::from_secs(10)).await;
+    assert_eq!(status, "FAILED_EXHAUSTED");
+    let state = caller.get_result(&task_id).await.expect("get_result");
+
+    // Assert: status is FAILED_EXHAUSTED, outcome is RetryableFail,
+    // and the failure record has retryable=true.
+    use taskq_caller_sdk::TerminalState;
+    assert_eq!(state.status, TerminalState::FAILED_EXHAUSTED);
+    assert_eq!(state.outcome, Some(TaskOutcome::RetryableFail));
+    assert!(state.result_payload.is_none());
+    let failure = state.failure.expect("failure record present");
+    assert_eq!(failure.error_class, "transient");
+    assert_eq!(failure.message, "upstream timeout");
+    assert_eq!(failure.details.as_ref(), b"trace=503");
+    assert!(
+        failure.retryable,
+        "FAILED_EXHAUSTED keeps retryable=true on the last failure record"
+    );
+
+    let _ = worker_stop.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(5), worker_handle).await;
+    harness.shutdown().await;
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
