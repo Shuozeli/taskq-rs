@@ -593,11 +593,17 @@ async fn get_task_result_impl(
 /// Default `outcome` derived purely from the task's status, used when
 /// no `task_results` row exists. The wire `TaskOutcome` enum lacks an
 /// `UNSPECIFIED` variant (its default is numeric 0 = `SUCCESS`), so
-/// without this fallback a CANCELLED or EXPIRED task would be
-/// indistinguishable from a successful one on the wire. `cancel_task`
-/// and the EXPIRED reaper transitions don't write a `task_results`
-/// row — there's no per-attempt failure detail to capture — so the
-/// status itself is the authoritative source for those outcomes.
+/// without this fallback a CANCELLED task — `cancel_task` doesn't
+/// write a `task_results` row, there's no per-attempt failure detail
+/// to capture — would be indistinguishable from a successful one on
+/// the wire.
+///
+/// `EXPIRED` is included defensively: today every EXPIRED task
+/// reaches that state via the worker-reported retry-past-TTL path
+/// in `complete_task`, which DOES write a `task_results` row. But
+/// keeping the mapping here means a future PENDING-TTL transition
+/// (e.g. an explicit reaper for stale unstarted tasks) won't have
+/// to remember to also touch the read-side.
 ///
 /// For non-terminal statuses we surface `SUCCESS` (the wire default)
 /// because the v1 schema cannot represent "outcome unset"; callers

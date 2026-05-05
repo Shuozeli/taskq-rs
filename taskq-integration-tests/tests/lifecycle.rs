@@ -368,6 +368,94 @@ async fn read_side_surfaces_cancelled_outcome_without_task_results_row() {
     harness.shutdown().await;
 }
 
+#[tokio::test]
+async fn batch_get_results_surfaces_mixed_outcomes_across_ids() {
+    // Arrange: spin up two tasks in different terminal states to
+    // exercise the per-row population in `batch_get_task_results_impl`:
+    //
+    // - one CANCELLED task (no `task_results` row → outcome derives
+    //   from `task.status`)
+    // - one COMPLETED task (worker-reported `task_results` row
+    //   overrides the default and supplies `result_payload`)
+    //
+    // Without the batch-path fix, the CANCELLED row would surface
+    // outcome=Success — same bug as the single-id path, just per row.
+    let harness = TestHarness::start_in_memory().await;
+    harness.seed_namespace(NS).await;
+
+    let worker = harness
+        .worker_for(NS, vec!["echo"], move |task| async move {
+            HandlerOutcome::Success(task.payload)
+        })
+        .await
+        .expect("worker_for");
+    let (worker_stop, worker_handle) = spawn_worker(worker);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut caller = harness.caller().await;
+
+    // The cancelled task: submit then cancel before any worker
+    // touches it. Use a task_type the worker isn't subscribed to so
+    // the cancel race never loses to a fast dispatch.
+    let cancelled_submit = caller
+        .submit(SubmitRequest::new(
+            NS,
+            "noop",
+            Bytes::from_static(b"cancel-payload"),
+        ))
+        .await
+        .expect("submit");
+    let cancelled_id = match cancelled_submit {
+        SubmitOutcome::Created { task_id, .. } => task_id,
+        other => panic!("expected Created, got {other:?}"),
+    };
+    let cancel = caller.cancel(&cancelled_id).await.expect("cancel");
+    assert!(matches!(cancel, CancelOutcome::Cancelled { .. }));
+
+    // The completed task: submit and let the worker echo it.
+    let completed_submit = caller
+        .submit(SubmitRequest::new(
+            NS,
+            "echo",
+            Bytes::from_static(b"echo-me"),
+        ))
+        .await
+        .expect("submit");
+    let completed_id = match completed_submit {
+        SubmitOutcome::Created { task_id, .. } => task_id,
+        other => panic!("expected Created, got {other:?}"),
+    };
+    let _ = wait_for_terminal_status(&harness, &completed_id, Duration::from_secs(10)).await;
+
+    // Act
+    let states = caller
+        .batch_get_results(&[cancelled_id.clone(), completed_id.clone()])
+        .await
+        .expect("batch_get_results");
+
+    // Assert: order is preserved; each row carries the right outcome.
+    use taskq_caller_sdk::TerminalState;
+    assert_eq!(states.len(), 2);
+
+    assert_eq!(states[0].task_id.as_str(), cancelled_id.as_str());
+    assert_eq!(states[0].status, TerminalState::CANCELLED);
+    assert_eq!(states[0].outcome, Some(TaskOutcome::Cancelled));
+    assert!(states[0].result_payload.is_none());
+    assert!(states[0].failure.is_none());
+
+    assert_eq!(states[1].task_id.as_str(), completed_id.as_str());
+    assert_eq!(states[1].status, TerminalState::COMPLETED);
+    assert_eq!(states[1].outcome, Some(TaskOutcome::Success));
+    assert_eq!(
+        states[1].result_payload.as_deref(),
+        Some(b"echo-me".as_slice())
+    );
+
+    let _ = worker_stop.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(5), worker_handle).await;
+    harness.shutdown().await;
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
