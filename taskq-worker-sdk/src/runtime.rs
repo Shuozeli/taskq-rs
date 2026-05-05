@@ -952,7 +952,18 @@ async fn join_acquire_loops(
     deadline: tokio::time::Instant,
     inflight: Arc<InFlight>,
 ) -> DrainOutcome {
+    // Snapshot abort handles before we consume the JoinHandles so we
+    // can cancel any acquire loop that's still parked in a long-poll
+    // gRPC call after the drain deadline. Without this, an abandoned
+    // long-poll keeps its server-side waiter alive in the CP's
+    // WaiterPool — and a freshly-PENDING task (e.g. from a
+    // ReplayDeadLetters) gets dispatched to the now-dead worker.
+    let abort_handles: Vec<tokio::task::AbortHandle> =
+        handles.iter().map(|h| h.abort_handle()).collect();
+
     let mut last_err: Option<String> = None;
+    let mut any_timed_out = false;
+    let mut timeout_outcome: Option<DrainOutcome> = None;
     for handle in handles {
         let timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
         match tokio::time::timeout(timeout, handle).await {
@@ -961,13 +972,29 @@ async fn join_acquire_loops(
                 last_err = Some(join_err.to_string());
             }
             Err(_elapsed) => {
+                any_timed_out = true;
                 if inflight.len().await > 0 {
-                    return DrainOutcome::Timeout;
+                    timeout_outcome = Some(DrainOutcome::Timeout);
+                    break;
                 }
                 // Loop never returned but no in-flight handlers remain --
-                // treat as drained; the JoinHandle abandoned itself.
+                // treat as drained; the abandoned JoinHandle will be
+                // aborted below so its long-poll gRPC call gets
+                // cancelled cleanly.
             }
         }
+    }
+
+    if any_timed_out {
+        // Cancel any acquire loop still parked in a long-poll. Aborting
+        // a task that already finished is a harmless no-op.
+        for ah in &abort_handles {
+            ah.abort();
+        }
+    }
+
+    if let Some(outcome) = timeout_outcome {
+        return outcome;
     }
     if let Some(msg) = last_err {
         DrainOutcome::JoinError(msg)
@@ -1194,6 +1221,39 @@ mod tests {
 
         // Assert
         assert!(matches!(outcome, DrainOutcome::Drained));
+    }
+
+    #[tokio::test]
+    async fn join_acquire_loops_aborts_abandoned_handle_after_drain_timeout() {
+        // Arrange: a long-running task we'd otherwise leak. We grab
+        // an abort handle on the side so we can assert it gets
+        // cancelled (not just abandoned) once the drain deadline
+        // fires.
+        let inflight = Arc::new(InFlight::default());
+        let handle = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        let abort_handle = handle.abort_handle();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+
+        // Act
+        let outcome = join_acquire_loops(vec![handle], deadline, Arc::clone(&inflight)).await;
+
+        // Assert: drain treats the empty-inflight timeout as Drained,
+        // and the abandoned task has been aborted (not silently
+        // leaked) so its long-poll gRPC call gets cancelled.
+        assert!(matches!(outcome, DrainOutcome::Drained));
+        // Give the abort a moment to land on the runtime's task slot.
+        for _ in 0..50 {
+            if abort_handle.is_finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            abort_handle.is_finished(),
+            "abandoned acquire-loop task must be aborted after drain timeout",
+        );
     }
 
     #[tokio::test]

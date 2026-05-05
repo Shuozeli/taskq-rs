@@ -207,8 +207,19 @@ async fn replay_dead_letters_resets_failed_tasks_to_pending() {
     .await;
 
     // Stop the worker so the replay does not immediately re-fail.
+    // Two things need to be true before we proceed:
+    //   1. The Worker's `run_with_signal` future has exited (so the
+    //      Deregister RPC has been issued).
+    //   2. The CP's per-replica WaiterPool no longer holds the
+    //      worker's long-poll waiter — otherwise the dispatcher
+    //      could match the freshly-replayed task to the lingering
+    //      waiter and we'd assert against `DISPATCHED` instead of
+    //      `PENDING`. The worker SDK aborts abandoned acquire-loop
+    //      tasks on drain, but the gRPC stream cancellation reaches
+    //      the server asynchronously — wait for the drain to land.
     let _ = worker_stop.send(());
     let _ = tokio::time::timeout(Duration::from_secs(5), worker_handle).await;
+    wait_for_waiters_drained(&harness, Duration::from_secs(5)).await;
 
     // Act
     let mut admin = admin_client(&harness).await;
@@ -275,6 +286,28 @@ fn populate_minimal_quota(quota: &mut WireQuota, ns: &str) {
     quota.trace_sampling_ratio = 1.0;
     quota.audit_log_retention_days = 90;
     quota.metrics_export_enabled = true;
+}
+
+/// Poll the CP's per-replica WaiterPool until no waiters remain.
+/// Used to bridge the asynchronous gap between the worker's local
+/// shutdown returning and the CP-side waiter actually being dropped
+/// (the abandoned long-poll's gRPC RST_STREAM has to round-trip).
+async fn wait_for_waiters_drained(harness: &TestHarness, deadline: Duration) {
+    let start = std::time::Instant::now();
+    let pool = harness.cp_state().waiter_pool.clone();
+    loop {
+        if pool.waiter_count_per_replica() == 0 {
+            return;
+        }
+        if start.elapsed() > deadline {
+            panic!(
+                "WaiterPool still has {} waiters after {:?}",
+                pool.waiter_count_per_replica(),
+                deadline
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 async fn wait_until(
