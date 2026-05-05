@@ -735,6 +735,12 @@ pub struct CpState {
     pub config: Arc<CpConfig>,
     pub namespace_config_cache: Arc<NamespaceConfigCache>,
     pub waiter_pool: Arc<WaiterPool>,
+    /// Per-process replica identifier minted at `CpState::new`. Used
+    /// as a metric label on per-replica gauges (`waiters_active`)
+    /// so multi-replica deployments can disambiguate dashboards.
+    /// UUIDv7 for time-orderability when operators eyeball logs +
+    /// metrics together.
+    pub replica_id: String,
 }
 
 impl CpState {
@@ -757,6 +763,7 @@ impl CpState {
             config,
             namespace_config_cache: Arc::new(NamespaceConfigCache::new(cache_ttl)),
             waiter_pool: Arc::new(WaiterPool::new(waiter_limit)),
+            replica_id: uuid::Uuid::now_v7().simple().to_string(),
         }
     }
 }
@@ -1306,6 +1313,59 @@ impl std::error::Error for WaiterLimitExceeded {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::net::SocketAddr;
+
+    use crate::config::{CpConfig, OtelExporterConfig, StorageBackendConfig};
+    use crate::observability::MetricsHandle;
+    use crate::shutdown::channel;
+    use crate::strategy::StrategyRegistry;
+
+    /// Build a minimal `CpState` for tests that need to inspect a
+    /// real instance (rather than just the WaiterPool). Backed by an
+    /// in-memory SQLite so it's hermetic and fast.
+    async fn build_minimal_state() -> Arc<CpState> {
+        let storage = taskq_storage_sqlite::SqliteStorage::open_in_memory()
+            .await
+            .expect("SqliteStorage::open_in_memory");
+        let storage_arc: Arc<dyn DynStorage> = Arc::new(storage);
+        let config = Arc::new(CpConfig {
+            bind_addr: "127.0.0.1:50051".parse::<SocketAddr>().unwrap(),
+            health_addr: "127.0.0.1:9090".parse::<SocketAddr>().unwrap(),
+            storage_backend: StorageBackendConfig::Sqlite {
+                path: ":memory:".to_owned(),
+            },
+            otel_exporter: OtelExporterConfig::Disabled,
+            quota_cache_ttl_seconds: 5,
+            long_poll_default_timeout_seconds: 30,
+            long_poll_max_seconds: 60,
+            belt_and_suspenders_seconds: 10,
+            waiter_limit_per_replica: 100,
+            lease_window_seconds: 30,
+        });
+        let (_tx, rx) = channel();
+        Arc::new(CpState::new(
+            storage_arc,
+            Arc::new(StrategyRegistry::empty()),
+            MetricsHandle::noop(),
+            rx,
+            config,
+        ))
+    }
+
+    #[tokio::test]
+    async fn cp_state_mints_unique_replica_id_per_construction() {
+        // Arrange / Act: two independent CP processes (or two
+        // restarts of one) should each get their own replica_id so
+        // dashboards can disambiguate. UUIDv7 makes collisions
+        // statistically impossible inside one process.
+        let a = build_minimal_state().await;
+        let b = build_minimal_state().await;
+
+        // Assert
+        assert_ne!(a.replica_id, b.replica_id);
+        assert_eq!(a.replica_id.len(), 32, "UUIDv7 simple form is 32 hex chars");
+    }
 
     #[tokio::test]
     async fn register_waiter_enforces_per_replica_cap() {

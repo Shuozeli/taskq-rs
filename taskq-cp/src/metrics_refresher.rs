@@ -206,10 +206,13 @@ impl NamespaceGaugeTracker {
     fn set_waiters_replica(&mut self, state: &Arc<CpState>, value: i64) {
         let delta = value - self.last_waiter_replica;
         if delta != 0 {
-            state
-                .metrics
-                .waiters_active
-                .add(delta, &[KeyValue::new("scope", "replica")]);
+            state.metrics.waiters_active.add(
+                delta,
+                &[
+                    KeyValue::new("scope", "replica"),
+                    KeyValue::new("replica_id", state.replica_id.clone()),
+                ],
+            );
         }
         self.last_waiter_replica = value;
     }
