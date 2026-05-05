@@ -51,6 +51,7 @@ pub struct WorkerBuilder {
     long_poll_timeout: Duration,
     heartbeat_interval: Option<Duration>,
     drain_timeout: Duration,
+    handler_deadline: Option<Duration>,
     labels: Vec<(String, String)>,
     handler: Option<Arc<dyn HandlerObject>>,
 }
@@ -67,6 +68,7 @@ impl WorkerBuilder {
             long_poll_timeout: DEFAULT_LONG_POLL_TIMEOUT,
             heartbeat_interval: None,
             drain_timeout: DEFAULT_DRAIN_TIMEOUT,
+            handler_deadline: None,
             labels: Vec::new(),
             handler: None,
         }
@@ -113,6 +115,26 @@ impl WorkerBuilder {
     #[must_use]
     pub fn with_drain_timeout(mut self, d: Duration) -> Self {
         self.drain_timeout = d;
+        self
+    }
+
+    /// Cap the wall-clock duration the harness will wait on a single
+    /// [`TaskHandler::handle`] invocation. When the deadline elapses
+    /// the handler future is dropped (cancelled at the next await
+    /// point), the runtime logs a warning, and the lease is left to
+    /// lapse — Reaper A on the CP side reclaims it after
+    /// `lease_window_seconds` and the next attempt redispatches.
+    /// Without this knob the harness awaits handlers indefinitely;
+    /// the lease still lapses CP-side, but the handler keeps running
+    /// (and burning a worker slot) until it finishes on its own.
+    ///
+    /// Default `None` (no enforcement). Pick a value slightly under
+    /// the namespace's `lease_window_seconds` so the wrapper triggers
+    /// before the lease itself does. v1 doesn't compute this from
+    /// `deadline_hint` automatically — that's a follow-up.
+    #[must_use]
+    pub fn with_handler_deadline(mut self, d: Duration) -> Self {
+        self.handler_deadline = Some(d);
         self
     }
 
@@ -212,6 +234,7 @@ impl WorkerBuilder {
             concurrency: self.concurrency,
             long_poll_timeout: self.long_poll_timeout,
             drain_timeout: self.drain_timeout,
+            handler_deadline: self.handler_deadline,
             handler,
         };
 

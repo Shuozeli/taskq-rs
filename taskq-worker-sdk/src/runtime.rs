@@ -65,6 +65,13 @@ pub(crate) struct WorkerConfig {
     pub(crate) concurrency: usize,
     pub(crate) long_poll_timeout: Duration,
     pub(crate) drain_timeout: Duration,
+    /// `None` => harness awaits handlers indefinitely (the lease
+    /// still lapses CP-side via Reaper A on `lease_window_seconds`,
+    /// but the handler future keeps running until it returns on its
+    /// own). `Some(d)` => wrap each handler call in
+    /// `tokio::time::timeout(d, ...)`; on timeout the handler is
+    /// dropped (cancelled) and the lease is left to lapse.
+    pub(crate) handler_deadline: Option<Duration>,
     pub(crate) handler: Arc<dyn HandlerObject>,
 }
 
@@ -187,6 +194,7 @@ impl Worker {
             handler: Arc::clone(&self.config.handler),
             stop: Arc::clone(&stop),
             long_poll_timeout: self.config.long_poll_timeout,
+            handler_deadline: self.config.handler_deadline,
         };
         for _ in 0..self.config.concurrency {
             acquire_handles.push(spawn_acquire_loop(acquire_args.clone()));
@@ -265,6 +273,7 @@ struct AcquireArgs {
     handler: Arc<dyn HandlerObject>,
     stop: Arc<Notify>,
     long_poll_timeout: Duration,
+    handler_deadline: Option<Duration>,
 }
 
 fn spawn_acquire_loop(args: AcquireArgs) -> JoinHandle<()> {
@@ -417,18 +426,55 @@ fn classify_acquire_rejection(reason: RejectReason) -> AcquireResult {
     }
 }
 
+/// Run the user handler with an optional wall-clock cap. Pulled out
+/// of [`handle_one`] so it can be unit-tested without spinning a
+/// session.
+///
+/// `None` deadline => await the handler indefinitely (CP-side
+/// reaper-A is the only safety net).
+/// `Some(d)` => `tokio::time::timeout(d, ...)`; on timeout the
+/// handler future is dropped (cancelled at its next await point) and
+/// this returns `None` so the caller can drop the held lease and
+/// move on. The CP's lease will lapse on its own and reaper-A will
+/// reclaim.
+async fn run_handler_with_deadline(
+    handler: &dyn HandlerObject,
+    task: AcquiredTask,
+    deadline: Option<Duration>,
+) -> Option<HandlerOutcome> {
+    match deadline {
+        None => Some(handler.handle_boxed(task).await),
+        Some(d) => tokio::time::timeout(d, handler.handle_boxed(task))
+            .await
+            .ok(),
+    }
+}
+
 async fn handle_one(args: &AcquireArgs, ok: AcquiredOk) {
     args.inflight.insert(ok.held.clone()).await;
     args.heartbeat_kick.notify_one();
 
-    // Run the user handler. We do not enforce the per-handler deadline here
-    // -- the lease will lapse on the CP side if the handler runs past
-    // `timeout_at`, and the user observes that via `deadline_hint`. A
-    // future enhancement could add a `tokio::time::timeout` wrapper here
-    // gated on a builder option.
     let task_id = ok.task.task_id.clone();
     let attempt_number = ok.task.attempt_number;
-    let outcome = args.handler.handle_boxed(ok.task).await;
+    let outcome = match run_handler_with_deadline(
+        args.handler.as_ref(),
+        ok.task,
+        args.handler_deadline,
+    )
+    .await
+    {
+        Some(o) => o,
+        None => {
+            tracing::warn!(
+                task_id = %task_id,
+                attempt_number,
+                deadline_ms = args.handler_deadline.map(|d| d.as_millis() as u64).unwrap_or(0),
+                "handler exceeded with_handler_deadline; cancelling and dropping the held lease",
+            );
+            args.inflight.remove(&task_id, attempt_number).await;
+            return;
+        }
+    };
 
     // Submit the outcome. On `LEASE_EXPIRED` we drop without retry.
     let report_result = report_outcome(args, &task_id, attempt_number, outcome).await;
@@ -1122,5 +1168,87 @@ mod tests {
             }
             other => panic!("expected JoinError, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // run_handler_with_deadline (`with_handler_deadline` builder knob)
+    // -----------------------------------------------------------------
+
+    /// Fake [`HandlerObject`] that sleeps for `delay` then returns
+    /// `Success(payload)`. Lets us race a handler against a deadline
+    /// without standing up the full session.
+    struct SleepHandler {
+        delay: Duration,
+    }
+
+    impl crate::builder::HandlerObject for SleepHandler {
+        fn handle_boxed(
+            &self,
+            task: AcquiredTask,
+        ) -> futures::future::BoxFuture<'_, HandlerOutcome> {
+            let delay = self.delay;
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                HandlerOutcome::Success(task.payload)
+            })
+        }
+    }
+
+    fn dummy_task() -> AcquiredTask {
+        AcquiredTask {
+            task_id: "test-task".to_owned(),
+            attempt_number: 1,
+            task_type: "echo".to_owned(),
+            payload: bytes::Bytes::from_static(b"hello"),
+            traceparent: bytes::Bytes::new(),
+            tracestate: bytes::Bytes::new(),
+            deadline_hint: std::time::SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    #[tokio::test]
+    async fn run_handler_with_deadline_returns_outcome_when_handler_finishes_before_cap() {
+        // Arrange: handler completes well inside the deadline.
+        let handler = SleepHandler {
+            delay: Duration::from_millis(10),
+        };
+
+        // Act
+        let outcome =
+            run_handler_with_deadline(&handler, dummy_task(), Some(Duration::from_secs(5))).await;
+
+        // Assert
+        assert!(matches!(outcome, Some(HandlerOutcome::Success(_))));
+    }
+
+    #[tokio::test]
+    async fn run_handler_with_deadline_returns_none_when_handler_exceeds_cap() {
+        // Arrange: handler sleeps past the deadline.
+        let handler = SleepHandler {
+            delay: Duration::from_secs(60),
+        };
+
+        // Act
+        let outcome =
+            run_handler_with_deadline(&handler, dummy_task(), Some(Duration::from_millis(50)))
+                .await;
+
+        // Assert: timeout fires; handler future was cancelled and
+        // we observe `None` so the caller can drop the held lease.
+        assert!(outcome.is_none());
+    }
+
+    #[tokio::test]
+    async fn run_handler_with_deadline_awaits_indefinitely_when_deadline_is_none() {
+        // Arrange: handler sleeps briefly; no deadline.
+        let handler = SleepHandler {
+            delay: Duration::from_millis(20),
+        };
+
+        // Act
+        let outcome = run_handler_with_deadline(&handler, dummy_task(), None).await;
+
+        // Assert
+        assert!(matches!(outcome, Some(HandlerOutcome::Success(_))));
     }
 }
