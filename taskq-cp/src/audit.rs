@@ -68,6 +68,26 @@ impl Actor {
     pub fn as_str(&self) -> &str {
         &self.identity
     }
+
+    /// Pull the request-bound actor that the auth interceptor stamps
+    /// into [`grpc_core::Request::extensions`]. Returns
+    /// [`Self::anonymous`] when no actor is present (the interceptor
+    /// always inserts one, so the fallback only fires for tests that
+    /// build a synthetic [`grpc_core::Request`] without going through
+    /// the interceptor stack).
+    pub fn from_request<T>(request: &grpc_core::Request<T>) -> Self {
+        request
+            .extensions()
+            .get::<Self>()
+            .cloned()
+            .unwrap_or_else(Self::anonymous)
+    }
+}
+
+impl std::fmt::Display for Actor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.identity)
+    }
 }
 
 /// Compute sha256 over `bytes`. Re-exported convenience around `sha2` so

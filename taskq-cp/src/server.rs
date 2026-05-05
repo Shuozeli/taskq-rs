@@ -166,22 +166,48 @@ pub fn version_handshake_interceptor(
     }
 }
 
-/// Build the auth interceptor. Phase 5a accepts any non-empty
-/// `authorization` header value (the real validator is v0.2). Empty/missing
-/// metadata is *also* accepted in Phase 5a so a tester can hit the server
-/// without bearing a token; Phase 5b will tighten this once a configurable
-/// validator lands.
+/// Build the auth interceptor. Reads the `authorization` metadata
+/// header, parses an optional `Bearer <token>` prefix, and inserts an
+/// [`crate::audit::Actor`] into the request's `Extensions` so admin
+/// handlers can stamp `audit_log.actor` with the caller identity.
+///
+/// v0.1.x policy: the token is treated as the actor identity verbatim
+/// (no signature check). Empty `authorization` values are rejected
+/// with `UNAUTHENTICATED`. Missing `authorization` is accepted and
+/// surfaces as [`crate::audit::Actor::anonymous`] downstream — keeps
+/// internal smoke tests / `taskq-cli` against a localhost CP working
+/// without token plumbing. A future revision plugs in a verifier
+/// trait.
 pub fn auth_interceptor(
 ) -> impl Fn(Request<()>) -> std::result::Result<Request<()>, Status> + Clone + Send + Sync + 'static
 {
-    |req: Request<()>| {
-        // TODO(phase-5b): validate the token via a pluggable trait.
-        // Phase 5a accepts everything so end-to-end smoke tests work.
-        if let Some(value) = req.metadata().get(AUTH_HEADER) {
-            if value.to_str().map(|s| s.is_empty()).unwrap_or(true) {
-                return Err(Status::unauthenticated("authorization header is empty"));
+    |mut req: Request<()>| {
+        let actor = match req.metadata().get(AUTH_HEADER) {
+            Some(value) => {
+                let token = value
+                    .to_str()
+                    .map_err(|_| Status::unauthenticated("authorization is not utf-8"))?;
+                if token.is_empty() {
+                    return Err(Status::unauthenticated("authorization header is empty"));
+                }
+                // Strip a `Bearer ` prefix if present (case-insensitive),
+                // otherwise use the raw header. Either way the leftover
+                // is the actor identity — we don't validate it in v0.1.
+                let identity = token
+                    .strip_prefix("Bearer ")
+                    .or_else(|| token.strip_prefix("bearer "))
+                    .unwrap_or(token)
+                    .trim();
+                if identity.is_empty() {
+                    return Err(Status::unauthenticated(
+                        "authorization carries an empty token",
+                    ));
+                }
+                crate::audit::Actor::new(identity)
             }
-        }
+            None => crate::audit::Actor::anonymous(),
+        };
+        req.extensions_mut().insert(actor);
         Ok(req)
     }
 }
@@ -295,6 +321,76 @@ mod tests {
         let interceptor = auth_interceptor();
         let mut req: Request<()> = Request::new(());
         req.metadata_mut().insert(AUTH_HEADER, "".parse().unwrap());
+
+        // Act
+        let result = interceptor(req);
+
+        // Assert
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn auth_interceptor_inserts_anonymous_actor_when_header_absent() {
+        // Arrange
+        let interceptor = auth_interceptor();
+        let req: Request<()> = Request::new(());
+
+        // Act
+        let intercepted = interceptor(req).expect("missing header should be accepted");
+
+        // Assert
+        let actor = intercepted
+            .extensions()
+            .get::<crate::audit::Actor>()
+            .expect("interceptor must always insert an actor");
+        assert_eq!(actor.as_str(), "anonymous");
+    }
+
+    #[test]
+    fn auth_interceptor_strips_bearer_prefix_into_actor_identity() {
+        // Arrange
+        let interceptor = auth_interceptor();
+        let mut req: Request<()> = Request::new(());
+        req.metadata_mut()
+            .insert(AUTH_HEADER, "Bearer service-account-42".parse().unwrap());
+
+        // Act
+        let intercepted = interceptor(req).expect("valid bearer should be accepted");
+
+        // Assert
+        let actor = intercepted
+            .extensions()
+            .get::<crate::audit::Actor>()
+            .expect("auth interceptor must insert an actor");
+        assert_eq!(actor.as_str(), "service-account-42");
+    }
+
+    #[test]
+    fn auth_interceptor_keeps_raw_token_when_bearer_prefix_absent() {
+        // Arrange
+        let interceptor = auth_interceptor();
+        let mut req: Request<()> = Request::new(());
+        req.metadata_mut()
+            .insert(AUTH_HEADER, "raw-token-abc".parse().unwrap());
+
+        // Act
+        let intercepted = interceptor(req).unwrap();
+
+        // Assert
+        let actor = intercepted
+            .extensions()
+            .get::<crate::audit::Actor>()
+            .unwrap();
+        assert_eq!(actor.as_str(), "raw-token-abc");
+    }
+
+    #[test]
+    fn auth_interceptor_rejects_bearer_with_only_whitespace_token() {
+        // Arrange
+        let interceptor = auth_interceptor();
+        let mut req: Request<()> = Request::new(());
+        req.metadata_mut()
+            .insert(AUTH_HEADER, "Bearer    ".parse().unwrap());
 
         // Act
         let result = interceptor(req);

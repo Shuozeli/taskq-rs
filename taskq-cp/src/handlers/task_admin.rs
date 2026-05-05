@@ -91,8 +91,9 @@ impl TaskAdmin for TaskAdminHandler {
     > {
         let state = Arc::clone(&self.state);
         Box::pin(async move {
+            let actor = Actor::from_request(&request);
             let req = request.into_inner();
-            set_namespace_quota_impl(state, req)
+            set_namespace_quota_impl(state, actor, req)
                 .await
                 .map(Response::new)
         })
@@ -127,8 +128,9 @@ impl TaskAdmin for TaskAdminHandler {
     > {
         let state = Arc::clone(&self.state);
         Box::pin(async move {
+            let actor = Actor::from_request(&request);
             let req = request.into_inner();
-            set_namespace_config_impl(state, req)
+            set_namespace_config_impl(state, actor, req)
                 .await
                 .map(Response::new)
         })
@@ -145,8 +147,11 @@ impl TaskAdmin for TaskAdminHandler {
     > {
         let state = Arc::clone(&self.state);
         Box::pin(async move {
+            let actor = Actor::from_request(&request);
             let req = request.into_inner();
-            enable_namespace_impl(state, req).await.map(Response::new)
+            enable_namespace_impl(state, actor, req)
+                .await
+                .map(Response::new)
         })
     }
 
@@ -161,8 +166,11 @@ impl TaskAdmin for TaskAdminHandler {
     > {
         let state = Arc::clone(&self.state);
         Box::pin(async move {
+            let actor = Actor::from_request(&request);
             let req = request.into_inner();
-            disable_namespace_impl(state, req).await.map(Response::new)
+            disable_namespace_impl(state, actor, req)
+                .await
+                .map(Response::new)
         })
     }
 
@@ -174,8 +182,9 @@ impl TaskAdmin for TaskAdminHandler {
     > {
         let state = Arc::clone(&self.state);
         Box::pin(async move {
+            let actor = Actor::from_request(&request);
             let req = request.into_inner();
-            purge_tasks_impl(state, req).await.map(Response::new)
+            purge_tasks_impl(state, actor, req).await.map(Response::new)
         })
     }
 
@@ -190,8 +199,9 @@ impl TaskAdmin for TaskAdminHandler {
     > {
         let state = Arc::clone(&self.state);
         Box::pin(async move {
+            let actor = Actor::from_request(&request);
             let req = request.into_inner();
-            replay_dead_letters_impl(state, req)
+            replay_dead_letters_impl(state, actor, req)
                 .await
                 .map(Response::new)
         })
@@ -228,14 +238,12 @@ impl TaskAdmin for TaskAdminHandler {
 // SetNamespaceQuota
 // ---------------------------------------------------------------------------
 
-#[tracing::instrument(name = "taskq.admin.set_namespace_quota", skip_all)]
+#[tracing::instrument(name = "taskq.admin.set_namespace_quota", skip_all, fields(actor = %actor))]
 async fn set_namespace_quota_impl(
     state: Arc<CpState>,
+    actor: Actor,
     req: SetNamespaceQuotaRequest,
 ) -> Result<SetNamespaceQuotaResponse, Status> {
-    // TODO(phase-7-auth): pull Actor from request Extensions once the auth
-    // interceptor lands a structured carrier.
-    let actor = Actor::anonymous();
     let request_hash = sha256(
         serde_json::to_vec(&summarize_set_quota(&req))
             .unwrap_or_default()
@@ -374,6 +382,7 @@ async fn get_namespace_quota_impl(
 )]
 async fn set_namespace_config_impl(
     state: Arc<CpState>,
+    actor: Actor,
     req: SetNamespaceConfigRequest,
 ) -> Result<SetNamespaceConfigResponse, Status> {
     let namespace_str = req
@@ -383,9 +392,6 @@ async fn set_namespace_config_impl(
         .ok_or_else(|| Status::invalid_argument("namespace is required"))?
         .to_owned();
     let namespace = Namespace::new(namespace_str);
-    // TODO(phase-7-auth): pull Actor from request Extensions once the auth
-    // interceptor lands a structured carrier.
-    let actor = Actor::anonymous();
     let summary = summarize_set_config(&req);
     let request_hash = sha256(serde_json::to_vec(&summary).unwrap_or_default().as_slice());
     let metrics = state.metrics.clone();
@@ -514,6 +520,7 @@ async fn set_namespace_config_impl(
 )]
 async fn enable_namespace_impl(
     state: Arc<CpState>,
+    actor: Actor,
     req: EnableNamespaceRequest,
 ) -> Result<EnableNamespaceResponse, Status> {
     let namespace_str = req
@@ -523,9 +530,6 @@ async fn enable_namespace_impl(
         .ok_or_else(|| Status::invalid_argument("namespace is required"))?
         .to_owned();
     let namespace = Namespace::new(namespace_str);
-    // TODO(phase-7-auth): pull Actor from request Extensions once the auth
-    // interceptor lands a structured carrier.
-    let actor = Actor::anonymous();
     let summary = serde_json::json!({
         "rpc": "EnableNamespace",
         "namespace": namespace.as_str(),
@@ -574,6 +578,7 @@ async fn enable_namespace_impl(
 )]
 async fn disable_namespace_impl(
     state: Arc<CpState>,
+    actor: Actor,
     req: DisableNamespaceRequest,
 ) -> Result<DisableNamespaceResponse, Status> {
     let namespace_str = req
@@ -583,9 +588,6 @@ async fn disable_namespace_impl(
         .ok_or_else(|| Status::invalid_argument("namespace is required"))?
         .to_owned();
     let namespace = Namespace::new(namespace_str);
-    // TODO(phase-7-auth): pull Actor from request Extensions once the auth
-    // interceptor lands a structured carrier.
-    let actor = Actor::anonymous();
     let summary = serde_json::json!({
         "rpc": "DisableNamespace",
         "namespace": namespace.as_str(),
@@ -639,6 +641,7 @@ async fn disable_namespace_impl(
 )]
 async fn purge_tasks_impl(
     state: Arc<CpState>,
+    actor: Actor,
     req: PurgeTasksRequest,
 ) -> Result<PurgeTasksResponse, Status> {
     let namespace_str = req
@@ -654,10 +657,6 @@ async fn purge_tasks_impl(
             "confirm_namespace must match namespace",
         ));
     }
-
-    // TODO(phase-7-auth): pull Actor from request Extensions once the auth
-    // interceptor lands a structured carrier.
-    let actor = Actor::anonymous();
     let summary = serde_json::json!({
         "rpc": "PurgeTasks",
         "namespace": namespace.as_str(),
@@ -767,6 +766,7 @@ async fn purge_tasks_impl(
 )]
 async fn replay_dead_letters_impl(
     state: Arc<CpState>,
+    actor: Actor,
     req: ReplayDeadLettersRequest,
 ) -> Result<ReplayDeadLettersResponse, Status> {
     let namespace_str = req
@@ -782,10 +782,6 @@ async fn replay_dead_letters_impl(
             "confirm_namespace must match namespace",
         ));
     }
-
-    // TODO(phase-7-auth): pull Actor from request Extensions once the auth
-    // interceptor lands a structured carrier.
-    let actor = Actor::anonymous();
     let summary = serde_json::json!({
         "rpc": "ReplayDeadLetters",
         "namespace": namespace.as_str(),
@@ -1484,7 +1480,9 @@ mod tests {
         req.audit_note = Some("test".to_owned());
 
         // Act
-        let resp = enable_namespace_impl(state, req).await.unwrap();
+        let resp = enable_namespace_impl(state, Actor::anonymous(), req)
+            .await
+            .unwrap();
 
         // Assert
         assert!(resp.error.is_none());
@@ -1500,7 +1498,9 @@ mod tests {
         req.reason = Some("noisy".to_owned());
 
         // Act
-        let resp = disable_namespace_impl(state, req).await.unwrap();
+        let resp = disable_namespace_impl(state, Actor::anonymous(), req)
+            .await
+            .unwrap();
 
         // Assert
         assert!(resp.error.is_none());
@@ -1564,7 +1564,7 @@ mod tests {
         req.confirm_namespace = Some("ns-b".to_owned());
 
         // Act
-        let result = purge_tasks_impl(state, req).await;
+        let result = purge_tasks_impl(state, Actor::anonymous(), req).await;
 
         // Assert
         let err = result.expect_err("mismatched confirm must fail");
@@ -1580,7 +1580,7 @@ mod tests {
         req.confirm_namespace = Some("ns-b".to_owned());
 
         // Act
-        let result = replay_dead_letters_impl(state, req).await;
+        let result = replay_dead_letters_impl(state, Actor::anonymous(), req).await;
 
         // Assert
         let err = result.expect_err("mismatched confirm must fail");
@@ -1602,7 +1602,9 @@ mod tests {
         req.quota = Some(Box::new(quota));
 
         // Act
-        let resp = set_namespace_quota_impl(state, req).await.unwrap();
+        let resp = set_namespace_quota_impl(state, Actor::anonymous(), req)
+            .await
+            .unwrap();
 
         // Assert
         let err = resp.error.expect("quota over ceiling must reject");
@@ -1640,7 +1642,7 @@ mod tests {
         req.quota = Some(Box::new(quota_in));
 
         // Act
-        let resp = set_namespace_quota_impl(Arc::clone(&state), req)
+        let resp = set_namespace_quota_impl(Arc::clone(&state), Actor::anonymous(), req)
             .await
             .unwrap();
 
@@ -1680,10 +1682,10 @@ mod tests {
         r2.quota = Some(Box::new(second));
 
         // Act
-        set_namespace_quota_impl(Arc::clone(&state), r1)
+        set_namespace_quota_impl(Arc::clone(&state), Actor::anonymous(), r1)
             .await
             .unwrap();
-        set_namespace_quota_impl(Arc::clone(&state), r2)
+        set_namespace_quota_impl(Arc::clone(&state), Actor::anonymous(), r2)
             .await
             .unwrap();
 
@@ -1703,7 +1705,7 @@ mod tests {
         let quota_in = well_formed_quota("ns-cfg");
         let mut quota_req = SetNamespaceQuotaRequest::default();
         quota_req.quota = Some(Box::new(quota_in));
-        set_namespace_quota_impl(Arc::clone(&state), quota_req)
+        set_namespace_quota_impl(Arc::clone(&state), Actor::anonymous(), quota_req)
             .await
             .unwrap();
 
@@ -1715,7 +1717,7 @@ mod tests {
         req.add_task_types = Some(vec!["email".to_owned(), "sms".to_owned()]);
 
         // Act
-        let resp = set_namespace_config_impl(Arc::clone(&state), req)
+        let resp = set_namespace_config_impl(Arc::clone(&state), Actor::anonymous(), req)
             .await
             .unwrap();
 
@@ -1730,7 +1732,9 @@ mod tests {
         req2.dispatcher_kind = DispatcherKind::PRIORITY_FIFO;
         req2.add_error_classes = Some(vec!["transient".to_owned()]);
         req2.add_task_types = Some(vec!["email".to_owned()]);
-        let resp2 = set_namespace_config_impl(state, req2).await.unwrap();
+        let resp2 = set_namespace_config_impl(state, Actor::anonymous(), req2)
+            .await
+            .unwrap();
         assert!(resp2.error.is_none());
     }
 
@@ -1742,7 +1746,7 @@ mod tests {
         quota_in.max_error_classes = 2;
         let mut quota_req = SetNamespaceQuotaRequest::default();
         quota_req.quota = Some(Box::new(quota_in));
-        set_namespace_quota_impl(Arc::clone(&state), quota_req)
+        set_namespace_quota_impl(Arc::clone(&state), Actor::anonymous(), quota_req)
             .await
             .unwrap();
 
@@ -1753,7 +1757,9 @@ mod tests {
         req.add_error_classes = Some(vec!["a".to_owned(), "b".to_owned(), "c".to_owned()]);
 
         // Act
-        let resp = set_namespace_config_impl(state, req).await.unwrap();
+        let resp = set_namespace_config_impl(state, Actor::anonymous(), req)
+            .await
+            .unwrap();
 
         // Assert
         let err = resp.error.expect("over-cap addition must reject");
@@ -1809,7 +1815,9 @@ mod tests {
         req.max_tasks = 10;
 
         // Act
-        let resp = purge_tasks_impl(state, req).await.unwrap();
+        let resp = purge_tasks_impl(state, Actor::anonymous(), req)
+            .await
+            .unwrap();
 
         // Assert
         assert_eq!(resp.purged_count, 3);
@@ -1889,7 +1897,7 @@ mod tests {
         req.max_tasks = 10;
 
         // Act
-        let resp = replay_dead_letters_impl(Arc::clone(&state), req)
+        let resp = replay_dead_letters_impl(Arc::clone(&state), Actor::anonymous(), req)
             .await
             .unwrap();
 
@@ -1947,7 +1955,9 @@ mod tests {
         req.max_tasks = 10;
 
         // Act
-        let resp = replay_dead_letters_impl(state, req).await.unwrap();
+        let resp = replay_dead_letters_impl(state, Actor::anonymous(), req)
+            .await
+            .unwrap();
 
         // Assert: pending tasks aren't picked up by list_tasks_by_terminal_status
         // so the replay loop has nothing to process.
@@ -1999,7 +2009,9 @@ mod tests {
         req.max_tasks = 2;
 
         // Act
-        let resp = purge_tasks_impl(state, req).await.unwrap();
+        let resp = purge_tasks_impl(state, Actor::anonymous(), req)
+            .await
+            .unwrap();
 
         // Assert: 2 cancelled this RPC, has_more flagged so the operator
         // re-issues to drain the rest.

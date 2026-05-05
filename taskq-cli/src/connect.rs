@@ -1,13 +1,17 @@
 //! gRPC connection helper for the operator CLI.
 //!
 //! Mirrors `taskq-caller-sdk`'s `CallerClient::connect` shape: we build
-//! an `http::Uri` from the operator-supplied endpoint string, hand it to
-//! `TaskAdminClient::connect`, and surface failures through
-//! [`crate::error::CliError`]. Auth-token wiring is a Phase 7 concern;
-//! we accept and stash the token so the CLI is forward-compatible, but
-//! v1 does not yet attach it as gRPC request metadata (the auth
-//! interceptor in the CP is a stub — see `taskq-cp/src/handlers/task_admin.rs`
-//! `TODO(phase-7-auth)` markers).
+//! an `http::Uri` from the operator-supplied endpoint string, hand it
+//! to `TaskAdminClient::connect`, and surface failures through
+//! [`crate::error::CliError`].
+//!
+//! `--token` is accepted but not yet attached as `authorization`
+//! metadata on outbound requests. The CP-side auth interceptor (in
+//! `taskq-cp::server::auth_interceptor`) reads that header and stamps
+//! the actor identity into `audit_log.actor`; until pure-grpc-rs
+//! grows a per-call interceptor or this helper builds raw `Request`s
+//! to attach metadata, all CLI requests show up with
+//! `Actor::anonymous`. Tracked separately.
 
 use grpc_client::Channel;
 use taskq_proto::task_admin_client::TaskAdminClient;
