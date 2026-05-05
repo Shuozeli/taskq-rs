@@ -253,7 +253,10 @@ async fn llm_workload_routes_tasks_by_specialization() -> Result<()> {
     let drain_caller = caller_at(endpoint.clone()).await?;
     let drain_caller = Arc::new(Mutex::new(drain_caller));
     let task_ids = all_task_ids.clone();
-    wait_for(Duration::from_secs(60), Duration::from_millis(500), || {
+    // 60s suffices on a developer machine (~48s wall) but CI runners
+    // are roughly 2x slower; budget 120s so the full workload settles
+    // before the polling deadline elapses.
+    wait_for(Duration::from_secs(120), Duration::from_millis(500), || {
         let drain_caller = Arc::clone(&drain_caller);
         let ids = task_ids.clone();
         async move {
