@@ -36,6 +36,15 @@ use crate::shutdown::ShutdownSignal;
 /// reconnects to a different replica when behind a load balancer".
 const WAITER_LIMIT_BACKOFF: Duration = Duration::from_secs(1);
 
+/// Threshold for consecutive `REPLICA_WAITER_LIMIT_EXCEEDED` rejections
+/// before the acquire loop escalates: emits a `tracing::warn!` (so
+/// operators see persistent saturation in logs / OTel) and switches
+/// from the fixed 1s backoff to the same exponential schedule used for
+/// transient errors. Default 5 (≈5s of fixed backoff) — small enough
+/// that real saturation surfaces quickly, large enough that brief
+/// dispatch races don't spam the logs.
+const WAITER_LIMIT_ESCALATE_AFTER: u32 = 5;
+
 /// Initial backoff for non-retryable gRPC errors; doubles up to the cap.
 const ACQUIRE_BACKOFF_MIN: Duration = Duration::from_millis(500);
 /// Cap for the exponential backoff applied to non-retryable acquire errors.
@@ -284,6 +293,7 @@ fn spawn_acquire_loop(args: AcquireArgs) -> JoinHandle<()> {
 
 async fn run_acquire_loop(args: AcquireArgs) {
     let mut backoff = ACQUIRE_BACKOFF_MIN;
+    let mut consecutive_waiter_limit: u32 = 0;
     loop {
         // Cooperative cancellation: check the stop flag before each poll.
         if stop_is_signalled(&args.stop) {
@@ -293,18 +303,40 @@ async fn run_acquire_loop(args: AcquireArgs) {
         match acquire_one(&args).await {
             AcquireResult::Task(task) => {
                 backoff = ACQUIRE_BACKOFF_MIN;
+                consecutive_waiter_limit = 0;
                 handle_one(&args, task).await;
             }
             AcquireResult::NoTask => {
                 // Long-poll deadline elapsed without a hit: immediate
                 // reconnect, no backoff (`design.md` Sec 7 worker SDK).
                 backoff = ACQUIRE_BACKOFF_MIN;
+                consecutive_waiter_limit = 0;
             }
             AcquireResult::WaiterLimit => {
-                tracing::debug!("REPLICA_WAITER_LIMIT_EXCEEDED; backing off 1s");
-                wait_or_stop(&args.stop, WAITER_LIMIT_BACKOFF).await;
+                consecutive_waiter_limit = consecutive_waiter_limit.saturating_add(1);
+                if consecutive_waiter_limit >= WAITER_LIMIT_ESCALATE_AFTER {
+                    // Persistent saturation -- the replica's waiter
+                    // pool is full and brief retries aren't clearing
+                    // it. Surface once and switch to exponential
+                    // backoff so we don't burn capacity sending
+                    // doomed requests at fixed 1s cadence.
+                    tracing::warn!(
+                        consecutive = consecutive_waiter_limit,
+                        ?backoff,
+                        "REPLICA_WAITER_LIMIT_EXCEEDED persistent; escalating to exponential backoff",
+                    );
+                    wait_or_stop(&args.stop, backoff).await;
+                    backoff = next_backoff(backoff);
+                } else {
+                    tracing::debug!(
+                        consecutive = consecutive_waiter_limit,
+                        "REPLICA_WAITER_LIMIT_EXCEEDED; backing off 1s",
+                    );
+                    wait_or_stop(&args.stop, WAITER_LIMIT_BACKOFF).await;
+                }
             }
             AcquireResult::WorkerDeregistered => {
+                consecutive_waiter_limit = 0;
                 tracing::warn!("WORKER_DEREGISTERED on AcquireTask; re-registering");
                 if let Err(err) = re_register(&args.state).await {
                     tracing::error!(error = %err, "re-register failed");
@@ -313,6 +345,7 @@ async fn run_acquire_loop(args: AcquireArgs) {
                 }
             }
             AcquireResult::TransientError(err) => {
+                consecutive_waiter_limit = 0;
                 tracing::warn!(error = %err, ?backoff, "acquire transient error; backing off");
                 wait_or_stop(&args.stop, backoff).await;
                 backoff = next_backoff(backoff);
