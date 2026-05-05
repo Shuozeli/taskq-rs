@@ -66,6 +66,7 @@ mod error_class;
 mod handler;
 mod runtime;
 mod shutdown;
+mod trace;
 
 pub use builder::WorkerBuilder;
 pub use error::{BuildError, RunError};

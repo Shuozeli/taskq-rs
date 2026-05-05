@@ -456,6 +456,26 @@ async fn handle_one(args: &AcquireArgs, ok: AcquiredOk) {
 
     let task_id = ok.task.task_id.clone();
     let attempt_number = ok.task.attempt_number;
+
+    // §11.2: attach the upstream W3C parent context so the handler's
+    // tracing::Span continues the trace the caller started. Falls
+    // back silently to a fresh disconnected context if the bytes
+    // aren't a valid version-00 traceparent.
+    let span = tracing::info_span!(
+        "taskq.handle",
+        task_id = %task_id,
+        attempt_number,
+        task_type = %ok.task.task_type,
+    );
+    if let Some(parent_ctx) =
+        crate::trace::parse_traceparent(&ok.task.traceparent, &ok.task.tracestate)
+    {
+        use opentelemetry::trace::TraceContextExt;
+        let cx = opentelemetry::Context::new().with_remote_span_context(parent_ctx);
+        tracing_opentelemetry::OpenTelemetrySpanExt::set_parent(&span, cx);
+    }
+    let _enter = span.enter();
+
     let outcome = match run_handler_with_deadline(
         args.handler.as_ref(),
         ok.task,
