@@ -310,7 +310,26 @@ async fn submit_task_impl(state: Arc<CpState>, req: SubmitTaskRequest) -> Submit
                     // hooks land in Phase 5c.
                     Timestamp::from_unix_millis(now.as_unix_millis() + 24 * 60 * 60 * 1000)
                 });
-            let max_retries = retry_max_retries_req.unwrap_or(max_retries_req);
+            // §9.2 three-layer fallback: per-task → per-task-type →
+            // per-namespace. v1 implements two of the three: the
+            // per-task-type tier is post-v1 (no
+            // `task_type_retry_config` read path on the trait yet).
+            // When BOTH per-task wire fields are unset (0), look up
+            // the namespace's `max_retries_ceiling` so a caller that
+            // omits `max_retries` doesn't get FAILED_EXHAUSTED on
+            // first failure. `get_namespace_quota` always returns
+            // a row by inheriting from `system_default`, so the
+            // ceiling is always populated.
+            let per_task = retry_max_retries_req.unwrap_or(max_retries_req);
+            let max_retries = if per_task == 0 {
+                let ceiling = tx
+                    .get_namespace_quota(&namespace)
+                    .await?
+                    .max_retries_ceiling;
+                ceiling
+            } else {
+                per_task
+            };
             let retry_initial_ms = retry_initial_ms_req.unwrap_or(1_000);
             let retry_max_ms = retry_max_ms_req.unwrap_or(300_000);
             let retry_coefficient = retry_coefficient_req.unwrap_or(2.0);
@@ -1083,6 +1102,67 @@ mod tests {
         assert!(resp.task_id.is_some());
         assert_eq!(resp.status, TerminalState::PENDING);
         assert!(!resp.existing_task);
+    }
+
+    #[tokio::test]
+    async fn submit_task_falls_back_to_namespace_max_retries_ceiling_when_unset() {
+        // Arrange: build a submit request with max_retries left at 0
+        // (the wire default). The §9.2 three-layer fallback must
+        // pick up `system_default.max_retries_ceiling` (10 per the
+        // SQLite migration) instead of letting the task land with
+        // max_retries=0 (which would FAILED_EXHAUSTED on first
+        // failure).
+        let state = build_state().await;
+        let req = build_submit_request("test-fallback", "type", "key-fallback", b"x".to_vec());
+        assert_eq!(
+            req.max_retries, 0,
+            "test premise: caller did not set max_retries"
+        );
+
+        // Act
+        let resp = submit_task_impl(Arc::clone(&state), req).await;
+        assert!(resp.error.is_none(), "submit should succeed: {resp:?}");
+        let task_id_str = resp.task_id.expect("task_id present");
+        let task_id = parse_task_id(&task_id_str).expect("parse task_id");
+
+        // Read the persisted task row back via the trait.
+        let mut tx = state.storage.begin_dyn().await.unwrap();
+        let task = tx
+            .get_task_by_id(task_id)
+            .await
+            .expect("get_task_by_id")
+            .expect("row present");
+        let _ = tx.commit_dyn().await;
+
+        // Assert: max_retries was lifted from system_default's
+        // max_retries_ceiling, not the caller's zero. The exact
+        // ceiling comes from `system_default` in
+        // taskq-storage-sqlite/migrations/0001_initial.sql.
+        assert!(
+            task.max_retries > 0,
+            "expected fallback to namespace ceiling, got {}",
+            task.max_retries
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_task_keeps_per_task_max_retries_when_set() {
+        // Arrange: caller sets max_retries explicitly. The fallback
+        // path MUST NOT clobber it.
+        let state = build_state().await;
+        let mut req = build_submit_request("test-explicit", "type", "key-explicit", b"x".to_vec());
+        req.max_retries = 7;
+
+        // Act
+        let resp = submit_task_impl(Arc::clone(&state), req).await;
+        let task_id_str = resp.task_id.expect("task_id");
+        let task_id = parse_task_id(&task_id_str).expect("parse");
+        let mut tx = state.storage.begin_dyn().await.unwrap();
+        let task = tx.get_task_by_id(task_id).await.unwrap().unwrap();
+        let _ = tx.commit_dyn().await;
+
+        // Assert
+        assert_eq!(task.max_retries, 7);
     }
 
     #[tokio::test]
