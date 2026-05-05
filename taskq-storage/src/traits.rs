@@ -31,7 +31,8 @@ use crate::types::{
     AuditEntry, CancelOutcome, CapacityDecision, CapacityKind, DeadWorkerRuntime, DedupRecord,
     ExpiredRuntime, HeartbeatAck, LeaseRef, LockedTask, NamespaceQuota, NamespaceQuotaUpsert,
     NewDedupRecord, NewLease, NewTask, PickCriteria, RateDecision, RateKind, ReplayOutcome,
-    RuntimeRef, Task, TaskFilter, TaskOutcome, TaskStatus, TerminalState, WakeSignal, WorkerInfo,
+    RuntimeRef, Task, TaskFilter, TaskOutcome, TaskResultRow, TaskStatus, TerminalState,
+    WakeSignal, WorkerInfo,
 };
 
 /// Connection-lifecycle trait. A `Storage` factory hands out `StorageTx`
@@ -440,6 +441,20 @@ pub trait StorageTx: Send {
         &mut self,
         task_id: TaskId,
     ) -> impl std::future::Future<Output = Result<Option<Task>>> + Send;
+
+    /// Read the most recent `task_results` row for `task_id` (highest
+    /// `attempt_number`). Used by the wire `GetTaskResult` RPC to
+    /// populate `outcome` / `result_payload` / `failure` after a
+    /// task settles. Returns `Ok(None)` when:
+    /// - the task is still PENDING / DISPATCHED / WAITING_RETRY (no
+    ///   attempt has produced a result row yet), or
+    /// - the task_id does not exist in `task_results`.
+    ///
+    /// SERIALIZABLE: yes (rides the caller's transaction).
+    fn get_latest_task_result(
+        &mut self,
+        task_id: TaskId,
+    ) -> impl std::future::Future<Output = Result<Option<TaskResultRow>>> + Send;
 
     /// Used by §6.6 Reaper B: list runtime rows whose worker's last
     /// `worker_heartbeats.last_heartbeat_at` is older than

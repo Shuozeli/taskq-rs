@@ -42,6 +42,7 @@ pub use crate::types::{
     AuditEntry, CancelOutcome, CapacityDecision, CapacityKind, DeadWorkerRuntime, DedupRecord,
     ExpiredRuntime, HeartbeatAck, LeaseRef, LockedTask, NamespaceFilter, NamespaceQuota,
     NamespaceQuotaUpsert, NewDedupRecord, NewLease, NewTask, PickCriteria, PickOrdering,
-    RateDecision, RateKind, ReplayOutcome, RuntimeRef, Task, TaskFilter, TaskOutcome, TaskStatus,
-    TaskTypeFilter, TerminalState, WakeSignal, WorkerInfo,
+    RateDecision, RateKind, ReplayOutcome, RuntimeRef, Task, TaskFilter, TaskOutcome,
+    TaskOutcomeKind, TaskResultRow, TaskStatus, TaskTypeFilter, TerminalState, WakeSignal,
+    WorkerInfo,
 };

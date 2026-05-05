@@ -365,6 +365,14 @@ mod tests {
             unreachable!("Phase 5c admin methods not exercised in admitter tests")
         }
 
+        fn get_latest_task_result<'a>(
+            &'a mut self,
+            _task_id: TaskId,
+        ) -> StorageTxFuture<'a, Result<Option<taskq_storage::TaskResultRow>, StorageError>>
+        {
+            unreachable!("admin reads not exercised in admitter tests")
+        }
+
         fn list_expired_runtimes<'a>(
             &'a mut self,
             _before: Timestamp,

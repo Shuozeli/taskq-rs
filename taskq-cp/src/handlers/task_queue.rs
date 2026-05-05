@@ -27,14 +27,14 @@ use opentelemetry::KeyValue;
 use taskq_proto::task_queue_server::TaskQueue;
 use taskq_proto::{
     BatchGetTaskResultsRequest, BatchGetTaskResultsResponse, BatchTaskResult, CancelTaskRequest,
-    CancelTaskResponse, GetTaskResultRequest, GetTaskResultResponse,
+    CancelTaskResponse, Failure as WireFailure, GetTaskResultRequest, GetTaskResultResponse,
     RejectReason as WireRejectReason, Rejection, RetryConfig as WireRetryConfig, SemVer,
     SubmitAndWaitRequest, SubmitAndWaitResponse, SubmitTaskRequest, SubmitTaskResponse, Task,
-    TerminalState, Timestamp as WireTimestamp,
+    TaskOutcome as WireTaskOutcome, TerminalState, Timestamp as WireTimestamp,
 };
 use taskq_storage::{
     IdempotencyKey, Namespace, NewDedupRecord, NewTask, RateDecision, RateKind,
-    Task as StorageTask, TaskId, TaskStatus, TaskType, Timestamp,
+    Task as StorageTask, TaskId, TaskOutcomeKind, TaskResultRow, TaskStatus, TaskType, Timestamp,
 };
 
 use crate::handlers::cancel::{cancel_internal, CancelOutcome};
@@ -528,23 +528,37 @@ async fn get_task_result_impl(
     };
     let metrics = state.metrics.clone();
 
-    let task_opt = with_serializable_retry(&metrics, "get_task_result", || {
+    // Read the task row + the latest task_results row in one
+    // SERIALIZABLE transaction so the caller never sees a torn view
+    // (e.g. status=COMPLETED from `tasks` but no row in
+    // `task_results` because complete_task is mid-tx on another
+    // connection).
+    let lookup = with_serializable_retry(&metrics, "get_task_result", || {
         let state = Arc::clone(&state);
         async move {
             let mut tx = state.storage.begin_dyn().await?;
             let task = tx.get_task_by_id(task_id).await?;
+            let result = if task.is_some() {
+                tx.get_latest_task_result(task_id).await?
+            } else {
+                None
+            };
             tx.commit_dyn().await?;
-            Ok(task)
+            Ok((task, result))
         }
     })
     .await
     .map_err(|err| Status::internal(format!("get_task_result: {err}")))?;
 
+    let (task_opt, result_opt) = lookup;
     let mut resp = GetTaskResultResponse::default();
     resp.server_version = Some(Box::new(server_semver()));
     match task_opt {
         Some(task) => {
             resp.task = Some(Box::new(storage_task_to_wire(&task)));
+            if let Some(row) = result_opt {
+                populate_result_fields(&mut resp, row);
+            }
         }
         None => {
             // No dedicated `TASK_NOT_FOUND` reason in v1 enum; surface
@@ -553,6 +567,40 @@ async fn get_task_result_impl(
         }
     }
     Ok(resp)
+}
+
+/// Map a stored `TaskResultRow` onto the wire response's `outcome` /
+/// `result_payload` / `failure` fields. `Success` populates
+/// `result_payload`; the failure variants populate `failure` with
+/// the captured error class / message / details.
+fn populate_result_fields(resp: &mut GetTaskResultResponse, row: TaskResultRow) {
+    resp.outcome = wire_outcome(row.outcome);
+    if let Some(payload) = row.result_payload {
+        resp.result_payload = Some(payload.to_vec());
+    }
+    if matches!(
+        row.outcome,
+        TaskOutcomeKind::RetryableFail
+            | TaskOutcomeKind::NonretryableFail
+            | TaskOutcomeKind::Expired
+    ) {
+        let mut failure = WireFailure::default();
+        failure.error_class = row.error_class;
+        failure.message = row.error_message;
+        failure.details = row.error_details.map(|d| d.to_vec());
+        failure.retryable = matches!(row.outcome, TaskOutcomeKind::RetryableFail);
+        resp.failure = Some(Box::new(failure));
+    }
+}
+
+fn wire_outcome(kind: TaskOutcomeKind) -> WireTaskOutcome {
+    match kind {
+        TaskOutcomeKind::Success => WireTaskOutcome::SUCCESS,
+        TaskOutcomeKind::RetryableFail => WireTaskOutcome::RETRYABLE_FAIL,
+        TaskOutcomeKind::NonretryableFail => WireTaskOutcome::NONRETRYABLE_FAIL,
+        TaskOutcomeKind::Cancelled => WireTaskOutcome::CANCELLED,
+        TaskOutcomeKind::Expired => WireTaskOutcome::EXPIRED,
+    }
 }
 
 /// `BatchGetTaskResults` per `design.md` §6. Per-id semantics: missing

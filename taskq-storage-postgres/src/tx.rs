@@ -25,8 +25,9 @@ use taskq_storage::types::{
     AuditEntry, CancelOutcome, CapacityDecision, CapacityKind, DeadWorkerRuntime, DedupRecord,
     ExpiredRuntime, HeartbeatAck, LeaseRef, LockedTask, NamespaceFilter, NamespaceQuota,
     NamespaceQuotaUpsert, NewDedupRecord, NewLease, NewTask, PickCriteria, PickOrdering,
-    RateDecision, RateKind, ReplayOutcome, RuntimeRef, Task, TaskFilter, TaskOutcome, TaskStatus,
-    TaskTypeFilter, TerminalState, WakeSignal, WorkerInfo,
+    RateDecision, RateKind, ReplayOutcome, RuntimeRef, Task, TaskFilter, TaskOutcome,
+    TaskOutcomeKind, TaskResultRow, TaskStatus, TaskTypeFilter, TerminalState, WakeSignal,
+    WorkerInfo,
 };
 use taskq_storage::{StorageError, StorageTx};
 use tokio::sync::mpsc;
@@ -1046,6 +1047,50 @@ impl<'a> StorageTx for PostgresTx<'a> {
             tracestate: Bytes::from(tracestate),
             format_version: format_version as u32,
             original_failure_count: original_failure_count as u32,
+        }))
+    }
+
+    async fn get_latest_task_result(&mut self, task_id: TaskId) -> Result<Option<TaskResultRow>> {
+        let task_id_uuid = task_id.into_uuid();
+        let row = self
+            .conn
+            .query_opt(
+                "SELECT attempt_number, outcome::text, result_payload, error_class, \
+                        error_message, error_details, recorded_at \
+                   FROM task_results \
+                  WHERE task_id = $1 \
+               ORDER BY attempt_number DESC \
+                  LIMIT 1",
+                &[&task_id_uuid],
+            )
+            .await
+            .map_err(map_db_error)?;
+
+        let Some(row) = row else { return Ok(None) };
+
+        let attempt_number: i32 = row.get(0);
+        let outcome_str: String = row.get(1);
+        let result_payload: Option<Vec<u8>> = row.get(2);
+        let error_class: Option<String> = row.get(3);
+        let error_message: Option<String> = row.get(4);
+        let error_details: Option<Vec<u8>> = row.get(5);
+        let recorded_at: DateTime<Utc> = row.get(6);
+
+        let outcome = TaskOutcomeKind::from_db_str(&outcome_str).ok_or_else(|| {
+            StorageError::ConstraintViolation(format!(
+                "task_results.outcome unknown: {outcome_str}"
+            ))
+        })?;
+
+        Ok(Some(TaskResultRow {
+            task_id: TaskId::from_uuid(task_id_uuid),
+            attempt_number: attempt_number as u32,
+            outcome,
+            result_payload: result_payload.map(Bytes::from),
+            error_class,
+            error_message,
+            error_details: error_details.map(Bytes::from),
+            recorded_at: chrono_to_timestamp(recorded_at),
         }))
     }
 

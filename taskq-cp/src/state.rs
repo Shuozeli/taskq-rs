@@ -38,7 +38,8 @@ use taskq_storage::{
     ExpiredRuntime, IdempotencyKey, LeaseRef, LockedTask, Namespace, NamespaceQuota,
     NamespaceQuotaUpsert, NewDedupRecord, NewLease, NewTask, PickCriteria, RateDecision, RateKind,
     ReplayOutcome, RuntimeRef, Storage, StorageError, StorageTx, Task, TaskFilter, TaskId,
-    TaskOutcome, TaskStatus, TaskType, TerminalState, Timestamp, WakeSignal, WorkerId, WorkerInfo,
+    TaskOutcome, TaskResultRow, TaskStatus, TaskType, TerminalState, Timestamp, WakeSignal,
+    WorkerId, WorkerInfo,
 };
 
 use crate::config::CpConfig;
@@ -230,6 +231,11 @@ pub trait StorageTxDyn: Send {
         &'a mut self,
         task_id: TaskId,
     ) -> StorageTxFuture<'a, Result<Option<Task>, StorageError>>;
+
+    fn get_latest_task_result<'a>(
+        &'a mut self,
+        task_id: TaskId,
+    ) -> StorageTxFuture<'a, Result<Option<TaskResultRow>, StorageError>>;
 
     fn list_expired_runtimes<'a>(
         &'a mut self,
@@ -530,6 +536,13 @@ where
         task_id: TaskId,
     ) -> StorageTxFuture<'a, Result<Option<Task>, StorageError>> {
         Box::pin(StorageTx::get_task_by_id(&mut self.inner, task_id))
+    }
+
+    fn get_latest_task_result<'a>(
+        &'a mut self,
+        task_id: TaskId,
+    ) -> StorageTxFuture<'a, Result<Option<TaskResultRow>, StorageError>> {
+        Box::pin(StorageTx::get_latest_task_result(&mut self.inner, task_id))
     }
 
     fn list_expired_runtimes<'a>(

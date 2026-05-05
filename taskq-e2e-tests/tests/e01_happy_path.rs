@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
-use taskq_caller_sdk::{SubmitOutcome, SubmitRequest};
+use taskq_caller_sdk::{SubmitOutcome, SubmitRequest, TaskOutcome};
 use taskq_e2e_tests::{require_docker, wait_for, ComposeFile, ComposeStack};
 use taskq_proto::TerminalState;
 use taskq_worker_sdk::{AcquiredTask, HandlerOutcome, TaskHandler, WorkerBuilder};
@@ -81,12 +81,17 @@ async fn happy_path_round_trip() -> Result<()> {
     })
     .await?;
 
-    // Assert: task reached COMPLETED via the real wire path. v0.1.0
-    // does not yet read the per-attempt outcome / result_payload from
-    // task_runtime (that row is deleted on completion), so this test
-    // only asserts terminal status. When the read path lands the
-    // remaining checks should be re-enabled here.
+    // Assert: task reached COMPLETED via the real wire path AND the
+    // post-completion read path reports the worker's outcome plus
+    // the echoed result_payload. The handler returned the same bytes
+    // it received, so we should see them round-trip through the
+    // `task_results` table.
     assert_eq!(final_state.status, TerminalState::COMPLETED);
+    assert_eq!(final_state.outcome, Some(TaskOutcome::Success));
+    assert_eq!(
+        final_state.result_payload.as_deref(),
+        Some(b"hello".as_slice())
+    );
 
     worker_handle.abort();
     Ok(())

@@ -36,7 +36,8 @@ use taskq_storage::{
         ExpiredRuntime, HeartbeatAck, LeaseRef, LockedTask, NamespaceFilter, NamespaceQuota,
         NamespaceQuotaUpsert, NewDedupRecord, NewLease, NewTask, PickCriteria, PickOrdering,
         RateDecision, RateKind, ReplayOutcome, RuntimeRef, Task, TaskFilter, TaskOutcome,
-        TaskStatus, TaskTypeFilter, TerminalState, WakeSignal, WorkerInfo,
+        TaskOutcomeKind, TaskResultRow, TaskStatus, TaskTypeFilter, TerminalState, WakeSignal,
+        WorkerInfo,
     },
 };
 
@@ -942,6 +943,66 @@ impl StorageTx for SqliteTx {
             tracestate: Bytes::from(row.tracestate),
             format_version: row.format_version,
             original_failure_count: row.original_failure_count,
+        }))
+    }
+
+    async fn get_latest_task_result(
+        &mut self,
+        task_id: TaskId,
+    ) -> StorageResult<Option<TaskResultRow>> {
+        struct ResultRow {
+            attempt: i64,
+            outcome_str: String,
+            result_payload: Option<Vec<u8>>,
+            error_class: Option<String>,
+            error_message: Option<String>,
+            error_details: Option<Vec<u8>>,
+            recorded_at: i64,
+        }
+        let task_id_text = task_id_to_text(&task_id);
+        let row: Option<ResultRow> = self
+            .conn()
+            .query_row(
+                "SELECT attempt_number, outcome, result_payload, error_class, \
+                        error_message, error_details, recorded_at \
+                   FROM task_results \
+                  WHERE task_id = ?1 \
+               ORDER BY attempt_number DESC \
+                  LIMIT 1",
+                params![&task_id_text],
+                |row| {
+                    Ok(ResultRow {
+                        attempt: row.get(0)?,
+                        outcome_str: row.get(1)?,
+                        result_payload: row.get(2)?,
+                        error_class: row.get(3)?,
+                        error_message: row.get(4)?,
+                        error_details: row.get(5)?,
+                        recorded_at: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(map_sql_error)?;
+
+        let Some(row) = row else { return Ok(None) };
+
+        let outcome = TaskOutcomeKind::from_db_str(&row.outcome_str).ok_or_else(|| {
+            StorageError::ConstraintViolation(format!(
+                "task_results.outcome unknown: {}",
+                row.outcome_str
+            ))
+        })?;
+
+        Ok(Some(TaskResultRow {
+            task_id,
+            attempt_number: row.attempt as u32,
+            outcome,
+            result_payload: row.result_payload.map(Bytes::from),
+            error_class: row.error_class,
+            error_message: row.error_message,
+            error_details: row.error_details.map(Bytes::from),
+            recorded_at: millis_to_ts(row.recorded_at),
         }))
     }
 

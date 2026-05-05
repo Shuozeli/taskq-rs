@@ -250,6 +250,72 @@ pub enum TaskOutcome {
     },
 }
 
+/// Wire-stable enum tag for the `task_results.outcome` column.
+/// Distinct from [`TaskOutcome`] (the write-side input that fuses the
+/// outcome kind with its payload); this is the read-side projection
+/// that downstream handlers map onto the wire `TaskOutcome` enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskOutcomeKind {
+    Success,
+    RetryableFail,
+    NonretryableFail,
+    Cancelled,
+    Expired,
+}
+
+impl TaskOutcomeKind {
+    /// Stringify to the wire spelling the storage backends use in
+    /// `task_results.outcome`. Matches the SQL `CHECK` constraint
+    /// in `0001_initial.sql`.
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Success => "SUCCESS",
+            Self::RetryableFail => "RETRYABLE_FAIL",
+            Self::NonretryableFail => "NONRETRYABLE_FAIL",
+            Self::Cancelled => "CANCELLED",
+            Self::Expired => "EXPIRED",
+        }
+    }
+
+    /// Inverse of [`as_db_str`]. Accepts either case so it works
+    /// against both backends — SQLite stores uppercase
+    /// (`'SUCCESS'`, ...) per the CHECK constraint in
+    /// `0001_initial.sql`; Postgres uses a lowercase ENUM type
+    /// (`'success'`, ...) declared in its initial migration. The
+    /// canonical write side is owned by each backend's outcome-row
+    /// helper.
+    pub fn from_db_str(s: &str) -> Option<Self> {
+        match s.to_ascii_uppercase().as_str() {
+            "SUCCESS" => Some(Self::Success),
+            "RETRYABLE_FAIL" => Some(Self::RetryableFail),
+            "NONRETRYABLE_FAIL" => Some(Self::NonretryableFail),
+            "CANCELLED" => Some(Self::Cancelled),
+            "EXPIRED" => Some(Self::Expired),
+            _ => None,
+        }
+    }
+}
+
+/// One row from `task_results`. Returned by
+/// [`crate::traits::StorageTx::get_latest_task_result`] for the
+/// post-completion read path that powers the wire `GetTaskResult`
+/// RPC's `outcome` / `result_payload` / `failure` fields.
+///
+/// `error_*` fields are `Some` for failure outcomes and `None` for
+/// `Success`. `result_payload` is `Some` for `Success` and `None`
+/// for failures.
+#[derive(Debug, Clone)]
+pub struct TaskResultRow {
+    pub task_id: TaskId,
+    pub attempt_number: u32,
+    pub outcome: TaskOutcomeKind,
+    pub result_payload: Option<Bytes>,
+    pub error_class: Option<String>,
+    pub error_message: Option<String>,
+    pub error_details: Option<Bytes>,
+    pub recorded_at: Timestamp,
+}
+
 // ============================================================================
 // Heartbeats
 // ============================================================================
