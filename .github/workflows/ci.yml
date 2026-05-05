@@ -96,14 +96,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # smoke.rs uses `ALTER DATABASE ... SET search_path` for
-      # schema isolation, which races on `pg_db_role_setting`'s
-      # unique constraint when two tests run in parallel. admin.rs
-      # uses per-connection `options=-c search_path=...` instead.
-      # Until smoke.rs is migrated to that pattern, serialize this
-      # job's tests.
       - name: Run Postgres backend tests (smoke + conformance + admin)
-        run: cargo test -p taskq-storage-postgres --no-fail-fast -- --include-ignored --test-threads=1
+        run: cargo test -p taskq-storage-postgres --no-fail-fast -- --include-ignored
 
   build:
     name: Build (release)

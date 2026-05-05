@@ -99,54 +99,62 @@ async fn try_connect() -> Option<std::sync::Arc<PostgresStorage>> {
     }
 }
 
-/// Pre-test helper: create a schema dedicated to this test, set
-/// `search_path` so all subsequent statements land there. Returns the
-/// schema name so the test can drop it at the end.
-async fn isolate_schema(storage: &PostgresStorage, suffix: &str) -> String {
-    let schema_name = format!("taskq_phase3_smoke_{suffix}");
-    let conn = storage.pool().get().await.expect("pool checkout failed");
+/// Per-process counter so concurrent tests with the same suffix
+/// still get distinct schema names.
+static SCHEMA_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Pre-test helper: create a schema dedicated to this test. Schema-
+/// scoped statements use a per-test storage built via
+/// [`connect_in_schema`]; the admin storage passed here only owns
+/// the create / drop calls.
+async fn isolate_schema(admin: &PostgresStorage, suffix: &str) -> String {
+    let counter = SCHEMA_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let schema_name = format!("taskq_phase3_smoke_{suffix}_{counter}");
+    let conn = admin.pool().get().await.expect("pool checkout failed");
     conn.batch_execute(&format!("DROP SCHEMA IF EXISTS {schema_name} CASCADE"))
         .await
         .expect("drop existing schema");
-    conn.batch_execute(&format!(
-        "CREATE SCHEMA {schema_name}; SET search_path TO {schema_name}, public;"
-    ))
-    .await
-    .expect("create schema");
+    conn.batch_execute(&format!("CREATE SCHEMA {schema_name}"))
+        .await
+        .expect("create schema");
     drop(conn);
     schema_name
 }
 
+/// Build a per-test `PostgresStorage` whose pool checks out
+/// connections already pinned to `schema_name` via libpq
+/// `options=-c search_path=...`. Mirrors the `admin.rs` pattern;
+/// avoids the `ALTER DATABASE ... SET search_path` race that the old
+/// `set_search_path` helper hit when tests ran in parallel.
+async fn connect_in_schema(schema_name: &str) -> std::sync::Arc<PostgresStorage> {
+    let conn_str = format!(
+        "{base} options=-csearch_path={schema},public",
+        base = test_url(),
+        schema = schema_name,
+    );
+    PostgresStorage::connect(PostgresConfig::new(conn_str))
+        .await
+        .expect("connect with per-test search_path")
+}
+
 /// Drop the per-test schema. Best-effort.
-async fn drop_schema(storage: &PostgresStorage, schema_name: &str) {
-    if let Ok(conn) = storage.pool().get().await {
+async fn drop_schema(admin: &PostgresStorage, schema_name: &str) {
+    if let Ok(conn) = admin.pool().get().await {
         let _ = conn
             .batch_execute(&format!("DROP SCHEMA IF EXISTS {schema_name} CASCADE"))
             .await;
     }
 }
 
-/// Pool-level helper to set search_path for every checked-out connection in
-/// this test run. Cheap and avoids polluting the smoke test bodies with
-/// schema bookkeeping.
-async fn set_search_path(storage: &PostgresStorage, schema_name: &str) {
-    let conn = storage.pool().get().await.expect("pool checkout");
-    conn.batch_execute(&format!(
-        "ALTER DATABASE taskq_test_phase3 SET search_path = {schema_name}, public"
-    ))
-    .await
-    .expect("alter search_path");
-}
-
 #[tokio::test]
 #[ignore = "requires reachable Postgres at docker.yuacx.com:5432 (set TASKQ_PG_TEST_URL to override)"]
 async fn smoke_submit_then_complete_round_trips_through_storage() {
     // Arrange
-    let Some(storage) = try_connect().await else {
+    let Some(admin) = try_connect().await else {
         return;
     };
-    let schema = isolate_schema(&storage, "complete").await;
-    set_search_path(&storage, &schema).await;
+    let schema = isolate_schema(&admin, "complete").await;
+    let storage = connect_in_schema(&schema).await;
     migrate(storage.pool()).await.expect("run migrations");
 
     let namespace = Namespace::new("smoke-ns");
@@ -258,18 +266,18 @@ async fn smoke_submit_then_complete_round_trips_through_storage() {
     assert_eq!(task_status, "COMPLETED");
 
     drop(conn);
-    drop_schema(&storage, &schema).await;
+    drop_schema(&admin, &schema).await;
 }
 
 #[tokio::test]
 #[ignore = "requires reachable Postgres at docker.yuacx.com:5432 (set TASKQ_PG_TEST_URL to override)"]
 async fn smoke_duplicate_idempotency_key_with_different_payload_returns_constraint_violation() {
     // Arrange
-    let Some(storage) = try_connect().await else {
+    let Some(admin) = try_connect().await else {
         return;
     };
-    let schema = isolate_schema(&storage, "dedup").await;
-    set_search_path(&storage, &schema).await;
+    let schema = isolate_schema(&admin, "dedup").await;
+    let storage = connect_in_schema(&schema).await;
     migrate(storage.pool()).await.expect("run migrations");
 
     let namespace = Namespace::new("dedup-ns");
@@ -358,7 +366,7 @@ async fn smoke_duplicate_idempotency_key_with_different_payload_returns_constrai
         other => panic!("expected ConstraintViolation, got {other:?}"),
     }
 
-    drop_schema(&storage, &schema).await;
+    drop_schema(&admin, &schema).await;
 }
 
 #[tokio::test]
@@ -367,11 +375,11 @@ async fn smoke_upsert_namespace_quota_round_trip() {
     use taskq_storage::types::NamespaceQuotaUpsert;
 
     // Arrange
-    let Some(storage) = try_connect().await else {
+    let Some(admin) = try_connect().await else {
         return;
     };
-    let schema = isolate_schema(&storage, "quota").await;
-    set_search_path(&storage, &schema).await;
+    let schema = isolate_schema(&admin, "quota").await;
+    let storage = connect_in_schema(&schema).await;
     migrate(storage.pool()).await.expect("run migrations");
 
     let ns = Namespace::new("quota-smoke");
@@ -409,7 +417,7 @@ async fn smoke_upsert_namespace_quota_round_trip() {
     // Assert
     assert!(result.is_ok(), "upsert failed: {result:?}");
 
-    drop_schema(&storage, &schema).await;
+    drop_schema(&admin, &schema).await;
 }
 
 #[tokio::test]
@@ -418,11 +426,11 @@ async fn smoke_upsert_then_audit_then_commit_mimics_handler() {
     use taskq_storage::types::{AuditEntry, NamespaceQuotaUpsert};
 
     // Arrange
-    let Some(storage) = try_connect().await else {
+    let Some(admin) = try_connect().await else {
         return;
     };
-    let schema = isolate_schema(&storage, "audit").await;
-    set_search_path(&storage, &schema).await;
+    let schema = isolate_schema(&admin, "audit").await;
+    let storage = connect_in_schema(&schema).await;
     migrate(storage.pool()).await.expect("run migrations");
 
     let ns = Namespace::new("audit-smoke");
@@ -468,5 +476,5 @@ async fn smoke_upsert_then_audit_then_commit_mimics_handler() {
     assert!(audit_res.is_ok(), "audit failed: {audit_res:?}");
     assert!(commit_res.is_ok(), "commit failed: {commit_res:?}");
 
-    drop_schema(&storage, &schema).await;
+    drop_schema(&admin, &schema).await;
 }
