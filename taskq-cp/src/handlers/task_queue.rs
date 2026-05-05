@@ -9,10 +9,11 @@
 //!
 //! - Begins a SERIALIZABLE transaction via `state.storage.begin_dyn()`.
 //! - Wraps the transaction body in
-//!   [`crate::handlers::retry::with_serializable_retry`] for transparent
+//!   `crate::handlers::retry::with_serializable_retry` for transparent
 //!   `40001` retry up to 3 attempts (`design.md` §6.4).
-//! - Distinguishes [`StorageError::NotFound`] (return semantic error) from
-//!   [`StorageError::SerializationConflict`] (retry).
+//! - Distinguishes [`taskq_storage::StorageError::NotFound`] (return
+//!   semantic error) from [`taskq_storage::StorageError::SerializationConflict`]
+//!   (retry).
 //! - Records `taskq_storage_retry_attempts` (per `MetricsHandle`).
 //!
 //! Trace context (`traceparent` / `tracestate`) is read from the request

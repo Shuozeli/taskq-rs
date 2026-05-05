@@ -11,11 +11,11 @@
 //! handlers (§5.5) and the reapers (§5.4); Phase 5d wires observability
 //! emit sites (Phase 6).
 //!
-//! Two private support modules:
+//! Two private support modules (not in the public surface):
 //!
-//! - [`cancel`] — `cancel_internal` shared helper used by `CancelTask` and
-//!   `PurgeTasks` (`design.md` §6.7).
-//! - [`retry`] — transparent `40001` retry helper used by every state-
+//! - `cancel` — `cancel_internal` shared helper used by `CancelTask`
+//!   and `PurgeTasks` (`design.md` §6.7).
+//! - `retry` — transparent `40001` retry helper used by every state-
 //!   transition handler (`design.md` §6.4 / §6.6).
 
 pub(crate) mod cancel;

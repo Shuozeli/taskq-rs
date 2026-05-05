@@ -40,7 +40,7 @@ pub struct PostgresStorage {
 
 impl PostgresStorage {
     /// Connect, build the transaction pool, spawn the `LISTEN` dispatcher.
-    /// Migrations are NOT run here — call [`crate::migrate`] explicitly.
+    /// Migrations are NOT run here — call [`crate::migrate()`] explicitly.
     pub async fn connect(config: PostgresConfig) -> Result<Arc<Self>> {
         let pg_config: Config = config.conn_str.parse().map_err(map_db_error)?;
 
@@ -72,7 +72,7 @@ impl PostgresStorage {
         }))
     }
 
-    /// Borrow the connection pool. Used by [`crate::migrate`].
+    /// Borrow the connection pool. Used by [`crate::migrate()`].
     pub fn pool(&self) -> &Pool {
         &self.pool
     }

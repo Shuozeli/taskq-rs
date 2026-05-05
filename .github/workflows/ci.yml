@@ -141,6 +141,10 @@ jobs:
     name: Doc build
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      # Promote rustdoc warnings to errors so PRs can't merge with a
+      # dangling intra-doc link or other doc-level issues.
+      RUSTDOCFLAGS: "-D rustdoc::broken-intra-doc-links -D warnings"
     steps:
       - uses: actions/checkout@v5
         with:
@@ -150,12 +154,6 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # Build all rustdoc to catch syntax errors and missing items.
-      # Strict intra-doc-link checking is NOT enforced here — the
-      # current source has ~20 pre-existing broken-link / public-to-
-      # private warnings that are out of scope for this CI setup.
-      # Tracked separately; flip to `-D rustdoc::broken-intra-doc-links`
-      # once those land.
       - name: cargo doc
         run: cargo doc --workspace --no-deps --document-private-items
 

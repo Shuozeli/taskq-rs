@@ -7,7 +7,7 @@
 //! lives behind one helper so the two RPC paths cannot drift.
 //!
 //! Phase 5c lifts the storage-level state-transition pair onto the
-//! [`StorageTx::cancel_task`] trait method. The CP-side helper here is a
+//! [`taskq_storage::StorageTx::cancel_task`] trait method. The CP-side helper here is a
 //! thin re-export of [`taskq_storage::CancelOutcome`] so call sites do not
 //! depend on the storage crate directly for outcome matching, and so we can
 //! grow the helper later (e.g. wake one waiter on cancel) without touching
@@ -31,7 +31,7 @@ use crate::state::StorageTxDyn;
 /// 4. If the task does not exist: return [`CancelOutcome::NotFound`].
 ///
 /// The helper intentionally delegates the entire dance to
-/// [`StorageTx::cancel_task`] so the two backend implementations can keep
+/// [`taskq_storage::StorageTx::cancel_task`] so the two backend implementations can keep
 /// the SQL contracts they prefer (Postgres `SELECT ... FOR UPDATE` /
 /// SQLite `BEGIN IMMEDIATE`-implicit lock) without the CP layer
 /// reimplementing them.

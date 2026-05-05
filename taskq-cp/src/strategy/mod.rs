@@ -118,7 +118,7 @@ impl StrategyRegistry {
     /// metrics refresher and audit pruner to enumerate the set of
     /// namespaces the CP knows about. Degraded namespaces are NOT included
     /// — they have no strategy slot, but the audit-pruner walks them
-    /// separately via [`degraded`].
+    /// separately via [`Self::degraded`].
     pub fn loaded_namespaces(&self) -> Vec<Namespace> {
         self.namespaces.keys().cloned().collect()
     }

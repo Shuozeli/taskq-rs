@@ -59,7 +59,8 @@ pub struct SqliteTx {
 
 impl SqliteTx {
     /// Wrap an acquired connection guard. Caller is expected to issue
-    /// `BEGIN IMMEDIATE` immediately afterwards (see [`crate::SqliteStorage::begin`]).
+    /// `BEGIN IMMEDIATE` immediately afterwards (see
+    /// `SqliteStorage::begin` from the parent module).
     pub(crate) fn new(guard: OwnedMutexGuard<Connection>) -> Self {
         Self { guard }
     }

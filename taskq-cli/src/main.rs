@@ -33,8 +33,8 @@ use tracing_subscriber::EnvFilter;
 use crate::cli::Cli;
 
 /// CLI entry point. Returns a process exit code; non-zero values come
-/// from [`CliError::exit_code`] so shell scripts can distinguish
-/// connect / transport / rejection / abort failures.
+/// from [`crate::error::CliError::exit_code`] so shell scripts can
+/// distinguish connect / transport / rejection / abort failures.
 fn main() -> std::process::ExitCode {
     // Logs go to stderr only when `RUST_LOG` is set, so the default
     // human / json output on stdout stays uncluttered.

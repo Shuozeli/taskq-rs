@@ -88,9 +88,11 @@ pub fn bundled_migration_names() -> Vec<&'static str> {
     MIGRATIONS.iter().map(|(name, _)| *name).collect()
 }
 
-/// Compile-time-evaluated guard that panics if the [`MIGRATIONS`] slice is
+/// Compile-time-evaluated guard that panics if the `MIGRATIONS` slice is
 /// not sorted by filename. Exposed (rather than hidden behind an unused
-/// const) so dead-code lints don't have to be suppressed.
+/// const) so dead-code lints don't have to be suppressed. The slice
+/// itself is module-private; this const is the public surface that proves
+/// the ordering invariant.
 pub const MIGRATIONS_SORTED: () = {
     let mut i = 1;
     while i < MIGRATIONS.len() {

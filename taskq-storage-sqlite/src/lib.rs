@@ -26,7 +26,7 @@
 //!
 //! ## Module layout
 //!
-//! - [`migrate`] — migration runner.
+//! - [`mod@migrate`] — migration runner.
 //! - [`storage`] — [`SqliteStorage`] impl wrapping a connection.
 //! - [`tx`]      — [`SqliteTx`] impl.
 //! - [`convert`] — translation between trait types and SQLite-native rows.

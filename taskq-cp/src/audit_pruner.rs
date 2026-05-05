@@ -12,7 +12,8 @@
 //!   `NamespaceQuota`,
 //! - computes `cutoff = NOW − retention_days`,
 //! - deletes up to [`PRUNE_BATCH_SIZE`] rows for that namespace whose
-//!   `timestamp < cutoff` via [`StorageTxDyn::delete_audit_logs_before`],
+//!   `timestamp < cutoff` via
+//!   [`crate::state::StorageTxDyn::delete_audit_logs_before`],
 //! - emits `taskq_audit_log_pruned_total{namespace}` per delete count.
 //!
 //! Cadence is hourly by default (`design.md` §11.4 — "rate-limited"; the

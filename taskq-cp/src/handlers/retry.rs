@@ -41,7 +41,7 @@ fn backoff_for_attempt(attempt: u32) -> Duration {
 }
 
 /// Add ±50% jitter to `base` deterministically derived from a small
-/// randomness source. Uses [`rand-free`] arithmetic on the system clock so
+/// randomness source. Uses rand-free arithmetic on the system clock so
 /// this module does not pull in `rand` for one helper.
 fn jitter(base: Duration, attempt: u32) -> Duration {
     use std::time::{SystemTime, UNIX_EPOCH};

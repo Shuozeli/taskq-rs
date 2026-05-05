@@ -277,7 +277,7 @@ impl TaskOutcomeKind {
         }
     }
 
-    /// Inverse of [`as_db_str`]. Accepts either case so it works
+    /// Inverse of [`Self::as_db_str`]. Accepts either case so it works
     /// against both backends — SQLite stores uppercase
     /// (`'SUCCESS'`, ...) per the CHECK constraint in
     /// `0001_initial.sql`; Postgres uses a lowercase ENUM type

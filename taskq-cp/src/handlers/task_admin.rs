@@ -6,10 +6,10 @@
 //!
 //! - Begins a SERIALIZABLE transaction via `state.storage.begin_dyn()`.
 //! - Wraps the transaction body in
-//!   [`crate::handlers::retry::with_serializable_retry`] for transparent
+//!   `crate::handlers::retry::with_serializable_retry` for transparent
 //!   `40001` retry up to 3 attempts (`design.md` §6.4 retry helper).
 //! - Writes an `audit_log` row in the same SERIALIZABLE transaction
-//!   (`design.md` §11.4) — see [`crate::audit::audit_log_write`].
+//!   (`design.md` §11.4) — see `crate::audit::audit_log_write`.
 //! - Validates the request before mutating; rejected requests still write
 //!   an audit row with `result = "rejected"`.
 //! - On commit, the namespace-config cache is invalidated where the

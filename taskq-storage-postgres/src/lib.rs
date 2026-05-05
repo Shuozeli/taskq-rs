@@ -8,7 +8,7 @@
 //!   demuxes notifications to per-waiter channels.
 //! - [`PostgresTx`] — a single SERIALIZABLE transaction. Implements
 //!   [`taskq_storage::StorageTx`].
-//! - [`migrate`] — applies the bundled migration SQL files in lexical order.
+//! - [`mod@migrate`] — applies the bundled migration SQL files in lexical order.
 //! - [`PostgresConfig`] — minimal connection/pool wiring options.
 //!
 //! ## Isolation

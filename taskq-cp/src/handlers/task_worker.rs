@@ -8,10 +8,11 @@
 //!
 //! - Most methods open a SERIALIZABLE transaction via
 //!   `state.storage.begin_dyn()` and wrap the body in
-//!   [`crate::handlers::retry::with_serializable_retry`].
+//!   `crate::handlers::retry::with_serializable_retry`.
 //! - `Heartbeat` is the §6.3 carve-out — the heartbeat path is READ
-//!   COMMITTED via [`StorageTxDyn::record_worker_heartbeat`] (the storage
-//!   trait routes that to a cheap UPSERT). Lazy lease extension fires a
+//!   COMMITTED via `crate::state::StorageTxDyn::record_worker_heartbeat`
+//!   (the storage trait routes that to a cheap UPSERT). Lazy lease
+//!   extension fires a
 //!   SERIALIZABLE write only when more than `(lease − ε)` has elapsed since
 //!   the last extension.
 //! - `AcquireTask` is the §6.2 long-poll — the handler subscribes to
