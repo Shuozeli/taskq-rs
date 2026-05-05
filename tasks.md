@@ -1,4 +1,4 @@
-<!-- agent-updated: 2026-05-02T00:00:00Z -->
+<!-- agent-updated: 2026-05-05T00:00:00Z -->
 
 # taskq-rs Implementation Tasks
 
@@ -282,6 +282,14 @@ These are tracked here because they're external to taskq-rs but block specific t
 
 - [ ] **`flatbuffers-rs` schema-diff tool** — needed for the schema-diff CI step (Phase 1). Until landed, ship without CI enforcement and rely on review discipline. See [`problems/09`](problems/09-versioning.md) Open Q5.
 - [ ] **`pure-grpc-rs` long-poll support** — confirm the gRPC framework supports server-side long-poll cleanly (deadline-bounded blocking, cancellation propagation). If a feature is missing, file upstream.
+
+---
+
+## Known bugs
+
+- [ ] **Bug**: Worker-driven retry leaks a lease window per `WAITING_RETRY` cycle. `complete_task` does not bump `tasks.attempt_number` on the WAITING_RETRY transition, so the next dispatch pulls the row at the same `attempt_number`. The follow-up `complete_task` for the second attempt then hits a `task_results` PRIMARY KEY (task_id, attempt_number) constraint violation, which propagates as a transient error to the worker. The system silently recovers via Reaper A reclaiming the orphaned lease (which DOES bump `attempt_number`), but only after a full `lease_window_seconds` (default 30s) of dead time per retry. **In tests:** the harness's 1s lease window masks the latency cost; the bug surfaces only when probing `task_results` directly (you see one row per attempt at attempt-numbers `0, 1, 2, …` rather than `0, 1`).
+  - Backend divergence compounds the issue: SQLite's `pick_and_lock_pending` filters `status IN ('PENDING', 'WAITING_RETRY')`, but the Postgres dispatcher only filters `status = 'PENDING'`. On Postgres a worker-reported retryable failure never gets re-dispatched at all — the task sits in WAITING_RETRY until Reaper A runs.
+  - Fix: have `complete_task` bump `tasks.attempt_number` alongside the WAITING_RETRY status update (so the next dispatch reads the new value), and have the Postgres dispatcher filter `status IN ('PENDING', 'WAITING_RETRY')` to match SQLite. Add a conformance test that asserts `task_results` row count == attempt count after N retryable failures on each backend.
 
 ---
 
