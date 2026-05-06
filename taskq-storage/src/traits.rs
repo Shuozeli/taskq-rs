@@ -162,6 +162,18 @@ pub trait StorageTx: Send {
     /// 3. Update `tasks.status` to the terminal/retry state implied by the
     ///    outcome.
     /// 4. Delete the `task_runtime` row.
+    /// 5. **On `WaitingRetry` only**: also bump `tasks.attempt_number`.
+    ///    The next dispatch must read the bumped value; otherwise the
+    ///    follow-up `complete_task` for the next attempt collides with
+    ///    this row on PK(`task_id`, `attempt_number`) and the worker
+    ///    sees a transient error until Reaper A reclaims (one full
+    ///    `lease_window_seconds` of dead time per retry). This mirrors
+    ///    Reaper A's bump on lease reclaim — both paths leave the row's
+    ///    `attempt_number` pointing at the **next** attempt to be
+    ///    dispatched. Terminal outcomes (`Success`,
+    ///    `FailedNonretryable`, `FailedExhausted`, `Expired`) MUST NOT
+    ///    bump — the row's `attempt_number` stays at the last-completed
+    ///    attempt. Pinned by the `retry_progression` conformance test.
     ///
     /// Idempotent on `(task_id, attempt_number)` — a second call observes
     /// the existing terminal state and returns Ok without re-running side
