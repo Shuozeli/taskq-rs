@@ -12,7 +12,7 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use taskq_caller_sdk::{CancelOutcome, SubmitOutcome, SubmitRequest, TaskId, TaskOutcome};
@@ -526,6 +526,77 @@ async fn read_side_surfaces_failed_exhausted_with_retryable_failure_record() {
         failure.retryable,
         "FAILED_EXHAUSTED keeps retryable=true on the last failure record"
     );
+
+    let _ = worker_stop.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(5), worker_handle).await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn read_side_surfaces_expired_when_retry_after_overshoots_task_ttl() {
+    // Arrange: a worker that always fails retryably. We submit with a
+    // tight `expires_at` and a much larger `retry_initial_ms`, so on
+    // the first retryable failure the CP's §6.5 classifier sees
+    // `retry_after > task.expires_at` and writes a `task_results`
+    // row with `outcome=expired`, `task.status=EXPIRED`. This is the
+    // last unmapped `TaskOutcome` variant in the lifecycle suite.
+    let harness = TestHarness::start_in_memory().await;
+    harness.seed_namespace(NS).await;
+
+    let worker = harness
+        .worker_for(NS, vec!["tight"], move |_task| async move {
+            let registry = ErrorClassRegistry::new(["transient"]);
+            HandlerOutcome::RetryableFailure {
+                error_class: registry.error_class("transient").unwrap(),
+                message: "would retry but no time left".into(),
+                details: Some(Bytes::from_static(b"retry-blocked-by-ttl")),
+            }
+        })
+        .await
+        .expect("worker_for");
+    let (worker_stop, worker_handle) = spawn_worker(worker);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut caller = harness.caller().await;
+
+    // Act: tight `expires_at` + a `retry_initial_ms` large enough that
+    // `retry_after = now + initial_ms` overshoots the deadline. The
+    // dispatcher's `expires_at > now` filter must still allow the
+    // first dispatch — `expires_at = now + 500ms` is enough for the
+    // worker to acquire and report before the row goes stale.
+    use taskq_caller_sdk::RetryConfigOverride;
+    let mut req = SubmitRequest::new(NS, "tight", Bytes::from_static(b"x"));
+    req.expires_at = Some(SystemTime::now() + Duration::from_millis(500));
+    req.max_retries = Some(5); // large enough that we don't hit FailedExhausted first
+    req.retry_config = Some(RetryConfigOverride {
+        initial_ms: 2_000, // overshoots the 500ms TTL by ~1.5s
+        max_ms: 2_000,
+        coefficient: 1.0,
+        max_retries: 5,
+    });
+    let submit = caller.submit(req).await.expect("submit");
+    let task_id = match submit {
+        SubmitOutcome::Created { task_id, .. } => task_id,
+        other => panic!("expected Created, got {other:?}"),
+    };
+    let status = wait_for_terminal_status(&harness, &task_id, Duration::from_secs(10)).await;
+    assert_eq!(
+        status, "EXPIRED",
+        "first retryable failure with retry_after past expires_at must classify as EXPIRED"
+    );
+    let state = caller.get_result(&task_id).await.expect("get_result");
+
+    // Assert: status=EXPIRED, outcome=Expired, failure record populated
+    // (the worker-reported class/message/details survive the §6.5
+    // re-classification — they're the LAST captured failure).
+    use taskq_caller_sdk::TerminalState;
+    assert_eq!(state.status, TerminalState::EXPIRED);
+    assert_eq!(state.outcome, Some(TaskOutcome::Expired));
+    assert!(state.result_payload.is_none());
+    let failure = state.failure.expect("failure record present");
+    assert_eq!(failure.error_class, "transient");
+    assert_eq!(failure.message, "would retry but no time left");
+    assert_eq!(failure.details.as_ref(), b"retry-blocked-by-ttl");
 
     let _ = worker_stop.send(());
     let _ = tokio::time::timeout(Duration::from_secs(5), worker_handle).await;
