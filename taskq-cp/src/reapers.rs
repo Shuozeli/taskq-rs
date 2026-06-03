@@ -1,6 +1,6 @@
-//! Background reapers — Phase 5c.
+//! Background reapers — Phase 5c + Reaper C (TTL expiration).
 //!
-//! Two long-running tasks spawned from `main.rs::run_serve` after the gRPC
+//! Three long-running tasks spawned from `main.rs::run_serve` after the gRPC
 //! server starts and before the shutdown wait:
 //!
 //! - **Reaper A — per-task timeout** (`design.md` §6.6): every 5s, list
@@ -18,8 +18,21 @@
 //!   transaction so the worker's next heartbeat sees the flip and the SDK
 //!   re-`Register`s.
 //!
-//! Both reapers honor shutdown via a watch::Receiver: once the receiver
-//! flips to `true` the reaper finishes its current tick and exits.
+//! - **Reaper C — TTL expiration**: every 30s, transition every task
+//!   in `PENDING` or `WAITING_RETRY` whose `expires_at <= NOW()` to
+//!   `EXPIRED`. The dispatcher's `expires_at > now` filter prevents
+//!   these rows from being picked up by workers, but without Reaper C
+//!   they would sit in their non-terminal status indefinitely — a
+//!   caller polling `GetTaskResult` would never see a terminal state.
+//!   No `task_results` row is written (no per-attempt failure to
+//!   capture); the read-side projection's `derive_default_outcome`
+//!   fallback surfaces `outcome=Expired` from `task.status` directly.
+//!   Mirrors `cancel_task`'s precedent of releasing the
+//!   `idempotency_keys` row so the dedup window is reusable when the
+//!   work didn't run.
+//!
+//! All three reapers honor shutdown via a watch::Receiver: once the
+//! receiver flips to `true` the reaper finishes its current tick and exits.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -43,16 +56,27 @@ pub const REAPER_A_TICK: Duration = Duration::from_secs(5);
 /// per-task timeout; 10s amortizes the BRIN scan cost.
 pub const REAPER_B_TICK: Duration = Duration::from_secs(10);
 
+/// Polling cadence for Reaper C. TTL expiration is rare relative to
+/// lease timeouts (the typical task is dispatched well before its
+/// `expires_at`); 30s keeps the scan cost negligible while bounding
+/// the worst-case "PENDING-past-TTL" window callers can observe.
+pub const REAPER_C_TICK: Duration = Duration::from_secs(30);
+
 /// Default batch size per reaper transaction. Mirrors `design.md` §6.6.
 pub const REAPER_BATCH_SIZE: usize = 1000;
 
-/// Spawn both reapers and return the join handles. `main` owns them and
-/// awaits them after the gRPC server returns so the reapers cleanly
-/// finish their last in-flight tick before the runtime shuts down.
+/// Spawn all three reapers and return their join handles. `main` owns
+/// them and awaits them after the gRPC server returns so the reapers
+/// cleanly finish their last in-flight tick before the runtime shuts
+/// down.
 pub fn spawn_reapers(
     state: Arc<CpState>,
     shutdown: ShutdownReceiver,
-) -> (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>) {
+) -> (
+    tokio::task::JoinHandle<()>,
+    tokio::task::JoinHandle<()>,
+    tokio::task::JoinHandle<()>,
+) {
     let state_a = Arc::clone(&state);
     let shutdown_a = shutdown.clone();
     let handle_a = tokio::spawn(async move {
@@ -60,12 +84,18 @@ pub fn spawn_reapers(
     });
 
     let state_b = Arc::clone(&state);
-    let shutdown_b = shutdown;
+    let shutdown_b = shutdown.clone();
     let handle_b = tokio::spawn(async move {
         run_reaper_b(state_b, shutdown_b).await;
     });
 
-    (handle_a, handle_b)
+    let state_c = Arc::clone(&state);
+    let shutdown_c = shutdown;
+    let handle_c = tokio::spawn(async move {
+        run_reaper_c(state_c, shutdown_c).await;
+    });
+
+    (handle_a, handle_b, handle_c)
 }
 
 /// Reaper A loop. Runs ticks at `REAPER_A_TICK` until shutdown fires.
@@ -110,6 +140,34 @@ async fn run_reaper_b(state: Arc<CpState>, mut shutdown: ShutdownReceiver) {
             changed = shutdown.changed() => {
                 if changed.is_ok() && *shutdown.borrow() {
                     tracing::info!("reaper-b: shutdown signal observed; exiting");
+                    return;
+                }
+                if changed.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Reaper C loop. Periodically scans for tasks past their TTL that
+/// never reached a worker (or are stuck waiting for a retry slot)
+/// and transitions them to EXPIRED.
+async fn run_reaper_c(state: Arc<CpState>, mut shutdown: ShutdownReceiver) {
+    tracing::info!("reaper-c: ttl-expiration reaper started");
+    let mut ticker = tokio::time::interval(REAPER_C_TICK);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                if let Err(err) = reaper_c_tick(Arc::clone(&state)).await {
+                    tracing::warn!(error = %err, "reaper-c tick failed");
+                }
+            }
+            changed = shutdown.changed() => {
+                if changed.is_ok() && *shutdown.borrow() {
+                    tracing::info!("reaper-c: shutdown signal observed; exiting");
                     return;
                 }
                 if changed.is_err() {
@@ -284,6 +342,56 @@ async fn reclaim_one_b(
     };
     tx.reclaim_runtime(&runtime_ref).await?;
     tx.mark_worker_dead(&row.worker_id, now).await?;
+    Ok(())
+}
+
+/// Run one Reaper C tick. Transitions un-dispatched / waiting-retry
+/// tasks past their TTL to `EXPIRED` in a single SERIALIZABLE
+/// transaction (with 40001 retry). Idempotent — a tick that finds
+/// no doomed rows is a cheap no-op.
+///
+/// Phase 9b helper: `pub` so integration tests can drive a deterministic
+/// tick instead of waiting on the 30s polling cadence.
+#[tracing::instrument(name = "taskq.reaper_c", skip_all)]
+pub async fn reaper_c_tick(state: Arc<CpState>) -> Result<(), StorageError> {
+    let now = current_timestamp();
+    let metrics = state.metrics.clone();
+
+    let expired_count: u32 = with_serializable_retry(&metrics, "reaper_c", || {
+        let state = Arc::clone(&state);
+        async move {
+            let mut tx = state.storage.begin_dyn().await?;
+            let count = tx.expire_stale_tasks(now, REAPER_BATCH_SIZE).await?;
+            tx.commit_dyn().await?;
+            Ok(count)
+        }
+    })
+    .await?;
+
+    if expired_count > 0 {
+        // Per-tick aggregate event so operators can correlate dashboards
+        // without hot-pathing per-task INFO logs in the steady state.
+        tracing::info!(
+            expired = expired_count,
+            "reaper-c: expired stale PENDING / WAITING_RETRY tasks past TTL"
+        );
+        // Increment the shared `taskq_terminal_total{state="EXPIRED"}`
+        // counter without per-task labels (namespace+task_type would
+        // require a second SELECT and Reaper C's job is bulk cleanup,
+        // not per-task observability — operators get per-task detail
+        // via `GetTaskResult` after the fact). The "reaper" source
+        // label distinguishes this counter increment from the
+        // worker-driven retry-past-TTL classification in
+        // `report_failure_impl`.
+        state.metrics.terminal_total.add(
+            u64::from(expired_count),
+            &[
+                KeyValue::new("namespace", "_reaper_c"),
+                KeyValue::new("task_type", "_reaper_c"),
+                KeyValue::new("terminal_state", "EXPIRED"),
+            ],
+        );
+    }
     Ok(())
 }
 

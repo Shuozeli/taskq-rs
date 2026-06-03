@@ -49,6 +49,7 @@
 
 pub mod bounded_dedup_cleanup;
 pub mod conditional_insert;
+pub mod expire_stale;
 pub mod external_consistency;
 pub mod helpers;
 pub mod range_scans;
@@ -145,6 +146,13 @@ where
     // this; there is no opt-out flag.
     let s = setup().await;
     retry_progression::worker_driven_retry_bumps_attempt_and_writes_per_attempt_row(&s).await;
+
+    // TTL expiration for un-dispatched / waiting-retry tasks (Reaper C).
+    // Asserts that `expire_stale_tasks` only touches PENDING /
+    // WAITING_RETRY rows past TTL and that the released idempotency
+    // keys become reusable. Both backends must satisfy this.
+    let s = setup().await;
+    expire_stale::expire_stale_tasks_only_transitions_pending_or_waiting_retry_past_ttl(&s).await;
 
     // Bounded dedup cleanup (§8.2 #6).
     if options.vacuously_satisfied_bounded_cleanup {

@@ -36,7 +36,7 @@
 use std::sync::Arc;
 
 use taskq_storage_conformance::{
-    bounded_dedup_cleanup, conditional_insert, external_consistency, range_scans,
+    bounded_dedup_cleanup, conditional_insert, expire_stale, external_consistency, range_scans,
     retry_progression, skip_locking, subscribe_ordering,
 };
 use taskq_storage_postgres::{migrate, PostgresConfig, PostgresStorage};
@@ -262,6 +262,18 @@ async fn retry_progression_worker_driven_retry_bumps_attempt_and_writes_per_atte
         return;
     };
     retry_progression::worker_driven_retry_bumps_attempt_and_writes_per_attempt_row(&*storage)
+        .await;
+    drop(storage);
+    drop_db(&dbname).await;
+}
+
+#[tokio::test]
+#[ignore = "requires reachable Postgres at docker.yuacx.com:5432"]
+async fn expire_stale_tasks_only_transitions_pending_or_waiting_retry_past_ttl() {
+    let Some((storage, dbname)) = fresh().await else {
+        return;
+    };
+    expire_stale::expire_stale_tasks_only_transitions_pending_or_waiting_retry_past_ttl(&*storage)
         .await;
     drop(storage);
     drop_db(&dbname).await;

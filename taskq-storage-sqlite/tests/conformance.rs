@@ -11,7 +11,7 @@
 //! `SqliteStorage::open_in_memory()`, so per-test isolation is automatic.
 
 use taskq_storage_conformance::{
-    bounded_dedup_cleanup, conditional_insert, external_consistency, range_scans,
+    bounded_dedup_cleanup, conditional_insert, expire_stale, external_consistency, range_scans,
     retry_progression, run_all, skip_locking, subscribe_ordering, Options,
 };
 use taskq_storage_sqlite::SqliteStorage;
@@ -113,6 +113,12 @@ async fn subscribe_ordering_subscribe_pending_observes_post_subscription_commit(
 async fn retry_progression_worker_driven_retry_bumps_attempt_and_writes_per_attempt_row() {
     let s = fresh_storage().await;
     retry_progression::worker_driven_retry_bumps_attempt_and_writes_per_attempt_row(&s).await;
+}
+
+#[tokio::test]
+async fn expire_stale_tasks_only_transitions_pending_or_waiting_retry_past_ttl() {
+    let s = fresh_storage().await;
+    expire_stale::expire_stale_tasks_only_transitions_pending_or_waiting_retry_past_ttl(&s).await;
 }
 
 #[tokio::test]

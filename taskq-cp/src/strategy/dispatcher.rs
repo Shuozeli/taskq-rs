@@ -393,6 +393,14 @@ mod tests {
             unreachable!("Phase 5c reaper methods not exercised in dispatcher tests")
         }
 
+        fn expire_stale_tasks<'a>(
+            &'a mut self,
+            _before: Timestamp,
+            _n: usize,
+        ) -> StorageTxFuture<'a, Result<u32, StorageError>> {
+            unreachable!("Phase 5c reaper methods not exercised in dispatcher tests")
+        }
+
         fn list_dead_worker_runtimes<'a>(
             &'a mut self,
             _stale_before: Timestamp,

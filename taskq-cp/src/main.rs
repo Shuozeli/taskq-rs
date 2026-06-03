@@ -175,10 +175,13 @@ async fn run_serve(config: CpConfig, auto_migrate: bool) -> anyhow::Result<()> {
         let _ = signal_shutdown_tx.send(true);
     });
 
-    // Spawn the Phase 5c reapers. They each tick on their own cadence and
-    // exit on shutdown; the gRPC server is the runtime's blocking root, so
-    // the reapers' join handles are awaited below after the server returns.
-    let (reaper_a_handle, reaper_b_handle) =
+    // Spawn the Phase 5c reapers (A: per-task timeout, B: dead-worker)
+    // plus Reaper C (TTL expiration for PENDING / WAITING_RETRY rows
+    // whose deadline elapsed without dispatch). Each ticks on its own
+    // cadence and exits on shutdown; the gRPC server is the runtime's
+    // blocking root, so the reapers' join handles are awaited below
+    // after the server returns.
+    let (reaper_a_handle, reaper_b_handle, reaper_c_handle) =
         reapers::spawn_reapers(Arc::clone(&cp_state), shutdown_rx.clone());
 
     // Phase 5d: periodic metrics refresher updates gauge instruments
@@ -211,6 +214,9 @@ async fn run_serve(config: CpConfig, auto_migrate: bool) -> anyhow::Result<()> {
     }
     if let Err(err) = reaper_b_handle.await {
         tracing::warn!(error = %err, "reaper-b task panicked");
+    }
+    if let Err(err) = reaper_c_handle.await {
+        tracing::warn!(error = %err, "reaper-c task panicked");
     }
     if let Err(err) = metrics_handle.await {
         tracing::warn!(error = %err, "metrics refresher task panicked");

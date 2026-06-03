@@ -73,6 +73,8 @@ pub struct TestHarness {
     pub reaper_a_handle: JoinHandle<()>,
     /// JoinHandle for Reaper B.
     pub reaper_b_handle: JoinHandle<()>,
+    /// JoinHandle for Reaper C (TTL expiration).
+    pub reaper_c_handle: JoinHandle<()>,
     /// JoinHandle for the metrics refresher.
     pub metrics_handle: JoinHandle<()>,
     /// JoinHandle for the audit pruner.
@@ -144,7 +146,7 @@ impl TestHarness {
 
         // 4. Spawn reapers + metrics refresher + audit pruner so the
         //    background plumbing matches a production CP.
-        let (reaper_a_handle, reaper_b_handle) =
+        let (reaper_a_handle, reaper_b_handle, reaper_c_handle) =
             reapers::spawn_reapers(Arc::clone(&state), shutdown_rx.clone());
         let metrics_handle = metrics_refresher::spawn(Arc::clone(&state), shutdown_rx.clone());
         let pruner_handle = audit_pruner::spawn(Arc::clone(&state), shutdown_rx.clone());
@@ -160,6 +162,7 @@ impl TestHarness {
             server_handle,
             reaper_a_handle,
             reaper_b_handle,
+            reaper_c_handle,
             metrics_handle,
             pruner_handle,
             shutdown: shutdown_tx,
@@ -377,6 +380,14 @@ impl TestHarness {
             .expect("reaper_b_tick must succeed");
     }
 
+    /// Drive a single Reaper C tick synchronously. Tests prefer this
+    /// to waiting on the 30s polling cadence of the spawned reaper.
+    pub async fn tick_reaper_c(&self) {
+        reapers::reaper_c_tick(Arc::clone(&self.state))
+            .await
+            .expect("reaper_c_tick must succeed");
+    }
+
     /// Cooperative shutdown -- broadcasts to every long-running task and
     /// joins the handles. Tests should call this at the end of their
     /// `Act`/`Assert` block so the runtime tears down cleanly.
@@ -385,6 +396,7 @@ impl TestHarness {
         let _ = tokio::time::timeout(Duration::from_secs(5), self.server_handle).await;
         let _ = tokio::time::timeout(Duration::from_secs(5), self.reaper_a_handle).await;
         let _ = tokio::time::timeout(Duration::from_secs(5), self.reaper_b_handle).await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), self.reaper_c_handle).await;
         let _ = tokio::time::timeout(Duration::from_secs(5), self.metrics_handle).await;
         let _ = tokio::time::timeout(Duration::from_secs(5), self.pruner_handle).await;
     }

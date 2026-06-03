@@ -248,6 +248,12 @@ pub trait StorageTxDyn: Send {
         runtime: &'a RuntimeRef,
     ) -> StorageTxFuture<'a, Result<(), StorageError>>;
 
+    fn expire_stale_tasks<'a>(
+        &'a mut self,
+        before: Timestamp,
+        n: usize,
+    ) -> StorageTxFuture<'a, Result<u32, StorageError>>;
+
     fn list_dead_worker_runtimes<'a>(
         &'a mut self,
         stale_before: Timestamp,
@@ -558,6 +564,14 @@ where
         runtime: &'a RuntimeRef,
     ) -> StorageTxFuture<'a, Result<(), StorageError>> {
         Box::pin(StorageTx::reclaim_runtime(&mut self.inner, runtime))
+    }
+
+    fn expire_stale_tasks<'a>(
+        &'a mut self,
+        before: Timestamp,
+        n: usize,
+    ) -> StorageTxFuture<'a, Result<u32, StorageError>> {
+        Box::pin(StorageTx::expire_stale_tasks(&mut self.inner, before, n))
     }
 
     fn list_dead_worker_runtimes<'a>(

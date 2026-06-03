@@ -560,6 +560,48 @@ impl<'a> StorageTx for PostgresTx<'a> {
         Ok(())
     }
 
+    async fn expire_stale_tasks(&mut self, before: Timestamp, n: usize) -> Result<u32> {
+        // Reaper C — TTL expiration for un-dispatched / waiting-retry rows.
+        // Single statement: lock, transition, return the (task_id,
+        // namespace) pairs in one round-trip. The CTE form lets us
+        // release the matching idempotency_keys in the same transaction.
+        let before_chrono = timestamp_to_chrono(before);
+        let limit = n as i64;
+
+        let rows = self
+            .conn
+            .query(
+                "WITH doomed AS ( \
+                    SELECT task_id, namespace FROM tasks \
+                     WHERE status IN ('PENDING'::taskq_task_status, \
+                                      'WAITING_RETRY'::taskq_task_status) \
+                       AND expires_at <= $1 \
+                     ORDER BY task_id \
+                     LIMIT $2 \
+                     FOR UPDATE SKIP LOCKED \
+                 ), \
+                 transitioned AS ( \
+                    UPDATE tasks SET status = 'EXPIRED'::taskq_task_status, \
+                                     retry_after = NULL \
+                      WHERE task_id IN (SELECT task_id FROM doomed) \
+                    RETURNING task_id, namespace \
+                 ), \
+                 dedup_release AS ( \
+                    DELETE FROM idempotency_keys ik \
+                      USING transitioned t \
+                      WHERE ik.task_id = t.task_id \
+                        AND ik.namespace = t.namespace \
+                    RETURNING ik.task_id \
+                 ) \
+                 SELECT count(*)::bigint FROM transitioned",
+                &[&before_chrono, &limit],
+            )
+            .await
+            .map_err(map_db_error)?;
+        let count: i64 = rows.first().map(|r| r.get::<_, i64>(0)).unwrap_or(0);
+        Ok(count as u32)
+    }
+
     // ========================================================================
     // Quota enforcement
     // ========================================================================

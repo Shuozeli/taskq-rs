@@ -233,6 +233,26 @@ pub trait StorageTx: Send {
         at: Timestamp,
     ) -> impl std::future::Future<Output = Result<()>> + Send;
 
+    /// Used by Reaper C — TTL expiration for un-dispatched / waiting-retry
+    /// tasks. Atomically transitions all rows where `status IN ('PENDING',
+    /// 'WAITING_RETRY') AND expires_at <= before` to `status = EXPIRED`,
+    /// and releases their `idempotency_keys` rows so the same key can be
+    /// re-submitted (mirrors `cancel_task` — the task didn't run, the key
+    /// is reusable). Implementations MAY cap each call at `n` rows;
+    /// callers re-poll until 0 rows are returned.
+    ///
+    /// Returns the number of rows transitioned. No `task_results` row is
+    /// written (no per-attempt failure to capture); the read-side
+    /// surfaces `outcome=Expired` via the `derive_default_outcome`
+    /// fallback in the CP layer's `GetTaskResult` projection.
+    ///
+    /// SERIALIZABLE: yes.
+    fn expire_stale_tasks(
+        &mut self,
+        before: Timestamp,
+        n: usize,
+    ) -> impl std::future::Future<Output = Result<u32>> + Send;
+
     // ========================================================================
     // Quota enforcement
     // ========================================================================

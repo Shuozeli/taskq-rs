@@ -570,6 +570,74 @@ impl StorageTx for SqliteTx {
         Ok(())
     }
 
+    async fn expire_stale_tasks(&mut self, before: Timestamp, n: usize) -> StorageResult<u32> {
+        // Reaper C — TTL expiration for un-dispatched / waiting-retry
+        // rows. Step 1: collect (task_id, namespace) for the doomed
+        // rows so we can release their idempotency_keys atomically.
+        // Step 2: flip their status to EXPIRED. Step 3: delete the
+        // matching dedup rows. All inside the same writer transaction
+        // (single-writer scope makes "FOR UPDATE" implicit).
+        let before_ms = ts_to_millis(before);
+        let limit = n as i64;
+
+        let conn = self.conn();
+        let doomed: Vec<(String, String)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT task_id, namespace FROM tasks \
+                       WHERE status IN ('PENDING', 'WAITING_RETRY') \
+                         AND expires_at <= ?1 \
+                       LIMIT ?2",
+                )
+                .map_err(map_sql_error)?;
+            let rows = stmt
+                .query_map(params![before_ms, limit], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(map_sql_error)?;
+            rows.filter_map(Result::ok).collect()
+        };
+        let count = doomed.len() as u32;
+        if count == 0 {
+            return Ok(0);
+        }
+
+        // Step 2: transition status. Build an IN-list with positional
+        // params so the UPDATE only touches the rows we observed
+        // (avoids racing a concurrent ReportFailure that's mid-tx).
+        let mut update_sql = String::from(
+            "UPDATE tasks SET status = 'EXPIRED', retry_after = NULL \
+              WHERE task_id IN (",
+        );
+        for (idx, _) in doomed.iter().enumerate() {
+            if idx > 0 {
+                update_sql.push(',');
+            }
+            update_sql.push('?');
+            update_sql.push_str(&(idx + 1).to_string());
+        }
+        update_sql.push(')');
+        let task_id_values: Vec<&dyn rusqlite::ToSql> = doomed
+            .iter()
+            .map(|(id, _)| id as &dyn rusqlite::ToSql)
+            .collect();
+        conn.execute(&update_sql, &task_id_values[..])
+            .map_err(map_sql_error)?;
+
+        // Step 3: release the idempotency_keys for these tasks. Per
+        // `cancel_task`'s precedent, the dedup window is reusable
+        // when the task didn't actually run.
+        for (task_id, namespace) in &doomed {
+            conn.execute(
+                "DELETE FROM idempotency_keys WHERE namespace = ?1 AND task_id = ?2",
+                params![namespace, task_id],
+            )
+            .map_err(map_sql_error)?;
+        }
+
+        Ok(count)
+    }
+
     // ------------------------------------------------------------------------
     // Quotas
     // ------------------------------------------------------------------------
